@@ -49,6 +49,34 @@ resource appiLogger 'Microsoft.ApiManagement/service/loggers@2024-05-01' = {
   }
 }
 
+// Wire the logger into the request pipeline. WITHOUT this service-level `diagnostics`
+// resource the `appinsights` logger exists but APIM emits NO request/dependency
+// telemetry to Application Insights (the logger alone is inert). Applies to all APIs
+// unless an API-level diagnostics overrides it. Sampling 100% for the pilot.
+resource appiDiagnostics 'Microsoft.ApiManagement/service/diagnostics@2024-05-01' = {
+  parent: apim
+  name: 'applicationinsights'
+  properties: {
+    loggerId: appiLogger.id
+    alwaysLog: 'allErrors'
+    sampling: {
+      samplingType: 'fixed'
+      percentage: 100
+    }
+    httpCorrelationProtocol: 'W3C'
+    verbosity: 'information'
+    logClientIp: true
+    frontend: {
+      request: { headers: [], body: { bytes: 0 } }
+      response: { headers: [], body: { bytes: 0 } }
+    }
+    backend: {
+      request: { headers: [], body: { bytes: 0 } }
+      response: { headers: [], body: { bytes: 0 } }
+    }
+  }
+}
+
 resource diag 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
   scope: apim
   name: 'to-log-analytics'
