@@ -3,10 +3,52 @@
 This guide assumes the plan has been reviewed and the Entra tenant + Azure
 subscription are picked. **Nothing here is destructive until step 5.**
 
+## Which cloud are you deploying to?
+
+The same template serves two distinct use cases. **Pick one now** — it determines the
+parameters profile you copy in Step 1 and the cloud you sign into. There are **no code
+changes** between them; everything is driven by the `cloudEnv` param (see
+[Cloud parameterization](architecture.md#cloud-parameterization)).
+
+| | **Government** (`AzureUSGovernment`) | **Commercial** (`AzureCloud`) |
+|---|---|---|
+| **Use case** | Sovereign / regulated workloads (DoD, federal, CJIS, ITAR) that must stay in Azure Government. The pilot's default. | Standard enterprise tenants, dev/test, or any workload without a sovereign-cloud mandate. |
+| **Account** | `*.onmicrosoft.us` identity in a Gov tenant | `*.onmicrosoft.com` identity in a commercial tenant |
+| **Sign-in** | `az cloud set --name AzureUSGovernment` then `az login --use-device-code` | `az cloud set --name AzureCloud` then `az login` |
+| **Parameters profile** | `infra/main.parameters.example.json` | `infra/main.parameters.commercial.example.json` |
+| **`cloudEnv`** | `AzureUSGovernment` | `AzureCloud` |
+| **Typical region** | `usgovvirginia` | a commercial region (e.g. `eastus2`) that hosts your model |
+| **Model SKU** | `DataZoneStandard` (`GlobalStandard` is N/A in usgovvirginia) | `GlobalStandard` |
+| **`services.ai` DNS zone** | none (Gov has no `services.ai` zone — derived empty & skipped) | `privatelink.services.ai.azure.com` is created + linked |
+| **`azd` cloud config** | `azd config set cloud.name AzureUSGovernment` (**required** — see azd section) | default (`AzureCloud`) — no extra config |
+
+> Everything downstream follows the cloud you select here: the Entra/Graph scripts read
+> it from `az cloud show`, the Bicep derives all endpoints from `cloudEnv`, and (for the
+> `azd` path) `azd`'s `cloud.name` selects the AAD authority. The rest of this guide is
+> written Gov-first; **Commercial callouts are inline** wherever the two differ.
+
 ## 0. Prereqs
 
+### Required tools
+
+`azd` (the Azure Developer CLI) is the **primary** way to deploy this repo. Install all
+of these once per machine — the versions are the floors this repo is validated against.
+
+| Tool | Min version | Why it's needed | Install / upgrade |
+|---|---|---|---|
+| **Azure Developer CLI (`azd`)** | **1.25.4** | Primary deploy driver. Reads [azure.yaml](../azure.yaml), provisions `infra/main` and manages the per-cloud environment. | `winget install Microsoft.Azd` / `winget upgrade Microsoft.Azd` (or `brew install azd`, `curl -fsSL https://aka.ms/install-azd.sh \| bash`) |
+| **Azure CLI (`az`)** | 2.60+ | Used by the alternative `az deployment` path, the Entra setup script, RBAC/playground grants, and fetching dev keys. `azd` also shells out to it. | `winget upgrade Microsoft.AzureCLI` (or `brew upgrade azure-cli`) |
+| **Bicep CLI** | 0.30+ | Compiles `infra/main.bicep`. `azd` and `az` both invoke it. | `az bicep upgrade` |
+| **PowerShell 7+ (`pwsh`)** | 7.4+ | Runs `scripts/setup-entra.ps1` and the probe/wrapper scripts. (bash equivalents exist under `scripts/*.sh`.) | `winget upgrade Microsoft.PowerShell` |
+| **GitHub Copilot CLI** | latest | The BYOK client you point at the gateway (Step 7). | `npm i -g @github/copilot` |
+
+> Verify in one shot: `azd version; az version; az bicep version; pwsh -v`. If `azd version`
+> prints an older build than 1.25.4, run the upgrade — a fresh terminal is needed after
+> `winget upgrade` so `PATH` resolves the new binary.
+
+### Required permissions
+
 - Azure CLI logged in: `az login` (Commercial) or `az login --use-device-code` against Gov.
-- Bicep CLI: `az bicep upgrade` (>= 0.30).
 - **Contributor** on the subscription (to create the RG, VNet, APIM, AOAI/Foundry, etc.).
 - **User Access Administrator** (or Owner) at the subscription/RG scope **if** you deploy with
   `assignAoaiRbac=true` (default). The template creates role assignments
@@ -79,7 +121,9 @@ source control. For Commercial, also confirm your `location` hosts the model + S
 az bicep build --file infra/main.bicep
 ```
 
-If it builds clean, run a what-if at subscription scope:
+If it builds clean, preview the plan. With `azd` (primary path) this is `azd provision
+--preview` (run it after the `azd` env is set up in Step 3); to preview without `azd`,
+run a what-if at subscription scope:
 
 ```pwsh
 az deployment sub what-if `
@@ -88,7 +132,7 @@ az deployment sub what-if `
   --parameters @infra/main.parameters.json
 ```
 
-Read the what-if output. **Stop here and inspect before going further.**
+Read the preview/what-if output. **Stop here and inspect before going further.**
 
 > **Commercial (`AzureCloud`) first run:** use your commercial region for `--location`
 > and confirm the plan includes the **`privatelink.services.ai.azure.com`** private DNS
@@ -98,6 +142,86 @@ Read the what-if output. **Stop here and inspect before going further.**
 
 ## 3. Deploy infrastructure
 
+**`azd` is the primary path.** [azure.yaml](../azure.yaml) wires `azd` to the same
+subscription-scope `infra/main` template and the `infra/main.parameters.json` you prepared
+in Step 1, so `azd provision` runs the identical Bicep as a hand-rolled `az deployment`.
+Because there is no `services:` block, `azd up` == `azd provision` (infra only). This single
+flow creates the RG, VNet, APIM (~30–45 min), AOAI + Foundry + PEs + DNS, App Insights, the
+APIM gateway Private DNS zone (`deployApimPrivateDns`, default true), and optionally the
+APIM-MI → AOAI/Foundry role assignments (`assignAoaiRbac`), the P2S VPN gateway
+(`deployVpnGateway`, another ~30 min), and a Windows test VM + Azure Bastion (`deployTestVm`).
+
+```pwsh
+# 1. Point azd's AUTH + resource layer at the Gov cloud GLOBALLY, then sign in.
+#    This MUST be the global cloud.name config — it governs which AAD authority the
+#    token is minted against. Setting it only on the environment (AZURE_CLOUD_NAME)
+#    steers provisioning endpoints but NOT the login authority, so the token is issued
+#    by public AAD and Gov ARM rejects it: "AADSTS90051: Invalid national Cloud ID (2)".
+azd config set cloud.name AzureUSGovernment
+azd auth logout                                        # clear any stale public-cloud token
+azd auth login --tenant-id <your-gov-tenant-guid>      # add --use-device-code if the browser redirect is blocked
+
+# 2. Create the azd environment for this deployment.
+azd env new gov-pilot --subscription <gov-sub-id> --location usgovvirginia
+azd env set AZURE_CLOUD_NAME AzureUSGovernment         # belt-and-suspenders for provisioning endpoints
+
+# 3. Preview the plan (what-if), then provision. No services: block => provision == up.
+azd provision --preview
+azd provision
+```
+
+> **Sovereign-cloud auth gotcha.** The global `azd config set cloud.name AzureUSGovernment`
+> is what makes `azd auth login` use the Gov AAD authority (`login.microsoftonline.us`).
+> The per-environment `AZURE_CLOUD_NAME` does **not** redirect the login authority — only
+> the resource/management endpoints. If you skip the global config (or set only the env
+> var), login mints a **public-cloud** token and provisioning fails with
+> `AADSTS90051: Invalid national Cloud ID (2)`. To switch back to Commercial later:
+> `azd config set cloud.name AzureCloud` (or `azd config unset cloud.name`).
+>
+> **`azd provision --preview` is benign-noisy on existing infra.** On an already-deployed
+> environment the preview shows the core resources (RG, AI Services accounts, VNet, Log
+> Analytics) as `Skip` (no change) and reports a handful of `Modify` lines for read-only /
+> computed / API-default properties — e.g. APIM `natGatewayState`/`legacyPortalStatus`,
+> model `currentCapacity`/`versionUpgradeOption`, App Insights `Flow_Type`/`Request_Source`,
+> PE `isIPv6EnabledPrivateEndpoint`. These are ARM what-if artifacts, **not** real drift.
+>
+> **Literal parameters are intentional.** `infra/main.parameters.json` uses literal
+> values (e.g. `"location": "usgovvirginia"`), **not** `azd`'s `${AZURE_LOCATION}`
+> substitution tokens. That keeps the file usable by **both** `azd` and the alternative
+> `az deployment sub create` — the az CLI passes `${...}` through verbatim, so tokenizing
+> would break the direct path. With literals, `azd` simply honors the values in the file;
+> the azd environment's location/name are not injected into resource names. If you want azd
+> to own those, switch to a fully azd-only workflow and tokenize, but you then lose the
+> direct `az deployment` path.
+>
+> **Outputs.** After `azd provision`, the Bicep outputs land in the azd environment —
+> read them with `azd env get-values` (instead of querying `az deployment sub show`).
+> The per-developer subscription keys are still retrieved with `az apim subscription`
+> as in Step 6.
+
+**Commercial (`AzureCloud`) with `azd`.** Commercial is `azd`'s default cloud, so the
+sovereign-cloud dance is unnecessary — **do not** set `cloud.name` (or set it back with
+`azd config set cloud.name AzureCloud` / `azd config unset cloud.name` if you previously
+targeted Gov). The flow collapses to:
+
+```pwsh
+azd auth login                                        # default AzureCloud authority
+azd env new comm-pilot --subscription <commercial-sub-id> --location <commercial-region>
+azd provision --preview
+azd provision
+```
+
+> Make sure `infra/main.parameters.json` was copied from
+> `infra/main.parameters.commercial.example.json` (Step 1) so `cloudEnv=AzureCloud`,
+> `modelDeploymentSku=GlobalStandard`, and a commercial `location` are in effect before
+> you provision.
+
+### Alternative: deploy with `az deployment sub create`
+
+If you prefer raw ARM (or can't use `azd`), the same template deploys directly. This is the
+path the project's CI/probe scripts use, and it sidesteps `azd`'s per-cloud `cloud.name`
+config entirely — the active `az cloud set` already determines the authority.
+
 ```pwsh
 az deployment sub create `
   --name "copilot-byok-$(Get-Date -Format yyyyMMdd-HHmm)" `
@@ -106,11 +230,7 @@ az deployment sub create `
   --parameters @infra/main.parameters.json
 ```
 
-This creates the RG, VNet, APIM (takes ~30–45 min), AOAI + PE + DNS, App Insights,
-the APIM gateway Private DNS zone (`deployApimPrivateDns`, default true), and
-optionally the APIM-MI → AOAI role assignment (`assignAoaiRbac`), the P2S VPN gateway
-(`deployVpnGateway`, another ~30 min), and a Windows test VM + Azure Bastion
-(`deployTestVm`).
+Read the outputs with `az deployment sub show --name <name> --query properties.outputs`.
 
 > **Model/SKU (Gov):** `GlobalStandard` does not exist in usgovvirginia. The pilot uses
 > **gpt-5.1 (2025-11-13) on DataZoneStandard**, capacity 50.

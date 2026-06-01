@@ -53,6 +53,15 @@ monitoring/kql/*.kql              Workbook queries
 **Pre-deployment.** Files are scaffolded for review. No `azd up`, no `az deployment`.
 See [docs/deployment-guide.md](docs/deployment-guide.md) for the run order once approved.
 
+**`azd` is the primary deploy path** — `azure.yaml` wires `azd` to the
+subscription-scope `infra/main` template (`azd provision`; no `services:` block, so
+`azd up` == `azd provision`). Requires `azd` >= 1.25.4, Azure CLI >= 2.60, Bicep >= 0.30,
+PowerShell 7+ (see *Required tools* in the deployment guide). **Commercial** is `azd`'s
+default cloud; **Gov** tenants must first run `azd config set cloud.name AzureUSGovernment`
+(global — it selects the AAD login authority) **then** `azd auth login`, otherwise
+provisioning fails with `AADSTS90051: Invalid national Cloud ID (2)`. Raw
+`az deployment sub create` against the same template remains available as an alternative.
+
 ## Known shipping limitations of Copilot CLI BYOK
 
 - `COPILOT_PROVIDER_TYPE=azure` may hardcode an `api-version` ([copilot-cli#3208](https://github.com/github/copilot-cli/issues/3208)). The APIM policy *injects* `api-version` if missing and tolerates whatever the CLI sends.
