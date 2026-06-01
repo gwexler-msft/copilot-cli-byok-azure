@@ -144,6 +144,27 @@ never committed; the two `*.example.json` templates are the only parameters file
 source control. For Commercial, also confirm your `location` hosts the model + SKU
 (`az cognitiveservices account list-skus`) before deploying.
 
+> **Running both Gov and Commercial? Use the env helper.** Manually re-copying the
+> example over `infra/main.parameters.json` every time you switch clouds wipes the
+> placeholder values you just filled in. Instead, [`scripts/select-env.ps1`](../scripts/select-env.ps1)
+> (or [`select-env.sh`](../scripts/select-env.sh)) keeps a persistent, gitignored
+> `infra/main.parameters.<env>.json` **per environment** and copies the selected one
+> over the active `infra/main.parameters.json`, then selects the matching `azd`
+> environment. Your filled-in secrets survive every switch.
+>
+> ```pwsh
+> # First run seeds infra/main.parameters.gov-pilot.json from the Gov profile, then stops
+> # so you can fill placeholders. Re-run to activate it + select the azd env.
+> ./scripts/select-env.ps1 -EnvName gov-pilot
+> # Switch to Commercial (seeds main.parameters.comm-pilot.json the first time):
+> ./scripts/select-env.ps1 -EnvName comm-pilot -SetCloud
+> ```
+>
+> The profile (Gov vs Commercial) is inferred from the env-name prefix
+> (`gov-*` / `comm-*`); pass `-Profile gov|commercial` to override. `-SetCloud` also
+> points `az` + `azd` at that cloud. If you only ever run one cloud, the plain
+> `Copy-Item` above is fine.
+
 ## 2. Validate the Bicep
 
 ```pwsh
