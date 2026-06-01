@@ -1,7 +1,12 @@
 # Deployment Guide
 
 This guide assumes the plan has been reviewed and the Entra tenant + Azure
-subscription are picked. **Nothing here is destructive until step 5.**
+subscription are picked. **Nothing here destroys data.** Steps 0–2 are read-only prep and
+validation; **Step 3 is the only step that creates or changes Azure resources**, and it runs
+in ARM **incremental** mode — re-running it is idempotent and converges in place, it never
+deletes resources that are absent from the template. The only intentionally destructive action
+in this guide is **Teardown** (`az group delete`) at the very end. See *Idempotency, safe
+re-runs & recovery* under Step 3 for what is (and isn't) safe to re-run.
 
 ## Which cloud are you deploying to?
 
@@ -338,6 +343,42 @@ Use `Cognitive Services OpenAI Contributor` instead if they must also create/man
 > **VNet caveat (both clouds):** both accounts have `publicNetworkAccess=Disabled`, so the role
 > is necessary but not sufficient — the playground only works from **inside the VNet** (P2S VPN
 > or the test VM). A user on the public internet stays blocked even with the role.
+
+### Idempotency, safe re-runs & recovery
+
+Both `azd provision` and `az deployment sub create` run ARM in **incremental** mode. That means:
+
+- **Re-running the deploy is safe and idempotent.** It updates resources in place to match the
+  template and **never deletes** resources that aren't in the template. There is no "clean
+  slate" wipe — converge by re-running, not by tearing down.
+- **Always preview first.** `azd provision --preview` (or `az deployment sub what-if`) shows
+  every change before it is applied. Treat a clean preview (core resources `Skip`, only benign
+  computed-property `Modify` noise) as "nothing real will change."
+- **Skip expensive or privileged pieces with the conditional flags** instead of editing the
+  template. Each of these is a `bool`/list param you can flip off:
+  
+  | Param | Skips |
+  |---|---|
+  | `deployVpnGateway` | the P2S VPN gateway (slow, ~30–45 min) |
+  | `deployTestVm` | the in-VNet diagnostics VM |
+  | `deployMiniModel` | the cheap mini tier used by auto-routing |
+  | `deployApimPrivateDns` | the APIM private DNS zone (when peering supplies it) |
+  | `assignAoaiRbac` | the data-plane role grant (when an Owner grants it out-of-band) |
+  | `playgroundPrincipalIds` | human playground access (empty list = none) |
+
+**The few changes ARM cannot do in place** (these are platform/RP limits, not template faults):
+
+| Change | Why it's not in-place | Safe way to make it |
+|---|---|---|
+| Model **SKU / version / name** on a Cognitive Services deployment | the deployment child resource is replaced, not patched | **Blue/green:** add the new model under a **new** deployment name, repoint the APIM exposed-model mapping to it, verify, then delete the old deployment. The account, PE, and network are untouched — no outage window. |
+| Immutable account props (e.g. PE `privateDnsZoneId`) | RP rejects the update | delete just the affected child (e.g. the PE DNS zone-group) and re-run; the parent account stays put |
+| `RoleAssignmentExists` collision | a hand-created assignment used a different name than Bicep's deterministic `guid()` | never hand-create assignments the template owns; if one exists, delete the manual one and let the template recreate it idempotently |
+| `AccountProvisioningStateInvalid` on a full sub re-deploy | the template re-PUTs the AOAI/Foundry account while it is still settling | **transient — retry.** Once the account is `Succeeded`, deploy the affected **RG-scope module** alone (e.g. `apim-aoai-api.bicep`) rather than the whole subscription template |
+
+Net: a customer **cannot** get into a "wonky state" from a normal re-run — incremental mode is
+forgiving. The only hard-destructive operation is **Teardown** below, and the only changes that
+require a replace are SKU/version/immutable edits, which the blue/green pattern stages without
+downtime.
 
 ## 4. Configure the P2S VPN client
 
