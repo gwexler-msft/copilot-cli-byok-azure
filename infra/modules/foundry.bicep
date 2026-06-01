@@ -105,6 +105,9 @@ resource miniDeployment 'Microsoft.CognitiveServices/accounts/deployments@2024-1
   ]
 }
 
+// The PE PUT calls the account control plane, which transiently flips to 'Accepted' while a
+// model deployment is in flight. Serialize the PE after the deployments so the account is back
+// in 'Succeeded' state, avoiding the AccountProvisioningStateInvalid race on idempotent re-runs.
 resource pe 'Microsoft.Network/privateEndpoints@2024-01-01' = {
   name: peName
   location: location
@@ -120,6 +123,10 @@ resource pe 'Microsoft.Network/privateEndpoints@2024-01-01' = {
       }
     ]
   }
+  dependsOn: [
+    modelDeployment
+    miniDeployment
+  ]
 }
 
 // Bind the PE to all relevant shared zones so whichever FQDN the platform registers resolves.
