@@ -216,9 +216,97 @@ az network vnet-gateway vpn-client generate -g $rg -n $gw --processor-architectu
 
 Download the returned URL, install the OpenVPN profile in `AzureVPN/`.
 
-## 5. First developer test
+## 5. Install the Copilot CLI
 
-`COPILOT_PROVIDER_BASE_URL` must include the `/openai` suffix. The wrapper defaults to
+The CLI is a developer-side client (laptop or the in-VNet test VM) — it is **not** part of
+the Azure deployment. Install it wherever you will run `copilot`.
+
+**Prerequisites (install in this order on the test VM):**
+
+| Component | Version | Why | Install (Windows) |
+|---|---|---|---|
+| PowerShell | **7+** | the CLI wants PS **6+**, and `copilot` must run in the same shell the wrapper configures; stock Windows only ships PS 5.1 | `winget install Microsoft.PowerShell` |
+| Node.js | **22+** | runtime for the `copilot` binary (required regardless of install method) | `winget install OpenJS.NodeJS.LTS` |
+| Copilot CLI | **≥ 1.0.54** | the BYOK client | `winget install GitHub.Copilot` |
+
+> **The wrapper runs on stock PowerShell 5.1.** `copilot-cli-byok.ps1` no longer hard-fails
+> with `#requires -Version 7`. Under Windows PowerShell 5.1 it **warns** that PS7 is
+> recommended and offers to install it (default **Yes**) — via WinGet, or, when WinGet is
+> absent, via Microsoft's official MSI installer (`https://aka.ms/install-powershell.ps1`), so
+> it works on stock Windows Server. It then **continues** in 5.1 — the wrapper's own steps
+> (prompting, installing deps, setting the env vars, the `-Test` smoke test) all work there.
+> Because env vars propagate **parent → child only**, the wrapper does everything in the
+> current 5.1 process and then, if PS7 is available, **drops you into an interactive PS7 shell
+> as its last step**. That child `pwsh` inherits the `COPILOT_PROVIDER_*` env vars (and the
+> PATH entry for the npm-global `copilot`), so you land in a supported shell already configured
+> — just type `copilot` to start, `exit` to return.
+
+> **Interactive & remembered.** If you omit `-ApimBaseUrl` or `-Model`, the wrapper prompts
+> for them and **persists the (non-secret) answers** to `%USERPROFILE%\.copilot-byok\config.json`,
+> so next time just press Enter to accept the saved values. `-Model` defaults to **`auto`** (let
+> the gateway route between the full and mini tiers). In subscription-key mode, if neither
+> `-SubscriptionKey` nor `$env:APIM_SUBSCRIPTION_KEY` is set, the wrapper prompts for the key
+> with **masked input** — the key (or JWT) is held only in the session and **never written to
+> disk**.
+
+> **Bake in your own defaults (optional).** Prefer a turn-key script? You can hardcode
+> `$ApimBaseUrl` (and even `$SubscriptionKey`) directly in the `param()` block of
+> `copilot-cli-byok.ps1` — a value set there wins over the saved config and the prompt. They
+> default to empty so the normal prompt/remember flow is unaffected when you leave them alone.
+> A baked-in key sits in the file as plaintext, so prefer `$env:APIM_SUBSCRIPTION_KEY` for
+> secrets.
+
+> **npm is optional.** `winget install GitHub.Copilot` pulls a self-contained build, so you
+> do **not** need npm — just PowerShell 7 and Node 22. Use the npm path only if you prefer it
+> (npm ships with Node 22+).
+
+> **WinGet may be missing on Windows Server.** The App Installer (which provides `winget`) is
+> not present on a stock Windows Server image. Install it first:
+> - Microsoft Store → search **App Installer**, or
+> - download the bundle from <https://aka.ms/getwinget> and run
+>   `Add-AppxPackage -Path .\Microsoft.DesktopAppInstaller_*.msixbundle`
+>
+> On air-gapped hosts where the Store is blocked, use the msixbundle. Alternatively, skip
+> WinGet entirely: install Node.js 22+ from the MSI (<https://nodejs.org>) and then
+> `npm install -g @github/copilot@latest`.
+
+```pwsh
+# Windows (WinGet) — no npm required:
+winget install Microsoft.PowerShell      # PowerShell 7+ (to run the wrapper)
+winget install OpenJS.NodeJS.LTS         # Node.js 22+ (CLI runtime)
+winget install GitHub.Copilot            # the Copilot CLI
+
+# OR all platforms (npm — needs Node 22+ already installed), pin a recent build:
+npm install -g @github/copilot@latest
+
+# Verify (expect 1.0.54 or higher; latest is 1.0.56):
+copilot --version
+```
+
+> **Shortcut.** The wrapper can install the CLI for you: run
+> `./copilot-cli-byok.ps1 ... -InstallDeps` and it will install Node 22+ and the Copilot CLI if
+> they are missing. With WinGet it uses `OpenJS.NodeJS.LTS` + `GitHub.Copilot`; **when WinGet is
+> absent** (stock Windows Server) it falls back to the official **Node.js MSI** from nodejs.org
+> and then `npm install -g @github/copilot@latest` — no Store, no WinGet required. Without
+> `-InstallDeps` it prompts interactively (or just prints the commands and stops when
+> non-interactive).
+
+> **Version floor.** Any build **≥ 1.0.20** speaks the OpenAI-style versionless `/v1`
+> route this gateway expects, but pin a recent release (**≥ 1.0.54**) to pick up BYOK and
+> auto-routing fixes. On the in-VNet test VM, install Node 22+ first (e.g.
+> `winget install OpenJS.NodeJS.LTS`) since it ships without it.
+
+> **GitHub sign-in still required.** Even in BYOK mode the CLI runs `/login` once to verify
+> your GitHub Copilot entitlement; only the **model traffic** is redirected to the private
+> gateway via `COPILOT_PROVIDER_*`. In a fully air-gapped VNet, sign in before locking down
+> egress, or use a `COPILOT_GITHUB_TOKEN` PAT with the *Copilot Requests* permission.
+
+## 6. First developer test
+
+`COPILOT_PROVIDER_BASE_URL` must point at the gateway's `/openai` route — the wrapper
+**appends `/openai` automatically** if you leave it off, so `-ApimBaseUrl
+'https://apim-...azure-api.us'` and `...azure-api.us/openai` are equivalent. The wrapper
+defaults to
 **`authMode=subscriptionKey`** — the developer presents their per-developer **APIM
 subscription key** (set it once in `$env:APIM_SUBSCRIPTION_KEY` to avoid putting the
 secret on the command line). Use `-AuthMode jwt -AppId <clientId-guid>` only if the
@@ -227,6 +315,17 @@ gateway was deployed with `authMode=jwt`; the `-AppId` is the app **client-ID GU
 
 > Get a developer's subscription key from APIM → **Subscriptions** (or the portal
 > "Show/Hide keys" action) for the subscription assigned to that developer.
+
+> **The `auto` model and token limits.** The CLI sizes its context window from a built-in model
+> catalog. A gateway-routed name like **`auto`** isn't in that catalog, so the CLI prints an
+> informational *"Model 'auto' is not in the built-in catalog"* warning and would otherwise fall
+> back to tiny token defaults. The wrapper handles this by exporting
+> `COPILOT_PROVIDER_MAX_PROMPT_TOKENS` / `COPILOT_PROVIDER_MAX_OUTPUT_TOKENS` for any non-catalog
+> model. The defaults are the **smaller** limit of each model the `auto` router can pick, so a
+> request can't overflow whichever tier it lands on: **272000** prompt (gpt-5.1's input cap) and
+> **32768** output (gpt-4.1-mini's output cap). Override either with `-MaxPromptTokens` /
+> `-MaxOutputTokens`. A named catalog model (e.g. `gpt-5.1`) leaves these unset and uses the
+> CLI's own values. The warning itself is harmless.
 
 > **Ready-made test keys.** When `deployTestSubscriptions=true` (the default in
 > subscription-key mode) the deployment provisions all-APIs APIM subscriptions named
@@ -281,7 +380,26 @@ Expected: a five-word response. The APIM log + App Insights show the request wit
 developer dimension (`developer_oid`/`developer_upn` = the APIM subscription Id/Name in
 subscription-key mode, or the Entra `oid`/`upn` in jwt mode).
 
-## 6. Observability check
+> **Linux / macOS developers.** Use the bash twin `scripts/copilot-cli-byok.sh` — `source` it so
+> the exported env vars stay in your shell. It mirrors the same provider contract: the `/openai`
+> suffix is appended if omitted, `[model]` defaults to **`auto`**, and for a non-catalog model it
+> exports the same token limits (`COPILOT_PROVIDER_MAX_PROMPT_TOKENS=272000` /
+> `COPILOT_PROVIDER_MAX_OUTPUT_TOKENS=32768`, overridable via the `MAX_PROMPT_TOKENS` /
+> `MAX_OUTPUT_TOKENS` env vars). It does **not** auto-install prerequisites (install Node 22+ and
+> `npm install -g @github/copilot@latest` yourself) — that bootstrap is Windows-only.
+>
+> ```bash
+> # Configure the shell (default subscription-key mode), then run copilot:
+> APIM_SUBSCRIPTION_KEY='<your per-developer key>' \
+>   source ./scripts/copilot-cli-byok.sh 'https://apim-...azure-api.us/openai'   # model defaults to auto
+> copilot "say hello in exactly five words"
+>
+> # One-shot smoke test (no shell change):
+> TEST=1 APIM_SUBSCRIPTION_KEY='<key>' [APIM_PRIVATE_IP=10.60.1.4] \
+>   ./scripts/copilot-cli-byok.sh 'https://apim-...azure-api.us/openai' gpt-5.1
+> ```
+
+## 7. Observability check
 
 ```pwsh
 # Gov caveat: the App Insights query REST API is disabled in this tenant
@@ -293,7 +411,7 @@ subscription-key mode, or the Entra `oid`/`upn` in jwt mode).
 You should see rows with `developer_oid`, `developer_upn`, `deployment_name` (and
 `backend` on the default Foundry API).
 
-## 7. Tune rate limits & content filtering (optional)
+## 8. Tune rate limits & content filtering (optional)
 
 **Rate-limit tiers (subscriptionKey mode).** Developers are grouped via APIM **products**. The
 defaults ship two tiers — `byok-standard` and `byok-power` — and `dev1`/`dev2` are assigned to
