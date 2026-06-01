@@ -1,0 +1,14 @@
+# CODEOWNERS — require review from the listed owners on every change.
+#
+# GitHub uses this file to auto-request reviews. To actually ENFORCE it you must
+# also turn on branch protection for `main`:
+#   Settings -> Branches -> Add rule -> Branch name pattern: main
+#     [x] Require a pull request before merging
+#     [x] Require approvals (1+)
+#     [x] Require review from Code Owners
+# (Optionally [x] Do not allow bypassing the above settings to include admins.)
+#
+# Syntax: <path-pattern>  <owner> [<owner>...]   Owners are @user or @org/team.
+
+# Global owner — applies to every file unless a later, more specific rule overrides it.
+*       @gwexler-msft
