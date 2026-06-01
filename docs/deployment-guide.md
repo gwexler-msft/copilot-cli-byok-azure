@@ -55,16 +55,22 @@ of these once per machine — the versions are the floors this repo is validated
 
 - Azure CLI logged in: `az login` (Commercial) or `az login --use-device-code` against Gov.
 - **Contributor** on the subscription (to create the RG, VNet, APIM, AOAI/Foundry, etc.).
-- **User Access Administrator** (or Owner) at the subscription/RG scope **if** you deploy with
-  `assignAoaiRbac=true` (default). The template creates role assignments
-  (`Microsoft.Authorization/roleAssignments/write`) so the APIM managed identity can call AOAI
-  **and** Foundry — granting that role is itself a privileged action. In Gov least-privilege
-  setups, **activate User Access Administrator as an eligible (PIM) role for the deployment
-  window only**; you can deactivate it after the deployment completes. With this active, the
-  deployment grants both MI roles itself — there is **no follow-up step**. If you cannot get
-  `roleAssignments/write`, set `assignAoaiRbac=false` and let the **postprovision hook** (or
-  an Owner/UAA running [`scripts/grant-apim-mi-rbac`](../scripts/grant-apim-mi-rbac.ps1))
-  grant both accounts out-of-band (Step 3).
+- **A role-assignment-capable role** — **User Access Administrator**, **Role Based Access
+  Control Administrator**, or **Owner** at the subscription/RG scope — so the APIM managed
+  identity can be granted `Cognitive Services OpenAI User` on AOAI **and** Foundry (the
+  accounts have local auth disabled, so the gateway needs this or data-plane calls return
+  `401 PermissionDenied`). **This is required regardless of how the grant happens.** In Gov
+  least-privilege setups, **activate the role as an eligible (PIM) role for the deployment
+  window only** and deactivate it after.
+- **How the grant happens (both shipped example param files set `assignAoaiRbac=false`):**
+  - **Default — `assignAoaiRbac=false` + `azd` postprovision hook (recommended).** The
+    template skips the in-template RBAC module; the **postprovision hook** grants both
+    accounts via the direct RBAC API. This is the only path that works for a **constrained
+    (ABAC-conditioned) Owner**, where the in-template grant fails (see note in Step 3).
+  - **Alternative — `assignAoaiRbac=true` (in-template).** Set it to `true` in your params
+    only if you hold an **unconstrained** Owner/UAA; the template then creates both role
+    assignments itself and there is **no follow-up step**. (The bicep *param* still defaults
+    to `true`, but every committed `*.example.json` overrides it to `false`.)
 - For the Gov pilot, sign in with an account in your Gov tenant (`*.onmicrosoft.us`).
 
 > **Automated by `azd` hooks.** [azure.yaml](../azure.yaml) wires two hooks so you don't have
@@ -79,10 +85,10 @@ of these once per machine — the versions are the floors this repo is validated
 > - **`postprovision`** → [`scripts/grant-apim-mi-rbac`](../scripts/grant-apim-mi-rbac.ps1)
 >   resolves the APIM MI principalId (it changes on every recreate) and idempotently grants
 >   `Cognitive Services OpenAI User` on the AOAI **and** Foundry accounts. Safe in both modes:
->   when `assignAoaiRbac=true` it just re-confirms the in-template grant (`az` returns the
->   existing assignment); when `false` it is the grant. Both hooks use `az`'s direct RBAC API,
->   which **works for a constrained (ABAC-conditioned) Owner** even though the in-template
->   path does not (see note in Step 3).
+>   with the default `assignAoaiRbac=false` it **is** the grant; when `true` it just
+>   re-confirms the in-template grant (`az` returns the existing assignment). Both hooks use
+>   `az`'s direct RBAC API, which **works for a constrained (ABAC-conditioned) Owner** even
+>   though the in-template path does not (see note in Step 3).
 
 ```pwsh
 # Commercial pilot
@@ -171,8 +177,10 @@ in Step 1, so `azd provision` runs the identical Bicep as a hand-rolled `az depl
 Because there is no `services:` block, `azd up` == `azd provision` (infra only). This single
 flow creates the RG, VNet, APIM (~30–45 min), AOAI + Foundry + PEs + DNS, App Insights, the
 APIM gateway Private DNS zone (`deployApimPrivateDns`, default true), and optionally the
-APIM-MI → AOAI/Foundry role assignments (`assignAoaiRbac`), the P2S VPN gateway
-(`deployVpnGateway`, another ~30 min), and a Windows test VM + Azure Bastion (`deployTestVm`).
+P2S VPN gateway (`deployVpnGateway`, another ~30 min) and a Windows test VM + Azure Bastion
+(`deployTestVm`). The APIM-MI → AOAI/Foundry role grant is handled by the **postprovision
+hook** (shipped default `assignAoaiRbac=false`); set `assignAoaiRbac=true` to have the
+template grant it in-line instead.
 
 ```pwsh
 # 1. Point azd's AUTH + resource layer at the Gov cloud GLOBALLY, then sign in.
@@ -265,8 +273,11 @@ Read the outputs with `az deployment sub show --name <name> --query properties.o
 > available in usgovvirginia). Tune routing via the `autoRoute*` params (threshold 500, band
 > 200, classifier off by default). Set `deployMiniModel=false` to skip the tier entirely.
 >
-> **RBAC:** if your deployer lacks `Microsoft.Authorization/roleAssignments/write`, set
-> `assignAoaiRbac=false` and have an Owner/UAA grant the role out-of-band (see below).
+> **RBAC:** the shipped params set `assignAoaiRbac=false`, so this raw `az deployment` path
+> grants the APIM MI **no** data-plane role. Unlike `azd`, `az deployment` does **not** run the
+> hooks, so you must grant it yourself afterwards — run
+> [`scripts/grant-apim-mi-rbac`](../scripts/grant-apim-mi-rbac.ps1) (see below). Only set
+> `assignAoaiRbac=true` if you hold an unconstrained Owner/UAA and want the template to grant it.
 >
 > **AOAI re-PUT race:** re-running the full `az deployment sub create` can fail with
 > `AccountProvisioningStateInvalid` because the template re-PUTs the AOAI account while
