@@ -367,6 +367,82 @@ flowchart TD
   Tuning knobs are APIM **named values** (`auto-route-*`), so the threshold, band, and classifier
   toggle can be changed without redeploying Bicep.
 
+## How APIM reaches the backend: managed identity vs API key
+
+There are two ways to wire APIM to a Foundry/AOAI backend, and the Azure portal "Import
+Azure OpenAI / Foundry" wizard picks the *other* one from what this project uses. They are
+**two orthogonal choices** the wizard happens to bundle together:
+
+| Axis | Portal wizard default | **This project (chosen)** |
+|---|---|---|
+| **Auth to the backend** | Foundry/AOAI **API key**, stored as an APIM named value / Backend secret | **Entra managed-identity bearer token** (`authentication-managed-identity` → `Authorization: Bearer`) |
+| **Backend reference** | APIM **Backend entity** (Backends tab) → `set-backend-service backend-id="…"` | Inline `set-backend-service base-url="{{…-private-base-url}}"` from a **named value** |
+
+The two axes are independent: a Backend entity can *also* carry a managed identity, and an
+inline `base-url` could *also* use a key. The wizard simply ties "Backend entity" to "key".
+This project deliberately uses **managed identity + named-value base URL**.
+
+### Pattern A — Portal wizard: Backend entity + API key
+
+```mermaid
+flowchart LR
+    Dev["Developer cred<br/>(sub key / JWT)"] --> APIM
+    subgraph APIM["APIM policy"]
+        P1["set-backend-service<br/>backend-id=foundry"]
+        KV["named value:<br/>foundry-api-key (secret)"]
+        P1 --> KV
+    end
+    APIM -- "api-key: &lt;Foundry key&gt;" --> FOUNDRY["Foundry / AOAI<br/>(localAuth ENABLED — required)"]
+    KV -. "manual rotation" .-> Ops["Operator rotates key,<br/>re-syncs named value"]
+```
+
+**Pros:** one-click in the portal; the Backend *entity* unlocks built-in **circuit breaker**
+rules and load-balanced **backend pools** (priority/weight) for multi-region or PTU→PAYG
+failover. **Cons:** requires `disableLocalAuth=false` on the account (a standing secret
+exists); the key must be rotated and the named value re-synced (a classic silent-outage
+source); backend logs attribute calls to an anonymous shared key, not a named identity.
+
+### Pattern B — This project: managed identity + named-value base URL
+
+```mermaid
+flowchart LR
+    Dev["Developer cred<br/>(sub key / JWT)"] --> APIM
+    subgraph APIM["APIM policy"]
+        MI["authentication-managed-identity<br/>resource = {{foundry-mi-audience}}"]
+        SB["set-backend-service<br/>base-url = {{foundry-private-base-url}}"]
+        MI --> SB
+    end
+    APIM -- "Authorization: Bearer &lt;AAD token&gt;" --> ENTRA["Entra ID<br/>(mints token, per-request)"]
+    ENTRA --> FOUNDRY["Foundry / AOAI<br/>(localAuth DISABLED, PE-only)"]
+    RBAC["RBAC: APIM system MI =<br/>Cognitive Services OpenAI User"] -. grants .-> FOUNDRY
+```
+
+**Pros:** **no secret exists** — the account runs with `disableLocalAuth=true`, so there is
+nothing to leak or rotate; tokens are minted per-request and auto-rotated by the platform;
+the backend attributes every call to the APIM MI **principal** (real audit identity) gated by
+least-privilege `Cognitive Services OpenAI User` RBAC; it composes cleanly with the PE-only,
+zero-trust posture this design already enforces. **Cons:** the inline `base-url` does not by
+itself express circuit-breaker / load-balancing — that logic is hand-rolled in policy if
+needed (today: a single private backend, so not needed).
+
+### Why this project leans on managed identity
+
+On the **auth axis the choice is decisive**: managed identity is strictly better for this
+threat model. The wizard's key approach would force us to *re-enable* local auth on a PE-only
+account — directly weakening the design — and add a rotation/drift burden for no benefit.
+Managed identity is also Microsoft's recommended production pattern in the GenAI / AI-gateway
+reference architectures. So we keep MI everywhere (all four policy variants use
+`authentication-managed-identity`).
+
+On the **backend-reference axis**, the inline named-value `base-url` is the right call *today*
+for a single private endpoint: it keeps the routing / auto-route logic legible in one policy
+and needs no extra resource. The one thing the wizard's Backend *entity* gives that we'd
+otherwise hand-code is **resiliency primitives** (circuit breaker, load-balanced pools).
+**Trigger to revisit:** the moment we need multi-region Foundry, PTU+PAYG spillover, or
+automatic backend health-tripping, migrate to APIM **Backend pools** — but keep them
+**managed-identity-authed**, never key-authed. Until then, MI + named-value base URL is the
+simpler, more secure design.
+
 ## Cloud parameterization
 
 The template runs in **both** Azure commercial (`AzureCloud`) and Azure Government
