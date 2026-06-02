@@ -376,11 +376,12 @@ Azure OpenAI / Foundry" wizard picks the *other* one from what this project uses
 | Axis | Portal wizard default | **This project (chosen)** |
 |---|---|---|
 | **Auth to the backend** | Foundry/AOAI **API key**, stored as an APIM named value / Backend secret | **Entra managed-identity bearer token** (`authentication-managed-identity` → `Authorization: Bearer`) |
-| **Backend reference** | APIM **Backend entity** (Backends tab) → `set-backend-service backend-id="…"` | Inline `set-backend-service base-url="{{…-private-base-url}}"` from a **named value** |
+| **Backend reference** | APIM **Backend entity** (Backends tab) → `set-backend-service backend-id="…"` | APIM **Backend entity** by `set-backend-service backend-id="{{…-backend-id}}"` — a single Url backend by default, a load-balanced **Pool** when multi-region is enabled |
 
 The two axes are independent: a Backend entity can *also* carry a managed identity, and an
 inline `base-url` could *also* use a key. The wizard simply ties "Backend entity" to "key".
-This project deliberately uses **managed identity + named-value base URL**.
+This project deliberately uses **managed identity + a Backend entity** — taking the wizard's
+resiliency-capable Backend reference but keeping MI auth instead of a key.
 
 ### Pattern A — Portal wizard: Backend entity + API key
 
@@ -402,14 +403,14 @@ failover. **Cons:** requires `disableLocalAuth=false` on the account (a standing
 exists); the key must be rotated and the named value re-synced (a classic silent-outage
 source); backend logs attribute calls to an anonymous shared key, not a named identity.
 
-### Pattern B — This project: managed identity + named-value base URL
+### Pattern B — This project: managed identity + Backend entity
 
 ```mermaid
 flowchart LR
     Dev["Developer cred<br/>(sub key / JWT)"] --> APIM
     subgraph APIM["APIM policy"]
         MI["authentication-managed-identity<br/>resource = {{foundry-mi-audience}}"]
-        SB["set-backend-service<br/>base-url = {{foundry-private-base-url}}"]
+        SB["set-backend-service<br/>backend-id = {{foundry-backend-id}}"]
         MI --> SB
     end
     APIM -- "Authorization: Bearer &lt;AAD token&gt;" --> ENTRA["Entra ID<br/>(mints token, per-request)"]
@@ -421,9 +422,11 @@ flowchart LR
 nothing to leak or rotate; tokens are minted per-request and auto-rotated by the platform;
 the backend attributes every call to the APIM MI **principal** (real audit identity) gated by
 least-privilege `Cognitive Services OpenAI User` RBAC; it composes cleanly with the PE-only,
-zero-trust posture this design already enforces. **Cons:** the inline `base-url` does not by
-itself express circuit-breaker / load-balancing — that logic is hand-rolled in policy if
-needed (today: a single private backend, so not needed).
+zero-trust posture this design already enforces. Because routing goes through a Backend
+entity, **circuit breakers and load-balanced pools are available without re-architecting** —
+see the opt-in multi-region section below. **Cons:** a Backend entity is one extra resource
+per account vs an inline URL (negligible), and pooling requires granting the MI RBAC on every
+regional member.
 
 ### Why this project leans on managed identity
 
@@ -434,14 +437,59 @@ Managed identity is also Microsoft's recommended production pattern in the GenAI
 reference architectures. So we keep MI everywhere (all four policy variants use
 `authentication-managed-identity`).
 
-On the **backend-reference axis**, the inline named-value `base-url` is the right call *today*
-for a single private endpoint: it keeps the routing / auto-route logic legible in one policy
-and needs no extra resource. The one thing the wizard's Backend *entity* gives that we'd
-otherwise hand-code is **resiliency primitives** (circuit breaker, load-balanced pools).
-**Trigger to revisit:** the moment we need multi-region Foundry, PTU+PAYG spillover, or
-automatic backend health-tripping, migrate to APIM **Backend pools** — but keep them
-**managed-identity-authed**, never key-authed. Until then, MI + named-value base URL is the
-simpler, more secure design.
+On the **backend-reference axis**, every policy now targets an APIM **Backend entity** by
+`backend-id` (a named value: `foundry-backend-id` / `aoai-backend-id`). With pooling off this
+is a single **Url backend** — functionally identical to the old inline base-url, but it gives
+us the seam to attach resiliency primitives (circuit breaker, load-balanced pools) without
+touching the policies. **Managed identity stays the auth method in every case**, single-region
+or pooled: one Entra token (audience = the shared Cognitive Services audience) is valid against
+*every* regional account, so pooling composes with MI for free. The only thing that ever
+changes is which backend the `backend-id` named value points at.
+
+### Multi-region backend pools (opt-in)
+
+Set `deployBackendPool: true` and list extra regions in `foundryRegions` (and/or `aoaiRegions`)
+to deploy regional AI accounts and have APIM load-balance / fail over across them — while the
+managed-identity auth route is unchanged.
+
+```mermaid
+flowchart LR
+    P["APIM policy<br/>authentication-managed-identity<br/>set-backend-service backend-id=foundry-pool"]
+    POOL["Backend: foundry-pool<br/>(Pool, priority/weight)"]
+    B0["Backend: foundry<br/>(primary region)<br/>circuit breaker 429+5xx"]
+    B1["Backend: foundry-r1<br/>(region 2)<br/>circuit breaker 429+5xx"]
+    A0[("Foundry account<br/>primary region")]
+    A1[("Foundry account<br/>region 2")]
+    P --> POOL
+    POOL --> B0 --> A0
+    POOL --> B1 --> A1
+```
+
+What the opt-in does, end to end:
+
+- **Accounts** — `foundryRegions` / `aoaiRegions` each deploy a secondary Cognitive Services
+  account (`infra/modules/foundry.bicep` / `aoai.bicep`, disambiguated by a `regionTag`) with
+  the **same** model and mini deployment names/versions as the primary, so explicit-model and
+  auto-route requests work against any member. Private endpoints land in the primary VNet's PE
+  subnet (cross-region PE is supported) and register in the shared private DNS zones.
+- **Backends + pool** — `infra/modules/apim-backends.bicep` creates one **Url backend** per
+  region plus a **Pool backend** (`foundry-pool` / `aoai-pool`) that load-balances them
+  (priority 1, weight 100 = round-robin). The `foundry-backend-id` named value flips from
+  `foundry` to `foundry-pool` automatically.
+- **Circuit breaker** — `enableBackendCircuitBreaker` (default on when pooling) trips a member
+  out of rotation on **429 + 5xx** within `breakerInterval` and **honors `Retry-After`**, so a
+  PTU 429 spills over to the next region promptly instead of failing the caller. Tune with
+  `breakerFailureCount` / `breakerTripDuration`.
+- **RBAC — the must-not-forget step** — because MI mints one token valid against all accounts,
+  `infra/modules/rbac.bicep` grants the APIM MI **Cognitive Services OpenAI User** on *every*
+  regional account. A member the MI lacks rights on returns 401/403 and silently poisons the
+  pool.
+
+Two caveats this design accepts: the auto-route **Level-2 classifier** still calls the
+*primary* base URL directly (via `foundry-private-base-url`, retained for exactly this reason),
+not the pool — fine for a `max_tokens:1` probe; and the secondary regional accounts must host
+the same deployment names for routing to be uniform. With `deployBackendPool: false` (default)
+none of this is created and behavior is identical to a single transparent Url backend.
 
 ## Cloud parameterization
 

@@ -56,6 +56,12 @@ param autoRouteClassifierEnabled bool = false
 @description('Auto-routing Level 2: deployment name used as the classifier (max_tokens:1 simple/complex).')
 param autoRouteClassifierDeployment string = ''
 
+@description('APIM backend-id the Foundry API policy targets in set-backend-service (a Url backend name or a Pool backend name). Empty = use the legacy inline base-url fallback name "foundry".')
+param foundryBackendId string = ''
+
+@description('APIM backend-id the AOAI API policy targets in set-backend-service. Empty = fallback name "aoai".')
+param aoaiBackendId string = ''
+
 resource apim 'Microsoft.ApiManagement/service@2024-05-01' existing = {
   name: apimName
 }
@@ -260,6 +266,30 @@ resource nvAutoClassifierDeployment 'Microsoft.ApiManagement/service/namedValues
   }
 }
 
+// Backend-id the policies target in set-backend-service. With a single region this is just the
+// Url backend name (transparent vs the old inline base-url); with a pool it is the Pool backend
+// name. The base-url named values above are retained because the auto-route classifier's
+// send-request uses them directly (it does not go through set-backend-service).
+resource nvFoundryBackendId 'Microsoft.ApiManagement/service/namedValues@2024-05-01' = {
+  parent: apim
+  name: 'foundry-backend-id'
+  properties: {
+    displayName: 'foundry-backend-id'
+    value: empty(foundryBackendId) ? 'foundry' : foundryBackendId
+    secret: false
+  }
+}
+
+resource nvAoaiBackendId 'Microsoft.ApiManagement/service/namedValues@2024-05-01' = {
+  parent: apim
+  name: 'aoai-backend-id'
+  properties: {
+    displayName: 'aoai-backend-id'
+    value: empty(aoaiBackendId) ? 'aoai' : aoaiBackendId
+    secret: false
+  }
+}
+
 output namedValueIds array = [
   nvOpenId.id
   nvAppIdUri.id
@@ -281,4 +311,6 @@ output namedValueIds array = [
   nvAutoBand.id
   nvAutoClassifierEnabled.id
   nvAutoClassifierDeployment.id
+  nvFoundryBackendId.id
+  nvAoaiBackendId.id
 ]

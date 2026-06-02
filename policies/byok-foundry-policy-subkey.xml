@@ -178,11 +178,11 @@
     <choose>
       <when condition="@((bool)context.Variables["routeToAoai"])">
         <authentication-managed-identity resource="{{aoai-mi-audience}}" />
-        <set-backend-service base-url="{{aoai-private-base-url}}" />
+        <set-backend-service backend-id="{{aoai-backend-id}}" />
       </when>
       <otherwise>
         <authentication-managed-identity resource="{{foundry-mi-audience}}" />
-        <set-backend-service base-url="{{foundry-private-base-url}}" />
+        <set-backend-service backend-id="{{foundry-backend-id}}" />
       </otherwise>
     </choose>
 

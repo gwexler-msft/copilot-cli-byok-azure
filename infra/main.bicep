@@ -226,6 +226,35 @@ param restrictVmEgress bool = false
 @description('Deploy a VNet-linked Private DNS zone (azure-api.us/.net) with an A record for the APIM gateway so in-VNet clients resolve it without a hosts entry. Prerequisite for the VPN/DNS-resolver phase too.')
 param deployApimPrivateDns bool = true
 
+// ---------------------------------------------------------------------------------------------
+// Multi-region backend pools (opt-in). When off (default) each AI account is fronted by a single
+// transparent APIM Url backend, identical to the prior inline base-url behavior. When on, extra
+// regional accounts are deployed and APIM load-balances/fails-over across them via a Pool backend
+// with circuit breakers — WITHOUT changing the managed-identity auth route (one Entra token,
+// audience = the shared Cognitive Services audience, is valid against every regional account).
+// ---------------------------------------------------------------------------------------------
+
+@description('Deploy multi-region APIM backend pools (load-balanced + circuit-broken) across the AI accounts, keeping the managed-identity auth route. Default false = a single transparent Url backend per account. Opt in AND populate foundryRegions / aoaiRegions to add regions.')
+param deployBackendPool bool = false
+
+@description('Additional Foundry regions for the backend pool, BEYOND the primary `location`. Each item: { location: string, modelCapacity: int, miniModelCapacity: int }. Only used when deployBackendPool=true. The same model + mini deployment (names/versions) is created in every region so auto-routing works pool-wide.')
+param foundryRegions array = []
+
+@description('Additional AOAI regions for the backend pool, BEYOND the primary `location`. Each item: { location: string, modelCapacity: int, miniModelCapacity: int }. Only used when deployBackendPool=true AND deployAoai=true.')
+param aoaiRegions array = []
+
+@description('Attach a circuit breaker to each pooled Url backend (trips on 429 + 5xx and honors Retry-After so PTU 429s spill promptly to the next region). Only applies when deployBackendPool=true.')
+param enableBackendCircuitBreaker bool = true
+
+@description('Circuit breaker: number of failures within breakerInterval that trip a backend out of rotation.')
+param breakerFailureCount int = 5
+
+@description('Circuit breaker: rolling window the failures are counted over (ISO-8601 duration).')
+param breakerInterval string = 'PT1M'
+
+@description('Circuit breaker: how long a tripped backend stays out of rotation before being retried (ISO-8601 duration).')
+param breakerTripDuration string = 'PT1M'
+
 var suffix = substring(uniqueString(subscription().id, envName, location), 0, 6)
 var rgName = 'rg-${namePrefix}-${envName}'
 
@@ -358,6 +387,69 @@ module foundry 'modules/foundry.bicep' = if (deployFoundry) {
   }
 }
 
+// Secondary Foundry accounts (one per extra region) for the backend pool. Same model + mini
+// deployment names/versions as the primary so auto-routing and explicit model calls work against
+// any pool member. PEs land in the primary VNet's PE subnet (cross-region PE is supported); the
+// shared private DNS zones get one A record per account (customSubDomainName is unique per name).
+module foundryRegional 'modules/foundry.bicep' = [for (region, i) in foundryRegions: if (deployFoundry && deployBackendPool) {
+  name: 'foundry-r${i + 1}'
+  scope: rg
+  params: {
+    namePrefix: namePrefix
+    envName: envName
+    suffix: suffix
+    regionTag: 'r${i + 1}'
+    location: region.location
+    openaiPublicSuffix: v.aoaiPublicSuffix
+    openaiZoneId: privatedns.outputs.openaiZoneId
+    cognitiveZoneId: privatedns.outputs.cognitiveZoneId
+    aiZoneId: privatedns.outputs.aiZoneId
+    peSubnetId: network.outputs.peSubnetId
+    modelName: foundryModelName
+    modelVersion: foundryModelVersion
+    modelDeploymentSku: foundryModelDeploymentSku
+    modelCapacity: region.modelCapacity
+    exposedModelName: foundryExposedModelName
+    raiPolicyName: raiPolicyName
+    deployMiniModel: deployMiniModel
+    miniModelName: miniModelName
+    miniModelVersion: miniModelVersion
+    miniModelDeploymentSku: miniModelDeploymentSku
+    miniModelCapacity: region.miniModelCapacity
+    miniExposedModelName: miniExposedModelName
+    miniRaiPolicyName: raiPolicyName
+  }
+}]
+
+// Secondary AOAI accounts (one per extra region) for the legacy /aoai backend pool.
+module aoaiRegional 'modules/aoai.bicep' = [for (region, i) in aoaiRegions: if (deployAoai && deployBackendPool) {
+  name: 'aoai-r${i + 1}'
+  scope: rg
+  params: {
+    namePrefix: namePrefix
+    envName: envName
+    suffix: suffix
+    regionTag: 'r${i + 1}'
+    location: region.location
+    openaiPublicSuffix: v.aoaiPublicSuffix
+    openaiZoneId: privatedns.outputs.openaiZoneId
+    peSubnetId: network.outputs.peSubnetId
+    modelName: modelName
+    modelVersion: modelVersion
+    modelDeploymentSku: modelDeploymentSku
+    modelCapacity: region.modelCapacity
+    apimExposedModelName: apimExposedModelName
+    raiPolicyName: raiPolicyName
+    deployMiniModel: deployMiniModel
+    miniModelName: miniModelName
+    miniModelVersion: miniModelVersion
+    miniModelDeploymentSku: miniModelDeploymentSku
+    miniModelCapacity: region.miniModelCapacity
+    miniExposedModelName: miniExposedModelName
+    miniRaiPolicyName: raiPolicyName
+  }
+}]
+
 module apim 'modules/apim.bicep' = {
   name: 'apim'
   scope: rg
@@ -373,6 +465,39 @@ module apim 'modules/apim.bicep' = {
     appInsightsId: observability.outputs.appInsightsId
     appInsightsInstrumentationKey: observability.outputs.appInsightsInstrumentationKey
     logAnalyticsId: observability.outputs.logAnalyticsId
+  }
+}
+
+// The backend-id the policies target: the single Url backend by default, the Pool when >1 region.
+// Unlike the old inline base-url, set-backend-service backend-id is validated to EXIST when the
+// policy is applied. The Foundry policy statically references {{aoai-backend-id}} (and vice-versa)
+// in its never-taken cross-route branch, so when one family is not deployed its backend-id must
+// fall back to the OTHER family's existing backend to pass validation. The branch is never taken
+// at runtime (it is gated on aoai-pinned-models, which is empty when AOAI is not deployed).
+var foundryBackendReal = (deployBackendPool && length(foundryRegions) > 0) ? 'foundry-pool' : 'foundry'
+var aoaiBackendReal = (deployBackendPool && length(aoaiRegions) > 0) ? 'aoai-pool' : 'aoai'
+var foundryBackendId = deployFoundry ? foundryBackendReal : (deployAoai ? aoaiBackendReal : 'foundry')
+var aoaiBackendId = deployAoai ? aoaiBackendReal : (deployFoundry ? foundryBackendReal : 'aoai')
+
+module apimBackends 'modules/apim-backends.bicep' = {
+  name: 'apim-backends'
+  scope: rg
+  params: {
+    apimName: apim.outputs.apimName
+    #disable-next-line BCP318 // guarded by deployFoundry
+    foundryPrimaryUrl: deployFoundry ? foundry.outputs.foundryPrivateBaseUrl : ''
+    // Direct for-expression (no ternary): empty when foundryRegions is unset. Pair foundryRegions
+    // with deployFoundry + deployBackendPool, since it references the regional accounts' outputs.
+    #disable-next-line BCP318 // regional outputs only present when the loop deployed
+    foundryRegionalUrls: [for (region, i) in foundryRegions: foundryRegional[i].outputs.foundryPrivateBaseUrl]
+    #disable-next-line BCP318 // guarded by deployAoai
+    aoaiPrimaryUrl: deployAoai ? aoai.outputs.aoaiPrivateBaseUrl : ''
+    #disable-next-line BCP318 // regional outputs only present when the loop deployed
+    aoaiRegionalUrls: [for (region, i) in aoaiRegions: aoaiRegional[i].outputs.aoaiPrivateBaseUrl]
+    enableCircuitBreaker: deployBackendPool && enableBackendCircuitBreaker
+    breakerFailureCount: breakerFailureCount
+    breakerInterval: breakerInterval
+    breakerTripDuration: breakerTripDuration
   }
 }
 
@@ -402,6 +527,8 @@ module apimNamedValues 'modules/apim-named-values.bicep' = {
     autoRouteAmbiguousBand: autoRouteAmbiguousBand
     autoRouteClassifierEnabled: autoRouteClassifierEnabled
     autoRouteClassifierDeployment: miniExposedModelName
+    foundryBackendId: foundryBackendId
+    aoaiBackendId: aoaiBackendId
   }
 }
 
@@ -420,6 +547,7 @@ module apimFoundryApi 'modules/apim-foundry-api.bicep' = if (deployFoundry) {
   // 'openai' is free, avoiding "Cannot create API ... with the same Path" collisions.
   dependsOn: [
     apimAoaiApi
+    apimBackends
   ]
 }
 
@@ -433,6 +561,9 @@ module apimAoaiApi 'modules/apim-aoai-api.bicep' = if (deployAoai) {
     authMode: authMode
     namedValueIds: apimNamedValues.outputs.namedValueIds
   }
+  dependsOn: [
+    apimBackends
+  ]
 }
 
 module apimProducts 'modules/apim-products.bicep' = if (authMode == 'subscriptionKey' && deployTestSubscriptions) {
@@ -477,6 +608,10 @@ module rbac 'modules/rbac.bicep' = if (assignAoaiRbac || !empty(playgroundPrinci
     assignAoai: deployAoai
     assignFoundry: deployFoundry
     assignApimMi: assignAoaiRbac
+    #disable-next-line BCP318 // regional outputs only present when those loops deployed
+    additionalFoundryAccountNames: [for (region, i) in foundryRegions: foundryRegional[i].outputs.foundryAccountName]
+    #disable-next-line BCP318
+    additionalAoaiAccountNames: [for (region, i) in aoaiRegions: aoaiRegional[i].outputs.aoaiAccountName]
     playgroundPrincipalIds: playgroundPrincipalIds
     playgroundPrincipalType: playgroundPrincipalType
     apimPrincipalId: apim.outputs.apimPrincipalId

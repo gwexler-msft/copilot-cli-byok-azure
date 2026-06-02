@@ -4,6 +4,12 @@ param aoaiAccountName string = ''
 @description('Foundry (kind=AIServices) account name. Empty when not deployed.')
 param foundryAccountName string = ''
 
+@description('Additional Foundry regional account names (backend-pool members) the APIM MI must also call.')
+param additionalFoundryAccountNames array = []
+
+@description('Additional AOAI regional account names (backend-pool members) the APIM MI must also call.')
+param additionalAoaiAccountNames array = []
+
 @description('Assign APIM MI the OpenAI User role on the AOAI account.')
 param assignAoai bool = true
 
@@ -95,3 +101,22 @@ resource deployerToFoundry 'Microsoft.Authorization/roleAssignments@2022-04-01' 
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleCognitiveServicesOpenAIContributor)
   }
 }
+
+// Backend-pool members in other regions. The APIM MI mints ONE token (shared Cognitive Services
+// audience) valid against every account, so it must hold the OpenAI User role on each member or
+// that member silently returns 401/403 and poisons the pool. This is the must-not-forget step.
+var additionalAiAccountNames = concat(additionalFoundryAccountNames, additionalAoaiAccountNames)
+
+resource additionalAccounts 'Microsoft.CognitiveServices/accounts@2024-10-01' existing = [for name in additionalAiAccountNames: {
+  name: name
+}]
+
+resource apimToAdditional 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for (name, i) in additionalAiAccountNames: if (assignApimMi) {
+  scope: additionalAccounts[i]
+  name: guid(additionalAccounts[i].id, apimPrincipalId, roleCognitiveServicesOpenAIUser)
+  properties: {
+    principalId: apimPrincipalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleCognitiveServicesOpenAIUser)
+  }
+}]

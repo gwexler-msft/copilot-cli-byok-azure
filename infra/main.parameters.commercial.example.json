@@ -50,6 +50,14 @@
     "deployNatGateway":   { "value": false },
     "restrictVmEgress":   { "value": false },
     "testVmAdminUsername": { "value": "byokadmin" },
-    "deployApimPrivateDns": { "value": true }
+    "deployApimPrivateDns": { "value": true },
+    "_comment_backendPool": "Opt-in multi-region backend pools. Leave deployBackendPool=false for a single transparent Url backend (current behavior). To add regions, set deployBackendPool=true and list extra regions; the SAME model + mini deployment is created in each. RBAC for the APIM MI is granted on every regional account automatically.",
+    "deployBackendPool":  { "value": false },
+    "foundryRegions":     { "value": [] },
+    "aoaiRegions":        { "value": [] },
+    "enableBackendCircuitBreaker": { "value": true },
+    "breakerFailureCount": { "value": 5 },
+    "breakerInterval":    { "value": "PT1M" },
+    "breakerTripDuration": { "value": "PT1M" }
   }
 }

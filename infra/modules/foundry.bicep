@@ -10,6 +10,9 @@ param envName string
 param suffix string
 param location string
 
+@description('Disambiguator appended to the account name for secondary backend-pool regions. Empty = primary account (name unchanged).')
+param regionTag string = ''
+
 @description('Public DNS suffix for the openai endpoint (e.g. openai.azure.com or openai.azure.us). Used to build the private base URL.')
 param openaiPublicSuffix string
 
@@ -44,9 +47,9 @@ param miniModelCapacity int = 0
 param miniExposedModelName string = ''
 param miniRaiPolicyName string = 'Microsoft.DefaultV2'
 
-var nameBody = take(replace(toLower('${namePrefix}${envName}${suffix}'), '-', ''), 56)
+var nameBody = take(replace(toLower('${namePrefix}${envName}${suffix}${regionTag}'), '-', ''), 56)
 var foundryName = 'aif${nameBody}'
-var peName      = take('pe-foundry-${envName}-${suffix}', 80)
+var peName      = take('pe-foundry-${envName}-${suffix}${empty(regionTag) ? '' : '-${regionTag}'}', 80)
 
 resource foundry 'Microsoft.CognitiveServices/accounts@2024-10-01' = {
   name: foundryName

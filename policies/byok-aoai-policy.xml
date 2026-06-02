@@ -213,8 +213,9 @@
       <value>{{aoai-default-api-version}}</value>
     </set-query-parameter>
 
-    <!-- 10. Route to private AOAI FQDN. set-backend-service overrides the API's baseUrl. -->
-    <set-backend-service base-url="{{aoai-private-base-url}}" />
+    <!-- 10. Route to the AOAI backend (a Url backend, or a multi-region Pool). The backend-id
+         named value resolves to the single Url backend by default, or the pool when enabled. -->
+    <set-backend-service backend-id="{{aoai-backend-id}}" />
   </inbound>
 
   <backend>
