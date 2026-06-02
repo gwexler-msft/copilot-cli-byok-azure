@@ -63,6 +63,9 @@ flowchart LR
 
     classDef optin fill:#f5f5f5,stroke:#bbbbbb,stroke-dasharray:5 5,color:#888888;
     class FOUNDRY2,AOAI,AOAI2,SAAS,ENT optin;
+    %% subgraph containers are styled separately from nodes (classDef does not apply)
+    style GH fill:#fafafa,stroke:#cccccc,stroke-dasharray:5 5,color:#888888;
+    style AoaiGroup fill:#fafafa,stroke:#cccccc,stroke-dasharray:5 5,color:#888888;
 ```
 
 > Greyed/dashed boxes are **opt-in** — nothing in the default deployment creates them. The
