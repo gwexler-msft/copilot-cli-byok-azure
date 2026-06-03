@@ -175,6 +175,8 @@ If it builds clean, preview the plan. As a note, no output = clean build. This c
 run a what-if at subscription scope:
 
 ```pwsh
+#Azure Government
+
 az deployment sub what-if `
   --location usgovvirginia `
   --template-file infra/main.bicep `
@@ -182,6 +184,15 @@ az deployment sub what-if `
 ```
 
 Read the preview/what-if output. **Stop here and inspect before going further.**
+
+```pwsh
+#Azure Commercial
+
+az deployment sub what-if `
+  --location centralus `
+  --template-file infra/main.bicep `
+  --parameters @infra/main.parameters.json
+```
 
 > **Commercial (`AzureCloud`) first run:** use your commercial region for `--location`
 > and confirm the plan includes the **`privatelink.services.ai.azure.com`** private DNS
