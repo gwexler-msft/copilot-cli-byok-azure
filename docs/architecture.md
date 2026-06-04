@@ -151,6 +151,18 @@ short-lived tokens, instant revocation). Switching modes is a single parameter f
 redeploy — no structural change, because both policy variants and all named values are
 always present.
 
+> **`authMode=jwt` validated end-to-end in Azure US Government (2026-06-03).** A live probe
+> from the in-VNet test VM against the Gov gateway (`copilot-byok-foundry`, Internal VNet)
+> returned **HTTP 200** with a `gpt-5.1` completion when a Gov Entra JWT was supplied in the
+> `api-key` header, and **HTTP 401** ("invalid Entra token") for a bad token — confirming
+> `validate-jwt` enforcement and the full chain *CLI → APIM (validate-jwt) → strip creds →
+> APIM system-MI token for `cognitiveservices.azure.us` → private-endpoint Foundry*. The CLI's
+> lack of custom-header support (github/copilot-cli#3399) is **not** a blocker: the JWT rides
+> in the single `api-key` header slot and the policy re-injects it as `Authorization: Bearer`.
+> Tokens mint with `az account get-access-token --scope "<AppId>/.default"` (v2 `aud` = the
+> app client-ID GUID). Gov OIDC metadata resolves at `login.microsoftonline.us`. Note: `gpt-5.1`
+> requires `max_completion_tokens` (not `max_tokens`).
+
 ### Mode A — subscription key (default)
 
 ```mermaid
@@ -250,6 +262,32 @@ End-to-end the flow is:
    issues APIM's **own** MI token for AOAI.
 5. APIM attaches the MI token as `Authorization: Bearer` and forwards to the private
    AOAI endpoint.
+
+### Upstream CLI dependencies & the token-refresh gap (`authMode=jwt`)
+
+Two distinct Copilot CLI limitations shape `jwt` mode. They are often conflated — they
+are not the same problem.
+
+| Limitation | Effect on this design | Upstream issue |
+|---|---|---|
+| **No custom headers** — the CLI exposes only the `api-key` slot | The JWT is *smuggled* in the `api-key` header and the policy re-injects it as `Authorization: Bearer` so `validate-jwt` can read it (steps 1–2 of [byok-foundry-policy.xml](../policies/byok-foundry-policy.xml)) | [github/copilot-cli#3399](https://github.com/github/copilot-cli/issues/3399) *(open, Feature)* |
+| **Static credential, read once at startup** — no refresh hook | The ~60–90 min Entra token expires mid-session → APIM returns **401** with no way for the CLI to re-mint. Requires an external refresh mechanism (a local token-refreshing sidecar proxy) | *No upstream issue exists yet* — see [docs/feature-request-byok-credential-refresh.md](feature-request-byok-credential-refresh.md) |
+
+**If #3399 ships (custom headers):** the change is *cosmetic cleanup only*. The JWT moves
+into a real `Authorization: Bearer <jwt>` header (e.g. `COPILOT_EXTRA_HEADERS`), and the
+policy's api-key→Bearer re-injection (steps 1–2) can be deleted because `validate-jwt`
+reads `Authorization` natively. **The expiry cliff is unchanged** — custom headers are
+still read once at startup, so the sidecar is still required.
+
+**The transformational fix is the missing one** — a credential *refresh* capability (a
+per-request credential command, a file-backed credential the CLI re-reads, or native
+OAuth client-credential refresh). That would let us **delete the sidecar** and make `jwt`
+mode seamless. It is *not* #3399 and *not* #3448 (extra request params); it does not yet
+exist upstream, so we draft it in [feature-request-byok-credential-refresh.md](feature-request-byok-credential-refresh.md).
+
+Until then the decision matrix is unchanged: **`subscriptionKey` stays the default**
+(long-lived, no refresh machinery), and **`jwt` is the opt-in stronger control** that
+ships with a token-refreshing sidecar.
 
 
 ## Wire format
