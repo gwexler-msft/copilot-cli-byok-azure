@@ -138,13 +138,13 @@ exposes.
 
 ### Why subscription-key is the default
 
-This gateway's design was set by the customer's sales-led architecture, which
-standardized on **one APIM subscription key per developer**. They very likely already
-have those keys provisioned and wired into their tooling, so defaulting to
-`authMode=subscriptionKey` matches what they were sold and lets them adopt the gateway
-with zero changes on the developer side. It also sidesteps the **~1-hour Entra token
-expiry**: a subscription key is long-lived, so there is no per-invocation token mint and
-no token-refresh wrapper to run.
+`authMode=subscriptionKey` is the **recommended starter default** — a proposal, not a
+mandate. It standardizes on **one APIM subscription key per developer**, which most teams
+can adopt with zero changes on the developer side (a long-lived static key fits the CLI's
+static-credential model and any keys already in their tooling). It also sidesteps the
+**~1-hour Entra token expiry**: a subscription key is long-lived, so there is no
+per-invocation token mint and no token-refresh wrapper to run. Teams that want
+cryptographic per-user identity should evaluate `authMode=jwt` below.
 
 `authMode=jwt` is retained as an opt-in **stronger control** (true per-user identity,
 short-lived tokens, instant revocation). Switching modes is a single parameter flip plus
@@ -215,7 +215,7 @@ sequenceDiagram
 
 | Dimension | `subscriptionKey` (default) | `jwt` |
 |---|---|---|
-| What the customer was sold | ✅ This is the sales-led design | Alternative / upgrade |
+| Recommended posture | ✅ Recommended starter default | Opt-in stronger control / upgrade |
 | Per-developer identity | Per **subscription** (one key = one dev, by convention) | Per **Entra user** (cryptographic `oid`) |
 | Secret lifetime | Long-lived key (rotate manually) | ~1 hour, minted per invocation |
 | Secret on disk | Yes — key sits in CLI config | No — token is ephemeral |
@@ -1243,9 +1243,10 @@ flowchart LR
 
 ## Choosing between the two auth modes
 
-The default is `authMode=subscriptionKey` because it matches the customer's existing
-sales-led design and likely-already-provisioned per-developer keys (see
-[Authentication modes](#authentication-modes)). The trade-off, stated plainly:
+The default is `authMode=subscriptionKey` because it is the simplest starter posture —
+long-lived per-developer keys that fit the CLI's static-credential model and any keys a
+team may already have provisioned (see [Authentication modes](#authentication-modes)). It
+is a recommended default, not a fixed decision. The trade-off, stated plainly:
 
 - **Per-developer identity.** A subscription key identifies the developer by *convention*
   — one key issued per developer, surfaced in telemetry as the subscription Id/Name. A
