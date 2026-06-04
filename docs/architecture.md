@@ -627,11 +627,11 @@ sequenceDiagram
     R1-->>APIM: 429 / 5xx
     APIM->>R2: in-request retry to next member
     R2-->>Dev: 200 (caller never sees the failure)
-    Note over APIM,R1: breaker counts the failure - after threshold primary is tripped out for breakerTripDuration
+    Note over Dev,R2: breaker counts the failure - after threshold primary is tripped out for breakerTripDuration
     Dev->>APIM: subsequent requests
     APIM->>R2: routed to healthy secondary while primary is tripped
     R2-->>Dev: 200
-    Note over APIM,R1: breaker resets - traffic returns to primary
+    Note over Dev,R2: breaker resets - traffic returns to primary
 ```
 
 With `backendPoolStrategy: priority` this is classic **active/passive DR**; with `weighted` it is
