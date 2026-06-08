@@ -182,8 +182,8 @@ param jwtDefaultTokensPerMinute int = 60000
 @description('jwt mode: the SINGLE flat per-developer hard monthly call ceiling (calls per 30 days), keyed on Entra oid. Applies only when authMode=jwt.')
 param jwtDefaultMonthlyCallQuota int = 200000
 
-@description('Content-filter (responsible-AI) policy name applied to model deployments. Microsoft.DefaultV2 = built-in default (no change). Set to a custom raiPolicy name created via scripts/configure-content-filter to tighten/loosen filtering.')
-param raiPolicyName string = 'Microsoft.DefaultV2'
+@description('Content-filter (responsible-AI) policy name applied to model deployments. byok-strict = the shipped tightened default (severityThreshold=Low on all four harm categories + Jailbreak prompt-shield + Protected Material Text; authored automatically from scripts/content-filter.byok-strict.json). Set to a built-in Microsoft.* name (e.g. Microsoft.DefaultV2) to use the platform default with no custom policy.')
+param raiPolicyName string = 'byok-strict'
 
 @description('Deploy a P2S VPN gateway. Adds ~30 min and ~$140/mo.')
 param deployVpnGateway bool = true

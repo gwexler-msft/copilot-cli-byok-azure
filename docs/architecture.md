@@ -1191,39 +1191,61 @@ parameter:
 
 **What you get regardless.** Every model deployment — **both** the Azure OpenAI and the Foundry
 deployment — is *always* created with a content filter; there is no "off" switch in Azure OpenAI /
-Foundry. Out of the box both deployments run Microsoft's built-in `Microsoft.DefaultV2` baseline
-(Hate, Sexual, Violence, Self-harm filtered at Medium on prompt **and** completion, plus prompt
-shields). This ships with zero configuration and is what your current Gov deployment is running.
+Foundry. Microsoft's built-in `Microsoft.DefaultV2` baseline (Hate, Sexual, Violence, Self-harm
+filtered at **Medium** on prompt **and** completion, plus prompt shields) is the platform floor and
+is what every deployment inherits if you do nothing.
 
-**It is not deployed as a custom resource by default — it is opt-in via one parameter.** What the
-template deliberately does *not* author is a custom `raiPolicies` Bicep resource (custom RAI
-policies and some categories behave differently in Azure Government, so a hardcoded resource risks
-breaking a Gov deploy). Instead the choice is a **single parameter plus a helper script**:
+**The deployed default is now `byok-strict`, a tightened custom policy authored in IaC.** Rather
+than ride on the Microsoft baseline, the template ships and attaches its own hardened policy by
+default. It is authored as a real `Microsoft.CognitiveServices/accounts/raiPolicies` Bicep resource
+on each account, from the single spec in
+[scripts/content-filter.byok-strict.json](../scripts/content-filter.byok-strict.json), and the
+model deployments `dependsOn` it so the policy always exists before a deployment references it.
+`byok-strict` tightens the four harm categories to **severityThreshold=Low** on prompt **and**
+completion (8 filters), and adds **Jailbreak** (prompt shield) and **Protected Material Text**
+blocking — `basePolicyName: Microsoft.DefaultV2`, `mode: Default`.
 
-- **Bicep param `raiPolicyName`** (default `Microsoft.DefaultV2`) — a **single** knob threaded
-  into **both** model modules ([aoai.bicep](../infra/modules/aoai.bicep) and
+> **Gov-validated.** The original template avoided authoring a `raiPolicies` Bicep resource over
+> a concern that custom RAI policies behave differently in Azure Government. That concern was
+> retired by a live stress test against the Gov Foundry account: the full `byok-strict` composite
+> (and every individual filter in it) is **accepted** by Azure US Government. The policy is now
+> live on both Gov deployments (`gpt-5.1`, `gpt-4.1-mini`).
+
+**One shared knob.** The choice is still a **single parameter plus a helper script**:
+
+- **Bicep param `raiPolicyName`** (default `byok-strict`) — a **single** knob threaded into
+  **both** model modules ([aoai.bicep](../infra/modules/aoai.bicep) and
   [foundry.bicep](../infra/modules/foundry.bicep)), so AOAI and Foundry always share the same
-  filter. Leave it at the default for zero change; set it to a custom policy name to pin a
-  tightened/loosened filter in IaC.
+  filter. Any custom (non-`Microsoft.*`) name is authored on the account from the `byok-strict`
+  spec; a built-in `Microsoft.*` name (e.g. `Microsoft.DefaultV2`) is used as-is with **no**
+  custom resource authored.
 - **`scripts/configure-content-filter.ps1` / `.sh`** — cloud-aware (reads the ARM endpoint from
   the active cloud, Gov-safe):
   - `-Show` lists the account's `raiPolicies` and which policy each deployment uses.
   - `-Apply` creates/updates a custom `raiPolicy` from a JSON spec
-    (`content-filter.sample.json`) and can repoint a deployment to it.
+    (`content-filter.byok-strict.json` or `content-filter.sample.json`) and can repoint a
+    deployment to it.
 - **Categories** (each with a severity threshold Low/Medium/High, blocking on/off, and a
   Prompt/Completion source): Hate, Sexual, Violence, Self-harm, Jailbreak (prompt shields),
-  Protected Material Text, Protected Material Code.
+  Protected Material Text, Protected Material Code, Indirect Attack. `byok-strict` deliberately
+  **omits Protected Material Code and Indirect Attack** — both are accepted by the platform, but
+  in a coding CLI (which streams file contents and source code) they are the categories most
+  likely to fire false-positives, so they are left as documented opt-in add-ons rather than on by
+  default.
 
 **What changing it does.** Because `raiPolicyName` is one shared value, repointing it affects
 **both** models identically:
 
 | You set `raiPolicyName` to… | Effect |
 |---|---|
-| `Microsoft.DefaultV2` (default) | Microsoft baseline on both deployments — no custom resource, nothing to maintain. |
-| a custom policy name (e.g. `byok-strict`) | Both AOAI and Foundry deployments are repointed to that policy on the next deploy. The policy itself must already exist on each account (create it with the helper script's `-Apply`, or it will fail to attach). |
+| `byok-strict` (default) | Both AOAI and Foundry accounts get the tightened policy authored as a Bicep `raiPolicies` resource and both deployments are attached to it. Nothing to pre-create — the deployment `dependsOn` the policy. |
+| another custom name | The `byok-strict` spec is authored under that name on each account and both deployments attach to it. |
+| `Microsoft.DefaultV2` (or any `Microsoft.*`) | Microsoft baseline on both deployments — no custom resource authored, nothing to maintain. |
 
 > If you ever need **different** filters for AOAI vs Foundry, the single `raiPolicyName` would
-> need splitting into two params; today both intentionally share one policy.
+> need splitting into two params; today both intentionally share one policy. The `mini`
+> deployment follows `miniRaiPolicyName` (also defaulting to `byok-strict`); when it differs from
+> the primary custom name a second `raiPolicies` resource is authored for it.
 
 ```mermaid
 flowchart LR
@@ -1236,10 +1258,14 @@ flowchart LR
     F2 -- blocked --> X
 ```
 
-> **Approval boundary:** *Tightening* (more blocking, lower thresholds) is always allowed.
-> *Loosening* below Microsoft defaults (raising a threshold to High, disabling a category)
-> requires an approved Azure OpenAI modified-content-filter application; the platform rejects an
-> unapproved loosened policy. The sample config tightens (thresholds at Low) as a safe example.
+> **Approval boundary (stress-tested live in Gov).** *Tightening* (more blocking, lower
+> thresholds) is always allowed — `byok-strict` at threshold `Low` applies with no approval.
+> The gate on *loosening* is narrower than commonly assumed: the live test found that raising a
+> category's `severityThreshold` to `High` is **accepted and stored unclamped** (it is *not*
+> silently pinned back to Medium). What the platform **rejects** without an approved Azure OpenAI
+> modified-content-filter application is **disabling a category** (`enabled: false`) or making it
+> **annotate-only** (`blocking: false`) below the Microsoft floor. So threshold adjustments are
+> ungated; only the enable/blocking flags are.
 
 ## Choosing between the two auth modes
 
