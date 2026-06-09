@@ -1,0 +1,17 @@
+{
+  "_comment": "byok-strict: the tightened content-safety policy shipped as the BYOK default. Validated as ACCEPTED on Azure US Government (foundry account, 2026-06-08) by scripts/.stress-content-filter test. Tightens the four harm categories to severityThreshold=Low (vs Microsoft.DefaultV2's Medium) on both Prompt and Completion, and turns on Jailbreak (prompt shield) and Protected Material Text blocking. Deliberately OMITS Protected Material Code and Indirect Attack to avoid false-positives in a coding CLI (both are accepted by the platform and can be added if desired). Tightening is always allowed; loosening (enabled:false or blocking:false) requires an approved Azure OpenAI modified-content-filter application. Apply/attach with scripts/configure-content-filter.ps1 -Apply -PolicyName byok-strict -ConfigPath scripts/content-filter.byok-strict.json -AttachToDeployment <name>.",
+  "basePolicyName": "Microsoft.DefaultV2",
+  "mode": "Default",
+  "contentFilters": [
+    { "name": "Hate",     "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Prompt" },
+    { "name": "Hate",     "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Completion" },
+    { "name": "Sexual",   "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Prompt" },
+    { "name": "Sexual",   "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Completion" },
+    { "name": "Violence", "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Prompt" },
+    { "name": "Violence", "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Completion" },
+    { "name": "Selfharm", "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Prompt" },
+    { "name": "Selfharm", "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Completion" },
+    { "name": "Jailbreak", "blocking": true, "enabled": true, "source": "Prompt" },
+    { "name": "Protected Material Text", "blocking": true, "enabled": true, "source": "Completion" }
+  ]
+}

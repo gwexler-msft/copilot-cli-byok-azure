@@ -38,8 +38,8 @@ param modelCapacity int
 @description('What devs put in the request body "model" field. Becomes the Foundry deployment name.')
 param exposedModelName string
 
-@description('Content-filter (responsible-AI) policy name applied to the deployment. Microsoft.DefaultV2 is the built-in default; set to a custom raiPolicy name (see scripts/configure-content-filter) to tighten or loosen filtering.')
-param raiPolicyName string = 'Microsoft.DefaultV2'
+@description('Content-filter (responsible-AI) policy name applied to the deployment. byok-strict is the shipped default (authored below from scripts/content-filter.byok-strict.json). A built-in Microsoft.* name (e.g. Microsoft.DefaultV2) uses the platform policy with no authoring. Any other custom name is authored from the byok-strict spec.')
+param raiPolicyName string = 'byok-strict'
 
 @description('Deploy a secondary smaller "mini" model on this account (the cheap tier used by APIM auto-routing).')
 param deployMiniModel bool = false
@@ -48,7 +48,7 @@ param miniModelVersion string = ''
 param miniModelDeploymentSku string = ''
 param miniModelCapacity int = 0
 param miniExposedModelName string = ''
-param miniRaiPolicyName string = 'Microsoft.DefaultV2'
+param miniRaiPolicyName string = 'byok-strict'
 
 var nameBody = take(replace(toLower('${namePrefix}${envName}${suffix}${regionTag}'), '-', ''), 56)
 var foundryName = 'aif${nameBody}'
@@ -72,6 +72,36 @@ resource foundry 'Microsoft.CognitiveServices/accounts@2024-10-01' = {
   }
 }
 
+// Custom responsible-AI policy. A model deployment can only reference a raiPolicy that already
+// exists on the account, so any custom (non-Microsoft.*) policy must be authored here first and
+// the deployment made to depend on it. Built-in Microsoft.* policies need no authoring. The
+// shipped byok-strict spec (tightened to severityThreshold=Low + Jailbreak + Protected Material
+// Text) is loaded from the same JSON the configure-content-filter helper applies, keeping a
+// single source of truth. Validated as accepted on Azure US Government.
+var isCustomRai = !startsWith(raiPolicyName, 'Microsoft.')
+var miniNeedsOwnRai = deployMiniModel && !startsWith(miniRaiPolicyName, 'Microsoft.') && miniRaiPolicyName != raiPolicyName
+var raiSpec = loadJsonContent('../../scripts/content-filter.byok-strict.json')
+
+resource raiPolicy 'Microsoft.CognitiveServices/accounts/raiPolicies@2024-10-01' = if (isCustomRai) {
+  parent: foundry
+  name: raiPolicyName
+  properties: {
+    basePolicyName: raiSpec.basePolicyName
+    mode: raiSpec.mode
+    contentFilters: raiSpec.contentFilters
+  }
+}
+
+resource miniRaiPolicy 'Microsoft.CognitiveServices/accounts/raiPolicies@2024-10-01' = if (miniNeedsOwnRai) {
+  parent: foundry
+  name: miniRaiPolicyName
+  properties: {
+    basePolicyName: raiSpec.basePolicyName
+    mode: raiSpec.mode
+    contentFilters: raiSpec.contentFilters
+  }
+}
+
 resource modelDeployment 'Microsoft.CognitiveServices/accounts/deployments@2024-10-01' = {
   parent: foundry
   name: exposedModelName
@@ -87,6 +117,7 @@ resource modelDeployment 'Microsoft.CognitiveServices/accounts/deployments@2024-
     }
     raiPolicyName: raiPolicyName
   }
+  dependsOn: isCustomRai ? [raiPolicy] : []
 }
 
 // Optional secondary "mini" deployment (cheap tier for APIM auto-routing). Serialized after the
@@ -106,9 +137,7 @@ resource miniDeployment 'Microsoft.CognitiveServices/accounts/deployments@2024-1
     }
     raiPolicyName: miniRaiPolicyName
   }
-  dependsOn: [
-    modelDeployment
-  ]
+  dependsOn: miniNeedsOwnRai ? [modelDeployment, miniRaiPolicy] : [modelDeployment]
 }
 
 // The PE PUT calls the account control plane, which transiently flips to 'Accepted' while a

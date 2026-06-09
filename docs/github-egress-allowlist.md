@@ -57,6 +57,19 @@ flowchart LR
 > CLI's GitHub phone-home is best-effort, not a hard dependency for inference — so you get the
 > privacy guarantee *without* sacrificing the model path that `COPILOT_OFFLINE` would have killed.
 
+> **Observed launch behavior (2026-06-02): a non-fatal `api.github.com:443` timeout.** When
+> GitHub egress is denied at the NSG, launching `copilot` logs a startup error like
+> `api.github.com:443 time out 10000ms` **and then responds to chat prompts normally**. This
+> is the expected, healthy state: the NSG **silently drops** (blackholes) the entitlement
+> phone-home rather than sending a TCP reset, so the client waits out its ~10 s connect
+> timeout, logs the line, and **degrades gracefully** — inference still flows to the private
+> `COPILOT_PROVIDER_BASE_URL` (APIM → model), which never touches GitHub. The timeout is
+> **cosmetic, not functional**, and is in fact the cleanest proof that `api.github.com` is
+> best-effort. The only side effect is a ~10 s startup delay on each launch (the cost of a
+> *dropped* vs *reset* connection). To make it fail fast instead, a firewall/proxy in path
+> would need to `reject` the connection (return RST); an NSG alone cannot, so under NSG
+> deny-all the delay is unavoidable but harmless.
+
 ## What this repo now implements (opt-in, test-VM subnet)
 
 NSG rules are **IP / service-tag based and cannot match FQDNs**. There is no Azure service

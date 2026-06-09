@@ -164,6 +164,29 @@ source control. For Commercial, also confirm your `location` hosts the model + S
 > points `az` + `azd` at that cloud. If you only ever run one cloud, the plain
 > `Copy-Item` above is fine.
 
+> **Optional: multi-region backend pools.** The single-region default (`deployBackendPool:
+> false`) sends all traffic to one Foundry account via a transparent Url backend. To add
+> failover/load-balancing across regions, set `deployBackendPool: true` and populate
+> `foundryRegions` with one entry per extra region — each adds a Foundry account as a pool
+> member and auto-grants the APIM managed identity `Cognitive Services OpenAI User` on it
+> (no manual RBAC). `backendPoolStrategy: 'priority'` = active/passive failover;
+> `'weighted'` = active/active load balancing. Example entry (the `location` MUST host your
+> `foundryModelName` + SKU):
+>
+> ```jsonc
+> // Gov:        "foundryRegions": { "value": [ { "location": "usgovarizona", "modelCapacity": 50, "miniModelCapacity": 50 } ] }
+> // Commercial: "foundryRegions": { "value": [ { "location": "westus3",     "modelCapacity": 50, "miniModelCapacity": 50 } ] }
+> // Legacy AOAI pool members use aoaiRegions with the same shape (no miniModelCapacity).
+> ```
+>
+> Verify the live regional split with [`monitoring/kql/requests-per-backend-region.kql`](../monitoring/kql/requests-per-backend-region.kql)
+> (the App Insights `Region` property shows the **gateway** region, not the backend).
+>
+> The example templates set these params to their single-region defaults. They are kept as
+> **real** parameters only — earlier revisions carried `_comment_*`/`_example_*` helper keys
+> inline, but `az deployment sub what-if`/`create` rejects any key not defined in the
+> template, so all guidance now lives here instead.
+
 ## 2. Validate the Bicep
 
 ```pwsh

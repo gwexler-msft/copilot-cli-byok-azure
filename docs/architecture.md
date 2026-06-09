@@ -47,7 +47,7 @@ flowchart LR
 
     CLI -- "default: api-key header to private APIM" --> APIM
     CLI -. "config-only: unset COPILOT_PROVIDER_* (off by default)" .-> SAAS
-    CLI -- "GitHub entitlement (public, allow-listed)" --> ENT
+    CLI -. "GitHub entitlement — best-effort phone-home, NOT required (deniable)" .-> ENT
 
     APIM -- "MI token (AAD)" --> ENTRA
     APIM -- "default route" --> FOUNDRY
@@ -62,7 +62,10 @@ flowchart LR
     FOUNDRY2 ~~~ AOAI2
 
     classDef optin fill:#f5f5f5,stroke:#bbbbbb,stroke-dasharray:5 5,color:#888888;
-    class FOUNDRY2,AOAI,AOAI2 optin;
+    class FOUNDRY2,AOAI,AOAI2,SAAS,ENT optin;
+    %% subgraph containers are styled separately from nodes (classDef does not apply)
+    style GH fill:#fafafa,stroke:#cccccc,stroke-dasharray:5 5,color:#888888;
+    style AoaiGroup fill:#fafafa,stroke:#cccccc,stroke-dasharray:5 5,color:#888888;
 ```
 
 > Greyed/dashed boxes are **opt-in** — nothing in the default deployment creates them. The
@@ -82,9 +85,12 @@ Key points the diagram encodes:
 - **The GitHub-SaaS model path is off by default** — it is only used if the developer
   does *not* set the `COPILOT_PROVIDER_*` env vars. The BYOK wrapper sets them, pointing
   the CLI at the private APIM gateway.
-- **GitHub entitlement traffic stays public** (allow-listed) — see
-  [github-egress-allowlist.md](github-egress-allowlist.md). That is auth/licensing, not
-  model traffic.
+- **GitHub entitlement traffic is best-effort, not required** — empirically (Gov test VM,
+  2026-06-01) the CLI runs BYOK end-to-end with **no GitHub login, no Copilot subscription,
+  and `api.github.com` egress denied**. The `api.github.com` phone-home is attempted by
+  default but is not a hard dependency, so a fully-private deployment denies it at the
+  network layer. See [github-egress-allowlist.md](github-egress-allowlist.md). Either way it
+  is auth/licensing, not model traffic.
 
 ## Why the classic APIM Developer SKU (the AI gateway is tier-agnostic)
 
@@ -132,18 +138,30 @@ exposes.
 
 ### Why subscription-key is the default
 
-This gateway's design was set by the customer's sales-led architecture, which
-standardized on **one APIM subscription key per developer**. They very likely already
-have those keys provisioned and wired into their tooling, so defaulting to
-`authMode=subscriptionKey` matches what they were sold and lets them adopt the gateway
-with zero changes on the developer side. It also sidesteps the **~1-hour Entra token
-expiry**: a subscription key is long-lived, so there is no per-invocation token mint and
-no token-refresh wrapper to run.
+`authMode=subscriptionKey` is the **recommended starter default** — a proposal, not a
+mandate. It standardizes on **one APIM subscription key per developer**, which most teams
+can adopt with zero changes on the developer side (a long-lived static key fits the CLI's
+static-credential model and any keys already in their tooling). It also sidesteps the
+**~1-hour Entra token expiry**: a subscription key is long-lived, so there is no
+per-invocation token mint and no token-refresh wrapper to run. Teams that want
+cryptographic per-user identity should evaluate `authMode=jwt` below.
 
 `authMode=jwt` is retained as an opt-in **stronger control** (true per-user identity,
 short-lived tokens, instant revocation). Switching modes is a single parameter flip plus
 redeploy — no structural change, because both policy variants and all named values are
 always present.
+
+> **`authMode=jwt` validated end-to-end in Azure US Government (2026-06-03).** A live probe
+> from the in-VNet test VM against the Gov gateway (`copilot-byok-foundry`, Internal VNet)
+> returned **HTTP 200** with a `gpt-5.1` completion when a Gov Entra JWT was supplied in the
+> `api-key` header, and **HTTP 401** ("invalid Entra token") for a bad token — confirming
+> `validate-jwt` enforcement and the full chain *CLI → APIM (validate-jwt) → strip creds →
+> APIM system-MI token for `cognitiveservices.azure.us` → private-endpoint Foundry*. The CLI's
+> lack of custom-header support (github/copilot-cli#3399) is **not** a blocker: the JWT rides
+> in the single `api-key` header slot and the policy re-injects it as `Authorization: Bearer`.
+> Tokens mint with `az account get-access-token --scope "<AppId>/.default"` (v2 `aud` = the
+> app client-ID GUID). Gov OIDC metadata resolves at `login.microsoftonline.us`. Note: `gpt-5.1`
+> requires `max_completion_tokens` (not `max_tokens`).
 
 ### Mode A — subscription key (default)
 
@@ -197,7 +215,7 @@ sequenceDiagram
 
 | Dimension | `subscriptionKey` (default) | `jwt` |
 |---|---|---|
-| What the customer was sold | ✅ This is the sales-led design | Alternative / upgrade |
+| Recommended posture | ✅ Recommended starter default | Opt-in stronger control / upgrade |
 | Per-developer identity | Per **subscription** (one key = one dev, by convention) | Per **Entra user** (cryptographic `oid`) |
 | Secret lifetime | Long-lived key (rotate manually) | ~1 hour, minted per invocation |
 | Secret on disk | Yes — key sits in CLI config | No — token is ephemeral |
@@ -244,6 +262,32 @@ End-to-end the flow is:
    issues APIM's **own** MI token for AOAI.
 5. APIM attaches the MI token as `Authorization: Bearer` and forwards to the private
    AOAI endpoint.
+
+### Upstream CLI dependencies & the token-refresh gap (`authMode=jwt`)
+
+Two distinct Copilot CLI limitations shape `jwt` mode. They are often conflated — they
+are not the same problem.
+
+| Limitation | Effect on this design | Upstream issue |
+|---|---|---|
+| **No custom headers** — the CLI exposes only the `api-key` slot | The JWT is *smuggled* in the `api-key` header and the policy re-injects it as `Authorization: Bearer` so `validate-jwt` can read it (steps 1–2 of [byok-foundry-policy.xml](../policies/byok-foundry-policy.xml)) | [github/copilot-cli#3399](https://github.com/github/copilot-cli/issues/3399) *(open, Feature)* |
+| **Static credential, read once at startup** — no refresh hook | The ~60–90 min Entra token expires mid-session → APIM returns **401** with no way for the CLI to re-mint. Requires an external refresh mechanism (a local token-refreshing sidecar proxy) | *No upstream issue exists yet* — see [docs/feature-request-byok-credential-refresh.md](feature-request-byok-credential-refresh.md) |
+
+**If #3399 ships (custom headers):** the change is *cosmetic cleanup only*. The JWT moves
+into a real `Authorization: Bearer <jwt>` header (e.g. `COPILOT_EXTRA_HEADERS`), and the
+policy's api-key→Bearer re-injection (steps 1–2) can be deleted because `validate-jwt`
+reads `Authorization` natively. **The expiry cliff is unchanged** — custom headers are
+still read once at startup, so the sidecar is still required.
+
+**The transformational fix is the missing one** — a credential *refresh* capability (a
+per-request credential command, a file-backed credential the CLI re-reads, or native
+OAuth client-credential refresh). That would let us **delete the sidecar** and make `jwt`
+mode seamless. It is *not* #3399 and *not* #3448 (extra request params); it does not yet
+exist upstream, so we draft it in [feature-request-byok-credential-refresh.md](feature-request-byok-credential-refresh.md).
+
+Until then the decision matrix is unchanged: **`subscriptionKey` stays the default**
+(long-lived, no refresh machinery), and **`jwt` is the opt-in stronger control** that
+ships with a token-refreshing sidecar.
 
 
 ## Wire format
@@ -583,11 +627,11 @@ sequenceDiagram
     R1-->>APIM: 429 / 5xx
     APIM->>R2: in-request retry to next member
     R2-->>Dev: 200 (caller never sees the failure)
-    Note over APIM,R1: breaker counts the failure - after threshold primary is tripped out for breakerTripDuration
+    Note over Dev,R2: breaker counts the failure - after threshold primary is tripped out for breakerTripDuration
     Dev->>APIM: subsequent requests
     APIM->>R2: routed to healthy secondary while primary is tripped
     R2-->>Dev: 200
-    Note over APIM,R1: breaker resets - traffic returns to primary
+    Note over Dev,R2: breaker resets - traffic returns to primary
 ```
 
 With `backendPoolStrategy: priority` this is classic **active/passive DR**; with `weighted` it is
@@ -1147,39 +1191,61 @@ parameter:
 
 **What you get regardless.** Every model deployment — **both** the Azure OpenAI and the Foundry
 deployment — is *always* created with a content filter; there is no "off" switch in Azure OpenAI /
-Foundry. Out of the box both deployments run Microsoft's built-in `Microsoft.DefaultV2` baseline
-(Hate, Sexual, Violence, Self-harm filtered at Medium on prompt **and** completion, plus prompt
-shields). This ships with zero configuration and is what your current Gov deployment is running.
+Foundry. Microsoft's built-in `Microsoft.DefaultV2` baseline (Hate, Sexual, Violence, Self-harm
+filtered at **Medium** on prompt **and** completion, plus prompt shields) is the platform floor and
+is what every deployment inherits if you do nothing.
 
-**It is not deployed as a custom resource by default — it is opt-in via one parameter.** What the
-template deliberately does *not* author is a custom `raiPolicies` Bicep resource (custom RAI
-policies and some categories behave differently in Azure Government, so a hardcoded resource risks
-breaking a Gov deploy). Instead the choice is a **single parameter plus a helper script**:
+**The deployed default is now `byok-strict`, a tightened custom policy authored in IaC.** Rather
+than ride on the Microsoft baseline, the template ships and attaches its own hardened policy by
+default. It is authored as a real `Microsoft.CognitiveServices/accounts/raiPolicies` Bicep resource
+on each account, from the single spec in
+[scripts/content-filter.byok-strict.json](../scripts/content-filter.byok-strict.json), and the
+model deployments `dependsOn` it so the policy always exists before a deployment references it.
+`byok-strict` tightens the four harm categories to **severityThreshold=Low** on prompt **and**
+completion (8 filters), and adds **Jailbreak** (prompt shield) and **Protected Material Text**
+blocking — `basePolicyName: Microsoft.DefaultV2`, `mode: Default`.
 
-- **Bicep param `raiPolicyName`** (default `Microsoft.DefaultV2`) — a **single** knob threaded
-  into **both** model modules ([aoai.bicep](../infra/modules/aoai.bicep) and
+> **Gov-validated.** The original template avoided authoring a `raiPolicies` Bicep resource over
+> a concern that custom RAI policies behave differently in Azure Government. That concern was
+> retired by a live stress test against the Gov Foundry account: the full `byok-strict` composite
+> (and every individual filter in it) is **accepted** by Azure US Government. The policy is now
+> live on both Gov deployments (`gpt-5.1`, `gpt-4.1-mini`).
+
+**One shared knob.** The choice is still a **single parameter plus a helper script**:
+
+- **Bicep param `raiPolicyName`** (default `byok-strict`) — a **single** knob threaded into
+  **both** model modules ([aoai.bicep](../infra/modules/aoai.bicep) and
   [foundry.bicep](../infra/modules/foundry.bicep)), so AOAI and Foundry always share the same
-  filter. Leave it at the default for zero change; set it to a custom policy name to pin a
-  tightened/loosened filter in IaC.
+  filter. Any custom (non-`Microsoft.*`) name is authored on the account from the `byok-strict`
+  spec; a built-in `Microsoft.*` name (e.g. `Microsoft.DefaultV2`) is used as-is with **no**
+  custom resource authored.
 - **`scripts/configure-content-filter.ps1` / `.sh`** — cloud-aware (reads the ARM endpoint from
   the active cloud, Gov-safe):
   - `-Show` lists the account's `raiPolicies` and which policy each deployment uses.
   - `-Apply` creates/updates a custom `raiPolicy` from a JSON spec
-    (`content-filter.sample.json`) and can repoint a deployment to it.
+    (`content-filter.byok-strict.json` or `content-filter.sample.json`) and can repoint a
+    deployment to it.
 - **Categories** (each with a severity threshold Low/Medium/High, blocking on/off, and a
   Prompt/Completion source): Hate, Sexual, Violence, Self-harm, Jailbreak (prompt shields),
-  Protected Material Text, Protected Material Code.
+  Protected Material Text, Protected Material Code, Indirect Attack. `byok-strict` deliberately
+  **omits Protected Material Code and Indirect Attack** — both are accepted by the platform, but
+  in a coding CLI (which streams file contents and source code) they are the categories most
+  likely to fire false-positives, so they are left as documented opt-in add-ons rather than on by
+  default.
 
 **What changing it does.** Because `raiPolicyName` is one shared value, repointing it affects
 **both** models identically:
 
 | You set `raiPolicyName` to… | Effect |
 |---|---|
-| `Microsoft.DefaultV2` (default) | Microsoft baseline on both deployments — no custom resource, nothing to maintain. |
-| a custom policy name (e.g. `byok-strict`) | Both AOAI and Foundry deployments are repointed to that policy on the next deploy. The policy itself must already exist on each account (create it with the helper script's `-Apply`, or it will fail to attach). |
+| `byok-strict` (default) | Both AOAI and Foundry accounts get the tightened policy authored as a Bicep `raiPolicies` resource and both deployments are attached to it. Nothing to pre-create — the deployment `dependsOn` the policy. |
+| another custom name | The `byok-strict` spec is authored under that name on each account and both deployments attach to it. |
+| `Microsoft.DefaultV2` (or any `Microsoft.*`) | Microsoft baseline on both deployments — no custom resource authored, nothing to maintain. |
 
 > If you ever need **different** filters for AOAI vs Foundry, the single `raiPolicyName` would
-> need splitting into two params; today both intentionally share one policy.
+> need splitting into two params; today both intentionally share one policy. The `mini`
+> deployment follows `miniRaiPolicyName` (also defaulting to `byok-strict`); when it differs from
+> the primary custom name a second `raiPolicies` resource is authored for it.
 
 ```mermaid
 flowchart LR
@@ -1192,16 +1258,21 @@ flowchart LR
     F2 -- blocked --> X
 ```
 
-> **Approval boundary:** *Tightening* (more blocking, lower thresholds) is always allowed.
-> *Loosening* below Microsoft defaults (raising a threshold to High, disabling a category)
-> requires an approved Azure OpenAI modified-content-filter application; the platform rejects an
-> unapproved loosened policy. The sample config tightens (thresholds at Low) as a safe example.
+> **Approval boundary (stress-tested live in Gov).** *Tightening* (more blocking, lower
+> thresholds) is always allowed — `byok-strict` at threshold `Low` applies with no approval.
+> The gate on *loosening* is narrower than commonly assumed: the live test found that raising a
+> category's `severityThreshold` to `High` is **accepted and stored unclamped** (it is *not*
+> silently pinned back to Medium). What the platform **rejects** without an approved Azure OpenAI
+> modified-content-filter application is **disabling a category** (`enabled: false`) or making it
+> **annotate-only** (`blocking: false`) below the Microsoft floor. So threshold adjustments are
+> ungated; only the enable/blocking flags are.
 
 ## Choosing between the two auth modes
 
-The default is `authMode=subscriptionKey` because it matches the customer's existing
-sales-led design and likely-already-provisioned per-developer keys (see
-[Authentication modes](#authentication-modes)). The trade-off, stated plainly:
+The default is `authMode=subscriptionKey` because it is the simplest starter posture —
+long-lived per-developer keys that fit the CLI's static-credential model and any keys a
+team may already have provisioned (see [Authentication modes](#authentication-modes)). It
+is a recommended default, not a fixed decision. The trade-off, stated plainly:
 
 - **Per-developer identity.** A subscription key identifies the developer by *convention*
   — one key issued per developer, surfaced in telemetry as the subscription Id/Name. A

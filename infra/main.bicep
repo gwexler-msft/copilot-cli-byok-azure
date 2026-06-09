@@ -182,8 +182,8 @@ param jwtDefaultTokensPerMinute int = 60000
 @description('jwt mode: the SINGLE flat per-developer hard monthly call ceiling (calls per 30 days), keyed on Entra oid. Applies only when authMode=jwt.')
 param jwtDefaultMonthlyCallQuota int = 200000
 
-@description('Content-filter (responsible-AI) policy name applied to model deployments. Microsoft.DefaultV2 = built-in default (no change). Set to a custom raiPolicy name created via scripts/configure-content-filter to tighten/loosen filtering.')
-param raiPolicyName string = 'Microsoft.DefaultV2'
+@description('Content-filter (responsible-AI) policy name applied to model deployments. byok-strict = the shipped tightened default (severityThreshold=Low on all four harm categories + Jailbreak prompt-shield + Protected Material Text; authored automatically from scripts/content-filter.byok-strict.json). Set to a built-in Microsoft.* name (e.g. Microsoft.DefaultV2) to use the platform default with no custom policy.')
+param raiPolicyName string = 'byok-strict'
 
 @description('Deploy a P2S VPN gateway. Adds ~30 min and ~$140/mo.')
 param deployVpnGateway bool = true
@@ -217,11 +217,14 @@ param testVmAdminUsername string = 'byokadmin'
 @secure()
 param testVmAdminPassword string = ''
 
-@description('Deploy a NAT Gateway on the test-VM subnet for deterministic, controlled egress (replaces the deprecated Azure default-outbound). Only applies when deployTestVm=true. ~$32/mo + data.')
-param deployNatGateway bool = false
+@description('Deploy a NAT Gateway on the test-VM subnet for deterministic, controlled egress (replaces the deprecated Azure default-outbound). Only applies when deployTestVm=true. ~$32/mo + data. Default true so the egress-restricted VM subnet has a working outbound path; set false only for quick dev/test where the NAT cost is unwanted.')
+param deployNatGateway bool = true
 
-@description('Apply an egress-allowlist NSG to the test-VM subnet (GitHub/npm/nodejs/Azure-management only; deny the rest). A discovery tool to observe exactly what the Copilot CLI install/runtime needs. Only applies when deployTestVm=true. Pair with deployNatGateway so allowed traffic has an egress path.')
-param restrictVmEgress bool = false
+@description('Apply an egress-allowlist NSG to the test-VM subnet (GitHub/npm/nodejs/Azure-management only; deny the rest). A discovery tool to observe exactly what the Copilot CLI install/runtime needs. Only applies when deployTestVm=true. Default true (default-deny posture, matching restrictApimEgress). Pair with deployNatGateway so allowed traffic has an egress path.')
+param restrictVmEgress bool = true
+
+@description('Add a default-deny outbound allowlist to the APIM subnet NSG: permit only the Azure-internal service-tag dependencies APIM (Internal VNet mode) MUST reach (Entra/Storage/SQL/Key Vault/Azure Monitor) plus intra-VNet, then deny the rest of the internet. Default true (recommended default-deny posture); the APIM subnet becomes private and gets a NAT gateway for the allowed egress path. Set false only for quick dev/test where the NAT cost or the immutable private-subnet choice is unwanted.')
+param restrictApimEgress bool = true
 
 @description('Deploy a VNet-linked Private DNS zone (azure-api.us/.net) with an A record for the APIM gateway so in-VNet clients resolve it without a hosts entry. Prerequisite for the VPN/DNS-resolver phase too.')
 param deployApimPrivateDns bool = true
@@ -323,6 +326,7 @@ module network 'modules/network.bicep' = {
     deployTestVm: deployTestVm
     deployNatGateway: deployNatGateway
     restrictVmEgress: restrictVmEgress
+    restrictApimEgress: restrictApimEgress
   }
 }
 

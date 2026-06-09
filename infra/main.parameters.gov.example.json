@@ -59,6 +59,7 @@
     "deployTestVm":       { "value": true },
     "deployNatGateway":   { "value": true },
     "restrictVmEgress":   { "value": true },
+    "restrictApimEgress": { "value": true },
     "testVmAdminUsername": { "value": "byokadmin" },
     "deployApimPrivateDns": { "value": true },
     "deployBackendPool":  { "value": false },

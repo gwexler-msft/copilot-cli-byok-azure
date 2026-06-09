@@ -65,9 +65,21 @@ function Get-Context {
 function Invoke-Arm {
   param([string]$Method, [string]$Url, [string]$Body)
   $args = @('rest', '--method', $Method, '--url', $Url)
-  if ($Body) { $args += @('--headers', 'Content-Type=application/json', '--body', $Body) }
-  $out = az @args 2>&1
-  if ($LASTEXITCODE -ne 0) { throw "ARM call failed ($Method $Url):`n$out" }
+  $bodyFile = $null
+  if ($Body) {
+    # Pass the body via a temp BOM-free UTF-8 file. Inline `--body "<json>"` is mangled by
+    # PowerShell/cmd quoting on Windows (ARM then rejects it as InvalidRequestContent).
+    $bodyFile = New-TemporaryFile
+    [System.IO.File]::WriteAllText($bodyFile.FullName, $Body, (New-Object System.Text.UTF8Encoding($false)))
+    $args += @('--headers', 'Content-Type=application/json', '--body', "@$($bodyFile.FullName)")
+  }
+  try {
+    $out = az @args 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "ARM call failed ($Method $Url):`n$out" }
+  }
+  finally {
+    if ($bodyFile) { Remove-Item $bodyFile.FullName -ErrorAction SilentlyContinue }
+  }
   if ($out) { return ($out | ConvertFrom-Json) }
   return $null
 }

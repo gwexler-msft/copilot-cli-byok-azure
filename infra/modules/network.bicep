@@ -13,11 +13,14 @@ param peerVnetResourceId string
 @description('Deploy a test VM + Azure Bastion for manual in-VNet validation of the Internal APIM.')
 param deployTestVm bool = false
 
-@description('Deploy a NAT Gateway on the test-VM subnet for deterministic, controlled outbound egress (replaces the deprecated Azure default-outbound the VM otherwise relies on). Only applies when deployTestVm=true.')
-param deployNatGateway bool = false
+@description('Deploy a NAT Gateway on the test-VM subnet for deterministic, controlled outbound egress (replaces the deprecated Azure default-outbound the VM otherwise relies on). Only applies when deployTestVm=true. Default true so the egress-restricted VM subnet has a working outbound path; set false only for quick dev/test where the NAT cost is unwanted.')
+param deployNatGateway bool = true
 
-@description('Apply an egress-allowlist NSG to the test-VM subnet: permit only GitHub, npm, nodejs and Azure-management outbound; deny all other internet egress. A discovery tool to observe exactly what the Copilot CLI install/runtime needs. Only applies when deployTestVm=true. Pair with deployNatGateway so allowed traffic has an egress path.')
-param restrictVmEgress bool = false
+@description('Apply an egress-allowlist NSG to the test-VM subnet: permit only GitHub, npm, nodejs and Azure-management outbound; deny all other internet egress. A discovery tool to observe exactly what the Copilot CLI install/runtime needs. Only applies when deployTestVm=true. Default true (default-deny posture, matching restrictApimEgress); the allowed FQDN-CDN ranges are IP/service-tag based and may need refreshing from api.github.com/meta. Pair with deployNatGateway so allowed traffic has an egress path.')
+param restrictVmEgress bool = true
+
+@description('Add a default-deny outbound allowlist to the APIM subnet NSG: permit only the Azure-internal service-tag dependencies APIM (Internal VNet mode, stv2) MUST reach to stay healthy (Entra, Storage, SQL, Key Vault, Azure Monitor) plus intra-VNet (to reach the model private endpoint), then deny all other internet egress. Default true (recommended default-deny posture); APIM has a mandatory egress contract so this allowlist tracks Microsoft service tags and the subnet gets a NAT gateway for the allowed path. Set false only for quick dev/test where the NAT cost or the immutable private-subnet choice is unwanted. The platform channel 168.63.129.16 (DNS/health) is exempt from NSG rules, so management stays reachable.')
+param restrictApimEgress bool = true
 
 @description('GitHub IPv4 CIDRs allowed outbound when restrictVmEgress=true. NSG is IP/service-tag based and CANNOT match FQDNs, so these must be refreshed from https://api.github.com/meta (api/web/git/packages unions). True FQDN egress control needs Azure Firewall.')
 param githubEgressCidrs array = [
@@ -44,11 +47,108 @@ var vpnGwName      = take('vpngw-${namePrefix}-${envName}-${suffix}', 80)
 var vpnPipName     = take('pip-vpngw-${namePrefix}-${envName}-${suffix}', 80)
 var p2sAddressPool = '172.16.200.0/24'
 
+// Mandatory outbound dependencies for APIM Internal VNet mode (stv2). Applied only when
+// restrictApimEgress=true; service-tag based so they track Microsoft's published ranges.
+// Omitting any of these (or pairing the deny without them) makes APIM go Unhealthy.
+var apimEgressRules = [
+  {
+    name: 'Allow-Out-VNet'
+    properties: {
+      priority: 200
+      direction: 'Outbound'
+      access: 'Allow'
+      protocol: '*'
+      sourceAddressPrefix: 'VirtualNetwork'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'VirtualNetwork'
+      destinationPortRange: '*'
+    }
+  }
+  {
+    name: 'Allow-Out-Entra'
+    properties: {
+      priority: 210
+      direction: 'Outbound'
+      access: 'Allow'
+      protocol: 'Tcp'
+      sourceAddressPrefix: 'VirtualNetwork'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'AzureActiveDirectory'
+      destinationPortRange: '443'
+    }
+  }
+  {
+    name: 'Allow-Out-Storage'
+    properties: {
+      priority: 220
+      direction: 'Outbound'
+      access: 'Allow'
+      protocol: 'Tcp'
+      sourceAddressPrefix: 'VirtualNetwork'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'Storage'
+      destinationPortRange: '443'
+    }
+  }
+  {
+    name: 'Allow-Out-SQL'
+    properties: {
+      priority: 230
+      direction: 'Outbound'
+      access: 'Allow'
+      protocol: 'Tcp'
+      sourceAddressPrefix: 'VirtualNetwork'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'SQL'
+      destinationPortRange: '1433'
+    }
+  }
+  {
+    name: 'Allow-Out-KeyVault'
+    properties: {
+      priority: 240
+      direction: 'Outbound'
+      access: 'Allow'
+      protocol: 'Tcp'
+      sourceAddressPrefix: 'VirtualNetwork'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'AzureKeyVault'
+      destinationPortRange: '443'
+    }
+  }
+  {
+    name: 'Allow-Out-Monitor'
+    properties: {
+      priority: 250
+      direction: 'Outbound'
+      access: 'Allow'
+      protocol: 'Tcp'
+      sourceAddressPrefix: 'VirtualNetwork'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'AzureMonitor'
+      destinationPortRanges: [ '443', '1886' ]
+    }
+  }
+  {
+    name: 'Deny-Out-Internet'
+    properties: {
+      priority: 4000
+      direction: 'Outbound'
+      access: 'Deny'
+      protocol: '*'
+      sourceAddressPrefix: '*'
+      sourcePortRange: '*'
+      destinationAddressPrefix: 'Internet'
+      destinationPortRange: '*'
+    }
+  }
+]
+
 resource nsgApim 'Microsoft.Network/networkSecurityGroups@2024-01-01' = {
   name: nsgApimName
   location: location
   properties: {
-    securityRules: [
+    securityRules: concat([
       {
         name: 'Allow-APIM-Management'
         properties: {
@@ -88,7 +188,7 @@ resource nsgApim 'Microsoft.Network/networkSecurityGroups@2024-01-01' = {
           destinationPortRange: '443'
         }
       }
-    ]
+    ], restrictApimEgress ? apimEgressRules : [])
   }
 }
 
@@ -184,16 +284,21 @@ resource nsgVm 'Microsoft.Network/networkSecurityGroups@2024-01-01' = if (deploy
   }
 }
 
-// NAT Gateway for deterministic, controlled egress from the test-VM subnet. Azure default-outbound
-// is being retired, so an explicit egress method is required for the allowlisted traffic to leave.
-resource natPip 'Microsoft.Network/publicIPAddresses@2024-01-01' = if (deployTestVm && deployNatGateway) {
+// NAT Gateway for deterministic, controlled egress. Azure default-outbound is being retired, so an
+// explicit egress method is required for the allowlisted traffic to leave. A single NAT gateway is
+// shared by every subnet that needs a controlled egress path (test-VM and/or APIM). It is deployed
+// when the test VM asks for it OR when APIM egress is locked down (APIM must keep a real egress path
+// once its subnet becomes private).
+var deployNat = (deployTestVm && deployNatGateway) || restrictApimEgress
+
+resource natPip 'Microsoft.Network/publicIPAddresses@2024-01-01' = if (deployNat) {
   name: natPipName
   location: location
   sku: { name: 'Standard' }
   properties: { publicIPAllocationMethod: 'Static' }
 }
 
-resource natGw 'Microsoft.Network/natGateways@2024-01-01' = if (deployTestVm && deployNatGateway) {
+resource natGw 'Microsoft.Network/natGateways@2024-01-01' = if (deployNat) {
   name: natGwName
   location: location
   sku: { name: 'Standard' }
@@ -206,11 +311,21 @@ resource natGw 'Microsoft.Network/natGateways@2024-01-01' = if (deployTestVm && 
 var baseSubnets = [
   {
     name: 'snet-apim'
-    properties: {
-      addressPrefix: '10.60.1.0/27'
-      networkSecurityGroup: { id: nsgApim.id }
-      privateEndpointNetworkPolicies: 'Enabled'
-    }
+    properties: union(
+      {
+        addressPrefix: '10.60.1.0/27'
+        networkSecurityGroup: { id: nsgApim.id }
+        privateEndpointNetworkPolicies: 'Enabled'
+      },
+      // When APIM egress is locked down, make snet-apim a private subnet (remove the deprecated
+      // implicit default-outbound) and route its allowed egress through the shared NAT gateway.
+      // defaultOutboundAccess is immutable post-creation, so toggling this on an existing subnet
+      // requires recreating snet-apim (which means recreating APIM on it).
+      restrictApimEgress ? {
+        defaultOutboundAccess: false
+        natGateway: { id: natGw.id }
+      } : {}
+    )
   }
   {
     name: 'snet-pe'
@@ -337,4 +452,4 @@ output peSubnetId   string = '${vnet.id}/subnets/snet-pe'
 output gatewaySubnetId string = deployVpnGateway ? '${vnet.id}/subnets/GatewaySubnet' : ''
 output vmSubnetId string = deployTestVm ? '${vnet.id}/subnets/snet-vm' : ''
 output bastionSubnetId string = deployTestVm ? '${vnet.id}/subnets/AzureBastionSubnet' : ''
-output natGatewayPublicIp string = (deployTestVm && deployNatGateway) ? (natPip.?properties.ipAddress ?? '') : ''
+output natGatewayPublicIp string = deployNat ? (natPip.?properties.ipAddress ?? '') : ''
