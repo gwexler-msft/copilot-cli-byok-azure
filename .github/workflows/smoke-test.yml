@@ -1,0 +1,140 @@
+name: smoke-test
+
+# End-to-end regression net for a deployed BYOK gateway env (#56). Runs the
+# self-hosted VNet runner provisioned by #57/#58 against the env's private
+# APIM gateway + Foundry + App Insights. The #16 regression class (apim
+# diagnostic loses `metrics: true`) is caught by assertion #4 here.
+#
+# Triggers:
+#   - workflow_call:    chained from deploy-dev.yml after a successful provision
+#   - workflow_dispatch: manual smoke on demand (any env)
+#
+# NOTE: there is intentionally NO `schedule` here. Smoke needs a dev runner that
+# is VNet-injected into the dev env, which only exists while the env exists. The
+# through-the-day cron lives in deploy-dev.yml instead, so it can lazily
+# (re)provision a torn-down env before chaining into this workflow. A smoke-only
+# cron would just queue ~24h against an absent env. Pilots are manual-only
+# forever (they hold real keys) and are never auto-smoked.
+#
+# Independence from the operator's test VM:
+#   This workflow runs entirely from the KEDA-driven self-hosted runner that is
+#   VNet-injected into the deployed env, so it reaches APIM Internal directly --
+#   it never needs the `deployTestStack` / `deployTestVm` / Bastion stack that
+#   the operator may keep around in the pilot RGs for manual demos and self-test.
+#   If you want to validate egress-allowlist behaviour or BYOK CLI install paths,
+#   do that interactively from the test VM; smoke is a CI assertion of the
+#   gateway only.
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        description: Target env (comm-pilot | gov-pilot | comm-dev | gov-dev)
+        required: true
+        type: string
+
+  workflow_dispatch:
+    inputs:
+      env:
+        description: Target env
+        type: choice
+        required: true
+        default: comm-pilot
+        options:
+          - comm-pilot
+          - gov-pilot
+          - comm-dev
+          - gov-dev
+      skip_token_limit:
+        description: Skip the oversized-prompt -> 429 assertion (envs without llm-token-limit)
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  id-token: write    # OIDC federated token for the runner UAMI (#53)
+  contents: read
+
+concurrency:
+  # One smoke run per env at a time; never cancel an in-flight run.
+  group: smoke-${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # matrix: smoke always targets the single env the caller specified (via
+  # workflow_call from deploy-dev, or manual workflow_dispatch).
+  # ---------------------------------------------------------------------------
+  build-matrix:
+    name: Build env matrix
+    # Self-hosted (#52). EMU hosted runners are disabled.
+    runs-on: [self-hosted, comm-pilot]
+    outputs:
+      envs: ${{ steps.set.outputs.envs }}
+    steps:
+      - id: set
+        run: |
+          printf 'envs=["%s"]\n' "${{ inputs.env }}" >> "$GITHUB_OUTPUT"
+
+  smoke:
+    name: Smoke (${{ matrix.env }})
+    needs: build-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJson(needs.build-matrix.outputs.envs) }}
+    # Self-hosted runner (#57/#58). Label = env name; pool registers per env via
+    # KEDA + myoung34/github-runner; ephemeral (1 job = 1 replica, then exits).
+    runs-on: [self-hosted, "${{ matrix.env }}"]
+    environment: ${{ matrix.env }}  # gates secrets/vars; required reviewers per env
+    # The smoke job must complete in <7 min for the #56 acceptance criterion.
+    # Most cost is in waiting for emit-metric to land in App Insights (~30-60s
+    # ingestion delay), not the probes themselves.
+    timeout-minutes: 15
+    env:
+      AZURE_ENV_NAME: ${{ matrix.env }}
+      RESOURCE_GROUP: rg-copilot-byok-${{ matrix.env }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Self-hosted ACA Job runner image (myoung34/github-runner) ships azd but
+      # NOT az. azure/login@v2 shells out to `az`, so install it on demand.
+      - name: Install Azure CLI (self-hosted runner)
+        shell: bash
+        run: |
+          if ! command -v az >/dev/null 2>&1; then
+            echo "az not found — installing"
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          else
+            echo "az already installed: $(az version --query '"azure-cli"' -o tsv)"
+          fi
+
+      - name: Azure CLI login (OIDC, runner UAMI)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ startsWith(matrix.env, 'gov-') && 'AzureUSGovernment' || 'AzureCloud' }}
+
+      # -------------------------------------------------------------------
+      # Probes. The runner is VNet-injected so APIM Internal is directly reachable;
+      # the operator's test VM / Bastion (if present in a pilot RG) is irrelevant.
+      # -------------------------------------------------------------------
+      - name: Run smoke probes (scripts/smoke-test.sh)
+        id: probes
+        run: |
+          chmod +x scripts/smoke-test.sh
+          ARGS=( "--env-name" "${{ matrix.env }}" "--resource-group" "${RESOURCE_GROUP}" )
+          if [[ "${{ inputs.skip_token_limit }}" == "true" ]]; then
+            ARGS+=( "--skip-token-limit" )
+          fi
+          ./scripts/smoke-test.sh "${ARGS[@]}"
+
+      # NOTE: previously this step uploaded `scripts/smoke-test.sh` and the KQL
+      # file as "smoke results" -- both already live in git, so the artifact was
+      # pure waste that compounded against the (small) GH artifact quota. See #63.
+      # The full smoke output (PASS/FAIL lines per assertion) is already in the
+      # job log under "Run smoke probes", so for now there is no separate artifact.
+      # If we add a real `smoke-result.json` emitter to the scripts later, wire it
+      # back here with `retention-days: 7`.

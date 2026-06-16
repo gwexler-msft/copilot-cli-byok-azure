@@ -1,0 +1,50 @@
+// monitoring/kql/smoke-emit-metric.kql
+//
+// Smoke-test assertion query (#56). Run against the env's Application Insights resource.
+// Returns ONE row with the count of `copilot_byok_*` custom metrics emitted in the
+// supplied window. The smoke-test script (scripts/smoke-test.ps1 / .sh) interprets
+// `Hits > 0` as PASS and any other result as FAIL.
+//
+// Why this query is the #16 regression gate:
+//   The `emit-metric` policy block is silently no-op'd by APIM when the service-level
+//   `applicationinsights` diagnostic doesn't have `properties.metrics: true`. The HTTP
+//   path keeps working (200s on chat/completions), tokens are deducted by the model,
+//   but the custom metrics never arrive. This query is the only post-deploy signal
+//   that catches that regression class. If a future PR drops `metrics: true` from
+//   apim.bicep, this query returns 0 and the smoke job goes red.
+//
+// Why we OR-match the three metric names (not just one):
+//   `copilot_byok_request` fires in inbound and is emitted on EVERY call (even when the
+//   upstream errors out before tokens flow). `*_prompt_tokens` / `*_completion_tokens`
+//   only fire on a 200-class response. By matching any of the three we accept the
+//   weakest valid signal -- "at least one request was metered". That's exactly what
+//   smoke is asserting.
+//
+// Inputs (set by the smoke-test caller via `az monitor app-insights query --analytics-query`):
+//   - The query is parameterless; the lookback window is hard-coded to 15m so the
+//     query is self-contained and re-runnable in the Azure portal.
+//
+// Tweakables:
+//   - Lengthen the lookback (e.g. ago(1h)) when investigating intermittent failures.
+//   - Add `| extend env = tostring(customDimensions["env"])` filter once the deploy
+//     stamps env name on metrics (TODO, follow-up).
+//
+// Output schema: a single row `Hits:long, LatestEmit:datetime, DistinctMetricNames:long`.
+//   - Hits = total number of metric data-points seen (sum of `valueCount` across rows)
+//   - LatestEmit = wall-clock timestamp of the most recent emit (handy for triage)
+//   - DistinctMetricNames = how many of the 3 metric names landed (1..3)
+//
+// Column note: `customMetrics` rows do NOT have an `itemCount` column (that's a
+// `traces`/`requests`/`exceptions` thing). The correct aggregate for "how many
+// data points landed" is `sum(valueCount)`. Using `sum(itemCount)` here produces
+// the App Insights server-side error:
+//     SEM0100: 'summarize' operator: Failed to resolve scalar expression named 'itemCount'
+// which surfaces from the CLI as `BadArgumentError: The request had some invalid
+// properties`. See #60.
+customMetrics
+| where timestamp > ago(15m)
+| where name in ("copilot_byok_request", "copilot_byok_prompt_tokens", "copilot_byok_completion_tokens")
+| summarize
+    Hits                = sum(valueCount),
+    LatestEmit          = max(timestamp),
+    DistinctMetricNames = dcount(name)

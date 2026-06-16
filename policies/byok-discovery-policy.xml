@@ -1,0 +1,58 @@
+<policies>
+  <inbound>
+    <!-- API-level policy for the dedicated 'copilot-byok-discovery' API.
+         Scope: this API has ONE operation (GET /v1/models) and is published under
+         exactly one product ('byok-discovery'), whose subscriptions go ONLY to the
+         smoke runner and explicitly named admins. Standard developer keys (dev1/dev2 /
+         tier subscriptions) are NOT scoped to this API and receive 401 from APIM
+         before any policy runs.
+
+         Why a separate API instead of an operation on copilot-byok-foundry:
+           - The foundry API's body-parsing policy 400s on any request without a 'model'
+             field, which makes GET /v1/models impossible to support cleanly there.
+           - Restricting which developers can list models becomes a product-membership
+             question instead of a policy-expression allowlist (auditable in the portal).
+           - Telemetry stays clean: emit-metric stays off this path, so discovery calls
+             don't skew per-developer billing metrics or rate-limit-by-key counters.
+
+         Auth context:
+           - subscriptionKey mode (default): APIM validates the api-key header NATIVELY
+             before any policy runs (subscriptionRequired=true on the API + product). No
+             JWT validation needed here.
+           - jwt mode: discovery is currently subscriptionKey-only by deliberate choice.
+             If jwt mode ever needs to expose discovery, add a parallel jwt variant of
+             this file matching the byok-foundry-policy.xml vs -subkey.xml split. -->
+
+    <base />
+
+    <!-- Strip the caller's credentials FIRST, before minting the managed-identity
+         token below. Order matters: authentication-managed-identity sets the
+         'Authorization: Bearer <MI token>' header, so deleting Authorization AFTER it
+         (as an earlier version of this policy did) silently removed the MI bearer token
+         and the backend rejected the credential-less request with the AOAI 401
+         "invalid subscription key or wrong API endpoint". The working foundry policy
+         (byok-foundry-policy*.xml) strips before MI auth for exactly this reason. -->
+    <set-header name="api-key" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+
+    <!-- Always route discovery to the foundry backend. The OpenAI-compatible
+         /openai/v1/models surface is exposed by AIServices / Foundry inference accounts
+         and returns the OpenAI shape {data:[{id,object,created,owned_by}]} that the
+         smoke probe (and any downstream OpenAI client) expects. The aoai-pinned-models
+         split only applies to per-request inference routing; for discovery we always go
+         to the canonical backend. authentication-managed-identity sets a fresh
+         'Authorization: Bearer <token>' that survives to the backend. -->
+    <set-backend-service backend-id="{{foundry-backend-id}}" />
+    <authentication-managed-identity resource="{{foundry-mi-audience}}" />
+    <rewrite-uri template="/openai/v1/models" copy-unmatched-params="true" />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

@@ -1,0 +1,180 @@
+# Static validation gate for pull requests. NO Azure auth, NO Azure cost.
+# Catches the kinds of regressions we can detect without a deployed env:
+#   - Bicep build failures (the #16 class — missing `metrics: true` won't be
+#     caught here but a typo / unused param / wrong type will be)
+#   - Wizard-vs-BYOK policy parity drift (the explicit follow-up from #56:
+#     if wizard-foundry-policy-fixed.xml gains an <emit-metric> the BYOK
+#     policy doesn't have, fail red so we don't silently regress observability)
+#   - YAML / PowerShell / bash syntax errors in workflow + scripts
+#   - JSON validity in CI parameter files
+#
+# Deeper "does it actually deploy?" checks (azd what-if) run on `workflow_dispatch`
+# in deploy.yml because they need OIDC into a real subscription. They also run
+# implicitly when push-to-main triggers deploy-dev.yml.
+name: validate
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - 'policies/**'
+      - 'scripts/**'
+      - 'monitoring/**'
+      - '.github/workflows/**'
+      - 'azure.yaml'
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel stale validate runs when a PR is force-pushed.
+  group: validate-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bicep:
+    name: Bicep build + lint
+    # Self-hosted (#52). EMU hosted runners are disabled; pilot runner is the
+    # only pool available. All steps below assume the myoung34/github-runner
+    # Ubuntu image (curl, sudo, git, python3, pwsh all present).
+    runs-on: [self-hosted, comm-pilot]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Bicep CLI
+        run: |
+          curl -Lo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+          chmod +x ./bicep
+          sudo mv ./bicep /usr/local/bin/bicep
+          bicep --version
+      - name: Build main.bicep
+        run: bicep build infra/main.bicep --outfile /tmp/main.json
+      - name: Build all modules (catches isolated module errors)
+        run: |
+          set -e
+          for f in infra/modules/*.bicep; do
+            echo "::group::$f"
+            bicep build "$f" --outfile "/tmp/$(basename "$f" .bicep).json"
+            echo "::endgroup::"
+          done
+      - name: Lint (warnings as errors via bicepconfig if present)
+        run: bicep lint infra/main.bicep
+
+  policy-parity:
+    name: Wizard-vs-BYOK policy parity (#16 prevention)
+    runs-on: [self-hosted, comm-pilot]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Diff <emit-metric> blocks (Foundry)
+        run: |
+          set -euo pipefail
+          # Extract every <emit-metric name="..."> entry from each policy and
+          # compare wizard (reference / latest MS pattern) vs BYOK (what we ship).
+          # Wizard MUST NOT be a strict superset of BYOK on emit-metric names —
+          # if MS adds a new one in the wizard, BYOK has to add it too or smoke
+          # won't see the matching customMetric.
+          extract() {
+            grep -oE '<emit-metric[^>]*name="[^"]+"' "$1" \
+              | sed -E 's/.*name="([^"]+)".*/\1/' \
+              | sort -u
+          }
+          wiz=$(extract policies/wizard-foundry-policy-fixed.xml)
+          byok=$(extract policies/byok-foundry-policy.xml)
+          echo "Wizard emit-metric names:"
+          echo "$wiz" | sed 's/^/  - /'
+          echo "BYOK   emit-metric names:"
+          echo "$byok" | sed 's/^/  - /'
+          missing=$(comm -23 <(echo "$wiz") <(echo "$byok") || true)
+          if [ -n "$missing" ]; then
+            echo "::error::Wizard policy emits metrics that BYOK does NOT:"
+            echo "$missing" | sed 's/^/  - /'
+            echo "::error::This is the #16 regression class. Add matching <emit-metric> blocks to policies/byok-foundry-policy.xml (and the -subkey variant) before merging."
+            exit 1
+          fi
+          echo "OK: BYOK foundry policy covers every wizard emit-metric."
+      - name: Diff <emit-metric> blocks (AOAI subkey vs jwt — drift guard)
+        run: |
+          set -euo pipefail
+          # AOAI has two auth flavors (jwt + subscriptionKey). They should emit the
+          # same metric set so dashboards don't go blind when an env flips authMode.
+          # KNOWN PRE-EXISTING DRIFT (tracked separately): subkey is missing
+          # `copilot_byok_throttled` (it's only in the jwt variant). We allowlist
+          # exactly this one drift below so this gate still catches any NEW drift.
+          extract() {
+            grep -oE '<emit-metric[^>]*name="[^"]+"' "$1" \
+              | sed -E 's/.*name="([^"]+)".*/\1/' \
+              | sort -u
+          }
+          jwt=$(extract policies/byok-aoai-policy.xml)
+          sub=$(extract policies/byok-aoai-policy-subkey.xml)
+          # Pre-existing drift allowlist (one entry per line).
+          allow=$(printf 'copilot_byok_throttled\n')
+          jwt_only=$(comm -23 <(echo "$jwt") <(echo "$sub") | grep -vxF -f <(echo "$allow") || true)
+          sub_only=$(comm -13 <(echo "$jwt") <(echo "$sub") | grep -vxF -f <(echo "$allow") || true)
+          if [ -n "$jwt_only$sub_only" ]; then
+            echo "::error::AOAI subkey-vs-jwt drift (outside the known allowlist):"
+            [ -n "$jwt_only" ] && echo "  jwt-only:";  echo "$jwt_only" | sed 's/^/    /'
+            [ -n "$sub_only" ] && echo "  subkey-only:"; echo "$sub_only" | sed 's/^/    /'
+            exit 1
+          fi
+          echo "OK: AOAI subkey + jwt emit identical metric sets (modulo allowlisted pre-existing drift)."
+
+  json:
+    name: JSON validity (CI parameter files)
+    runs-on: [self-hosted, comm-pilot]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate every infra/main.parameters*.json
+        run: |
+          set -e
+          for f in infra/main.parameters*.json; do
+            echo "  $f"
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f"
+          done
+
+  scripts:
+    name: PowerShell + bash syntax
+    runs-on: [self-hosted, comm-pilot]
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n on every scripts/*.sh
+        run: |
+          set -e
+          for f in scripts/*.sh; do
+            echo "  $f"
+            bash -n "$f"
+          done
+      - name: PowerShell parse on every scripts/*.ps1
+        shell: pwsh
+        run: |
+          $bad = 0
+          Get-ChildItem scripts/*.ps1 | ForEach-Object {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errs) | Out-Null
+            if ($errs.Count -gt 0) {
+              Write-Host "::error file=$($_.FullName)::$($errs.Count) parse error(s)"
+              $errs | ForEach-Object { Write-Host "  $($_.Message) at line $($_.Extent.StartLineNumber)" }
+              $bad++
+            } else {
+              Write-Host "  $($_.Name) OK"
+            }
+          }
+          if ($bad -gt 0) { exit 1 }
+
+  yaml:
+    name: Workflow YAML validity
+    runs-on: [self-hosted, comm-pilot]
+    steps:
+      - uses: actions/checkout@v4
+      - name: yamllint workflows
+        run: |
+          pip install --quiet yamllint
+          # Permissive config: tabs/lines/long-lines OK, structural errors not.
+          cat > /tmp/yamllint.yml <<'EOF'
+          extends: relaxed
+          rules:
+            line-length: disable
+            document-start: disable
+            truthy: disable
+          EOF
+          yamllint -c /tmp/yamllint.yml .github/workflows/

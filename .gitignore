@@ -1,0 +1,34 @@
+# Logs / local
+*.log
+.azuretmp/
+.vs/
+whatif.txt
+whatif*.json
+
+# azd state
+.azure/*
+!.azure/infrastructure-plan.json
+
+# Bicep build artifacts
+infra/**/*.json
+!infra/main.parameters.gov.example.json
+!infra/main.parameters.commercial.example.json
+# CI parameter profiles — committed; hold only non-secret defaults (secrets injected at runtime).
+!infra/main.parameters.ci.gov.json
+!infra/main.parameters.ci.commercial.json
+!infra/main.parameters.ci.gov-dev.json
+!infra/main.parameters.ci.commercial-dev.json
+
+# Real deployment parameters carry tenant/app-specific values — keep local only.
+# Copy infra/main.parameters.gov.example.json -> infra/main.parameters.json and fill in.
+infra/main.parameters.json
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vscode/*
+!.vscode/mcp.json
+*.code-workspace
+
+# Scratch / ad-hoc probe scripts (dot-prefixed, local only)
+scripts/.probe-*.ps1

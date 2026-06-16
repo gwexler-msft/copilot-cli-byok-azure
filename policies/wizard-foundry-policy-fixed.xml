@@ -1,0 +1,197 @@
+<!--
+  ===========================================================================
+  APIM policy for the GitHub Copilot CLI (BYOK) - AI Foundry backend
+  ===========================================================================
+  This is the policy that the APIM "Import Azure AI Foundry" wizard
+  generates, with three small tweaks we found were needed for a smooth
+  Copilot CLI experience.
+
+
+  WHAT WE CHANGED FROM THE RAW WIZARD OUTPUT
+  ------------------------------------------
+  1. App Insights actually shows traffic now.
+     The wizard's token metric only fires when the model response includes
+     a `usage` object. Copilot CLI streams its replies, and streamed replies
+     normally don't contain `usage`, so the wizard's metric was emitting
+     nothing. We added a separate request counter ("copilot_byok_request")
+     that fires once per call no matter what - so even when streaming hides
+     the token usage, you can still see how many requests each developer is
+     making.
+
+  2. Token-per-minute limit raised from 10,000 to 200,000.
+     A single Copilot CLI request is routinely 5,000-15,000 tokens by
+     itself (because of the system prompt and any file context). The
+     wizard's default of 10k/minute therefore throttled normal users on
+     their very first request. Treat 200k as a safety ceiling; you can
+     lower it if you're protecting a small shared deployment.
+
+  3. Both /chat/completions and /responses work through one policy.
+     If your wizard import only pulled in /chat/completions, add a
+     /responses operation to the API in the APIM portal so newer
+     VS Code clients (1.122+) can use the Responses API too.
+
+  4. Reasoning-model sampling-parameter strip (gpt-5 / o1 / o3 / o4).
+     These model families are reasoning models that reject any non-default
+     value for `temperature`, `top_p`, `presence_penalty`, and
+     `frequency_penalty` with `400 unsupported_value`. VS Code Copilot's
+     Custom Endpoint sends `temperature: 0.1` for factual/code tasks, so
+     it bites every user the moment they pick a reasoning deployment.
+     This policy now strips those four fields from the request body when
+     the deployment name in the URL starts with `gpt-5`, `o1`, `o3`, or
+     `o4`. Non-reasoning deployments (e.g. `gpt-4.1-mini`) pass through
+     untouched and still receive whatever sampling values the client
+     requested. No switch — the strip is always on for matching names
+     because there is no scenario where forwarding those fields to a
+     reasoning model succeeds.
+
+
+  WHAT YOU'LL SEE IN APPLICATION INSIGHTS OUT OF THE BOX
+  ------------------------------------------------------
+  * "copilot_byok_request" (custom metric, namespace copilot.byok)
+    - One count per request. Fires for EVERY call, success or failure,
+      streaming or not. Best metric for "how many requests per developer".
+
+  * "GenAI Tokens" (the wizard's token metric)
+    - Per-call prompt / completion / total token counts.
+    - Fires for: non-streaming chat-completions, and /responses calls.
+    - Does NOT fire for: streaming chat-completions (which is the default
+      mode Copilot CLI uses) unless you turn on the optional feature below.
+
+
+  OPTIONAL: TOKEN COUNTS FOR STREAMING CHAT-COMPLETIONS
+  -----------------------------------------------------
+  Streaming responses can include a final usage summary chunk, but only if
+  the caller asks for it by sending `stream_options.include_usage: true` in
+  the request. Copilot CLI doesn't send that flag, but this policy can add
+  it automatically. We leave that feature OFF by default because some
+  backends don't recognise the flag and reject the call with
+  `400 Unknown parameter: 'stream_options.include_usage'`.
+
+  This is purely a "REST API contract version" issue - NOT a problem with
+  your model deployment (gpt-5.1, gpt-4.1-mini, etc.). The flag was added
+  to the Azure OpenAI / Foundry REST API in contract version
+  2024-09-01-preview, and is in every newer version including the current
+  GA (2024-10-21) and the versionless v1 surface. If your wizard-imported
+  API forwards any of those, you can turn the feature on safely.
+
+  HOW TO TURN IT ON (one-line change):
+     <set-variable name="streamUsageInjection" value="on" />
+     (just change "off" to "on" in the line below)
+
+  HOW TO CHECK FIRST (no harm if you skip this and just try it):
+  - Open the wizard-imported API in the APIM portal -> Settings -> look at
+    the "Web service URL". It usually ends with
+    "?api-version=YYYY-MM-DD[-preview]". If that date is 2024-09-01 or
+    later, you're good. If it's older, leave the switch OFF (or update the
+    API to a newer version first).
+  - If you turn it on and Copilot CLI starts returning
+    `400 Unknown parameter: 'stream_options.include_usage'`, just flip it
+    back to "off". Nothing else is affected.
+
+  WHAT YOU LOSE BY LEAVING IT OFF:
+  - Per-call token counts for streaming chat-completions don't appear in
+    App Insights. You still get the per-call REQUEST count, and you still
+    get per-call token counts for non-streaming and /responses traffic.
+  ===========================================================================
+-->
+<policies>
+  <inbound>
+    <base />
+    <set-backend-service id="apim-generated-policy" backend-id="foundry-gov-copilot-pov-test-01-ai-endpoint" />
+
+    <!-- OPTIONAL: ask the model to include a token-usage summary in streaming
+         chat-completions responses. Off by default. See the file header
+         ("OPTIONAL: TOKEN COUNTS FOR STREAMING CHAT-COMPLETIONS") for what
+         this does, when it's safe to turn on, and how to turn it on. The
+         <set-body> below also strips sampling params for reasoning-model
+         deployments (always on, see file header tweak #4). -->
+    <set-variable name="streamUsageInjection" value="off" />
+    <set-body>@{
+        try {
+            var body = context.Request.Body?.As<JObject>(preserveContent: true);
+            if (body == null) { return context.Request.Body?.As<string>(preserveContent: true); }
+            var path = context.Request.OriginalUrl.Path.ToLowerInvariant();
+
+            // (a) Reasoning-model sampling-parameter strip (always on).
+            //     gpt-5 / o1 / o3 / o4 reject non-default temperature / top_p /
+            //     presence_penalty / frequency_penalty with 400 unsupported_value.
+            //     The deployment name lives in the URL path: /deployments/<name>/...
+            var m = System.Text.RegularExpressions.Regex.Match(path, "/deployments/([^/]+)/");
+            if (m.Success) {
+                var model = m.Groups[1].Value;
+                bool isReasoning = model.StartsWith("gpt-5") || model.StartsWith("o1") || model.StartsWith("o3") || model.StartsWith("o4");
+                if (isReasoning) {
+                    body.Remove("temperature");
+                    body.Remove("top_p");
+                    body.Remove("presence_penalty");
+                    body.Remove("frequency_penalty");
+                }
+            }
+
+            // (b) Streaming usage injection (opt-in, see file header).
+            //     /responses calls never need it (always include usage natively).
+            if (((string)context.Variables["streamUsageInjection"]) == "on" && !path.EndsWith("/responses")) {
+                var stream = body["stream"];
+                if (stream != null && stream.Type == JTokenType.Boolean && (bool)stream) {
+                    var opts = body["stream_options"] as JObject;
+                    if (opts == null) { opts = new JObject(); body["stream_options"] = opts; }
+                    opts["include_usage"] = true;
+                }
+            }
+
+            return body.ToString();
+        } catch {
+            // If the body is not JSON we can parse, forward it unchanged.
+            return context.Request.Body?.As<string>(preserveContent: true);
+        }
+    }</set-body>
+
+    <!-- Per-request counter. Fires for every call (streaming or not, success
+         or failure). Lands in App Insights as customMetrics with
+         name="copilot_byok_request" under the copilot.byok namespace. -->
+    <emit-metric name="copilot_byok_request" value="1" namespace="copilot.byok">
+      <dimension name="API ID" />
+      <dimension name="Subscription ID" />
+      <dimension name="Product ID" />
+      <dimension name="Operation ID" />
+    </emit-metric>
+
+    <!-- Wizard token metric. Emits per-call prompt / completion / total token
+         counts from the response's `usage` object. Always populated for
+         non-streaming chat-completions and for /responses calls. For
+         streaming chat-completions, only emits when the optional
+         streamUsageInjection switch above is "on" (see file header). -->
+    <llm-emit-token-metric>
+      <dimension name="API ID" />
+      <dimension name="Client IP address" value="@(context.Request.IpAddress)" />
+      <dimension name="Gateway ID" />
+      <dimension name="Location" />
+      <dimension name="Operation ID" />
+      <dimension name="Product ID" />
+      <dimension name="Subscription ID" />
+      <dimension name="User ID" />
+    </llm-emit-token-metric>
+
+    <!-- Token-per-minute safety ceiling (raised from the wizard's 10000 to
+         200000 - see file header for why). Monthly cost guard left at the
+         wizard's 3,000,000 tokens. -->
+    <llm-token-limit
+        tokens-per-minute="200000"
+        token-quota="3000000"
+        token-quota-period="Monthly"
+        counter-key="@(context.Subscription.Id)"
+        estimate-prompt-tokens="true"
+        remaining-tokens-header-name="x-remaining-tpm-tokens"
+        remaining-quota-tokens-header-name="x-remaining-monthly-tokens"
+        tokens-consumed-header-name="x-consumed-tokens" />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

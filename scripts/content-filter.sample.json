@@ -1,0 +1,18 @@
+{
+  "_comment": "Sample custom content-filter (raiPolicy) spec for the BYOK model deployments. This example TIGHTENS filtering relative to Microsoft.DefaultV2 (lower severity thresholds, jailbreak + protected-material blocking on). Tightening is always allowed. Loosening (raising a threshold to High or disabling a category) requires an approved Azure OpenAI modified-content-filter application and the platform will reject it otherwise. Apply with scripts/configure-content-filter.ps1 -Apply (or .sh --apply). The _comment fields are ignored by the script (it only reads basePolicyName, mode, contentFilters).",
+  "basePolicyName": "Microsoft.DefaultV2",
+  "mode": "Default",
+  "contentFilters": [
+    { "name": "Hate",     "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Prompt" },
+    { "name": "Hate",     "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Completion" },
+    { "name": "Sexual",   "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Prompt" },
+    { "name": "Sexual",   "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Completion" },
+    { "name": "Violence", "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Prompt" },
+    { "name": "Violence", "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Completion" },
+    { "name": "Selfharm", "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Prompt" },
+    { "name": "Selfharm", "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Completion" },
+    { "name": "Jailbreak", "blocking": true, "enabled": true, "source": "Prompt" },
+    { "name": "Protected Material Text", "blocking": true, "enabled": true, "source": "Completion" },
+    { "name": "Protected Material Code", "blocking": false, "enabled": true, "source": "Completion" }
+  ]
+}

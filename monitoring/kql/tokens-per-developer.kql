@@ -1,0 +1,10 @@
+// Per-developer request rate over the last 24h.
+customMetrics
+| where timestamp > ago(24h)
+| where name == "copilot_byok_request"
+| extend
+    developer = tostring(customDimensions["developer_upn"]),
+    oid       = tostring(customDimensions["developer_oid"]),
+    model     = tostring(customDimensions["deployment_name"])
+| summarize requests = sum(value) by bin(timestamp, 1h), developer, model
+| order by timestamp asc

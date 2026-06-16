@@ -1,0 +1,28 @@
+name: runner-ping
+
+# Minimal one-job workflow_dispatch to prove the comm-pilot self-hosted runner
+# can actually pick up and execute a job. Separates runner-health debugging
+# from the deploy-dev / reusable-workflow startup_failure question.
+# Delete this file once the comm-pilot runner is proven working end-to-end.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: [self-hosted, comm-pilot]
+    timeout-minutes: 5
+    steps:
+      - name: who-am-i
+        run: |
+          echo "hostname: $(hostname)"
+          echo "user: $(whoami)"
+          echo "pwd: $(pwd)"
+          echo "runner.os: ${{ runner.os }}"
+          echo "runner.arch: ${{ runner.arch }}"
+          echo "runner.name: ${{ runner.name }}"
+          echo "github.event_name: ${{ github.event_name }}"
+          echo "github.workflow: ${{ github.workflow }}"

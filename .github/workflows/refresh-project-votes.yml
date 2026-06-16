@@ -1,0 +1,51 @@
+name: Refresh project Votes from issue 👍 reactions
+
+# Why: keeps the "Votes" field on the BYOK Gateway Roadmap project (#1)
+# in sync with thumbs-up reaction counts on the linked issues, so the
+# Triage view can sort the P3 stub backlog by community demand.
+#
+# Requirements: repo or org secret `PROJECT_TOKEN`. Easiest is a CLASSIC
+# PAT with the `project` scope (Projects v2 read & write) AND `repo`
+# (for issues:read on this repo). A fine-grained PAT also works if its
+# resource owner is the user gwexler_microsoft with Projects: read & write
+# plus Issues: read on this repo. (The default GITHUB_TOKEN cannot write
+# to user-owned Projects v2.)
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # daily at 06:00 UTC
+  workflow_dispatch:       # manual run from the Actions tab
+
+permissions:
+  contents: read           # only need to checkout the script
+
+concurrency:
+  group: refresh-votes
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    # Self-hosted (#52). EMU hosted runners are disabled, so this cannot use
+    # ubuntu-latest. The comm-pilot pool is a persistent KEDA runner (the dev
+    # pools are torn down nightly). This job is pure GitHub-plane work (gh
+    # GraphQL/REST), so any persistent self-hosted runner with GitHub egress
+    # works — no Azure login needed. The myoung34/github-runner image already
+    # ships gh + pwsh, so no on-demand tool installs are required.
+    runs-on: [self-hosted, comm-pilot]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Refresh project field values
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+        run: |
+          if (-not $env:GH_TOKEN) {
+            throw "Missing PROJECT_TOKEN secret. Create a classic PAT with the 'project' + 'repo' scopes (or a fine-grained PAT owned by gwexler_microsoft with Projects read/write + Issues read) and add it as a repo or org secret named PROJECT_TOKEN."
+          }
+          ./scripts/seed-project-fields.ps1 `
+            -Owner gwexler_microsoft `
+            -Repo copilot-cli-byok-azure `
+            -ProjectNumber 1

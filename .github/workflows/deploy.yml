@@ -1,0 +1,217 @@
+name: deploy
+
+# CI/CD for the Copilot CLI BYOK → private Azure OpenAI/Foundry gateway.
+# Push to main (infra/policies/azure.yaml) runs a what-if VALIDATE/preview for BOTH
+# pilots automatically (continuous integration). The actual apply (`azd provision`)
+# is gated behind a manual workflow_dispatch with action=deploy for a single cloud
+# — GitHub Environment required-reviewers are not available on this private repo's
+# plan, so a human triggering the dispatch IS the approval gate. Authenticates with
+# OIDC federated credentials (no stored secrets).
+# See docs/deployment-guide.md → "CI/CD (GitHub Actions)" for setup.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cloud:
+        description: Target Azure cloud
+        type: choice
+        required: true
+        default: AzureUSGovernment
+        options:
+          - AzureUSGovernment
+          - AzureCloud
+      action:
+        description: validate (what-if only) or deploy (provision)
+        type: choice
+        required: true
+        default: validate
+        options:
+          - validate
+          - deploy
+  # Continuous integration: any change to the infra, the baked-in APIM policies, or
+  # the azd manifest runs a what-if VALIDATE/preview for both pilots (no apply). The
+  # real apply is a deliberate manual workflow_dispatch (action=deploy) — see header.
+  # NOTE: editing THIS workflow file does not trigger CI on purpose — a pipeline
+  # tweak should not re-preview infra.
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - 'policies/**'
+      - 'azure.yaml'
+
+# OIDC: the workflow requests a federated token; nothing secret is stored in the repo.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # setup — resolve the target cloud matrix and whether to apply (deploy) or only
+  # preview (validate). workflow_dispatch honors the chosen cloud + action; a push
+  # to main fans out to both pilots but only ever validates (apply requires a manual
+  # dispatch). Runs on a persistent pilot runner because EMU hosted runners are
+  # disabled for this repo.
+  # ---------------------------------------------------------------------------
+  setup:
+    name: Resolve targets
+    runs-on: [self-hosted, comm-pilot]
+    outputs:
+      clouds: ${{ steps.m.outputs.clouds }}
+      deploy: ${{ steps.m.outputs.deploy }}
+    steps:
+      - id: m
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            printf 'clouds=["%s"]\n' "${{ inputs.cloud }}" >> "$GITHUB_OUTPUT"
+            if [[ "${{ inputs.action }}" == "deploy" ]]; then
+              echo 'deploy=true'  >> "$GITHUB_OUTPUT"
+            else
+              echo 'deploy=false' >> "$GITHUB_OUTPUT"
+            fi
+          else
+            # push to main -> validate/preview BOTH pilots; never auto-apply.
+            echo 'clouds=["AzureUSGovernment","AzureCloud"]' >> "$GITHUB_OUTPUT"
+            echo 'deploy=false' >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # validate — always runs. Builds/lints Bicep and runs an azd what-if preview.
+  # No resources are created here.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate (${{ matrix.cloud }})
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        cloud: ${{ fromJson(needs.setup.outputs.clouds) }}
+    # Self-hosted pilot runner (EMU hosted runners are disabled). Label = env name.
+    runs-on: [self-hosted, "${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}"]
+    environment: ${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}
+    env:
+      AZURE_ENV_NAME: ${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}
+      CI_PARAMS_FILE: ${{ matrix.cloud == 'AzureUSGovernment' && 'infra/main.parameters.ci.gov.json' || 'infra/main.parameters.ci.commercial.json' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install azd
+        uses: Azure/setup-azd@v2
+
+      # The myoung34/github-runner image does not ship az; az bicep + azure/login
+      # shell out to it, so install on demand (mirrors smoke-test.yml).
+      - name: Install Azure CLI (self-hosted runner)
+        shell: bash
+        run: |
+          if ! command -v az >/dev/null 2>&1; then
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+
+      - name: Install Bicep CLI
+        run: az bicep install
+
+      - name: Lint / build Bicep
+        run: az bicep build --file infra/main.bicep --stdout > /dev/null
+
+      - name: Select cloud (azd) + stage CI parameters
+        run: |
+          azd config set cloud.name "${{ matrix.cloud }}"
+          cp "${CI_PARAMS_FILE}" infra/main.parameters.json
+
+      - name: azd auth login (OIDC federated)
+        run: |
+          azd auth login \
+            --client-id "${{ vars.AZURE_CLIENT_ID }}" \
+            --tenant-id "${{ vars.AZURE_TENANT_ID }}" \
+            --federated-credential-provider github
+
+      - name: Azure CLI login (OIDC) — used by azd pre/post hooks
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ matrix.cloud == 'AzureUSGovernment' && 'AzureUSGovernment' || 'AzureCloud' }}
+
+      - name: What-if preview (no changes applied)
+        run: azd provision --preview --no-prompt
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+          # Injected into the CI params file via azd ${...} substitution.
+          APIM_PUBLISHER_EMAIL: ${{ vars.APIM_PUBLISHER_EMAIL }}
+          ENTRA_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          API_APP_ID_URI: ${{ vars.API_APP_ID_URI }}
+          API_AUDIENCE: ${{ vars.API_AUDIENCE }}
+
+  # ---------------------------------------------------------------------------
+  # deploy — applies ONLY on a manual workflow_dispatch with action=deploy. Push to
+  # main never reaches here (setup sets deploy=false), so infra is never applied
+  # unattended; the human running the dispatch is the approval gate (environment
+  # required reviewers aren't available on this repo's plan).
+  # Self-deploy note: the pilot runner is itself provisioned by main.bicep
+  # (gh-runner module). azd provision is incremental, so an unchanged runner spec
+  # is a no-op; a change that alters the runner job could terminate this run
+  # mid-deploy — just re-run to converge if that happens.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy (${{ matrix.cloud }})
+    needs: [setup, validate]
+    if: ${{ needs.setup.outputs.deploy == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        cloud: ${{ fromJson(needs.setup.outputs.clouds) }}
+    # One in-flight provision per cloud; never cancel a running deploy.
+    concurrency:
+      group: deploy-${{ matrix.cloud }}
+      cancel-in-progress: false
+    runs-on: [self-hosted, "${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}"]
+    # Apply target environment. Reaches here only via manual dispatch (action=deploy).
+    environment: ${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}
+    env:
+      AZURE_ENV_NAME: ${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}
+      CI_PARAMS_FILE: ${{ matrix.cloud == 'AzureUSGovernment' && 'infra/main.parameters.ci.gov.json' || 'infra/main.parameters.ci.commercial.json' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install azd
+        uses: Azure/setup-azd@v2
+
+      - name: Install Azure CLI (self-hosted runner)
+        shell: bash
+        run: |
+          if ! command -v az >/dev/null 2>&1; then
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+
+      - name: Select cloud (azd) + stage CI parameters
+        run: |
+          azd config set cloud.name "${{ matrix.cloud }}"
+          cp "${CI_PARAMS_FILE}" infra/main.parameters.json
+
+      - name: azd auth login (OIDC federated)
+        run: |
+          azd auth login \
+            --client-id "${{ vars.AZURE_CLIENT_ID }}" \
+            --tenant-id "${{ vars.AZURE_TENANT_ID }}" \
+            --federated-credential-provider github
+
+      - name: Azure CLI login (OIDC) — used by azd pre/post hooks
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ matrix.cloud == 'AzureUSGovernment' && 'AzureUSGovernment' || 'AzureCloud' }}
+
+      - name: Provision (incremental, idempotent)
+        run: azd provision --no-prompt
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+          APIM_PUBLISHER_EMAIL: ${{ vars.APIM_PUBLISHER_EMAIL }}
+          ENTRA_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          API_APP_ID_URI: ${{ vars.API_APP_ID_URI }}
+          API_AUDIENCE: ${{ vars.API_AUDIENCE }}

@@ -1,0 +1,22 @@
+// Smoke test: confirm `emit-metric` is flowing into Application Insights.
+//
+// If this returns 0 rows AND AppRequests shows successful traffic in the
+// same window, the `applicationinsights` APIM service-level diagnostic is
+// almost certainly missing `properties.metrics: true`. See issue #16 and
+// `infra/modules/apim.bicep`.
+//
+// Confirm via gateway trace:
+//   POST .../service/<apim>/gateways/managed/listDebugCredentials?api-version=2024-05-01
+//   { "credentialsExpireAfter":"PT1H", "apiId":"/apis/copilot-byok-foundry", "purposes":["tracing"] }
+// Then call the API with header `Apim-Debug-Authorization: <token>` and
+// fetch /gateways/managed/listTrace. Look for `emit-metric` entries
+// reporting `"No diagnostic settings have metric enabled. Metric emission skipped."`.
+customMetrics
+| where timestamp > ago(15m)
+| where name in ("copilot_byok_request","copilot_byok_prompt_tokens","copilot_byok_completion_tokens")
+| extend
+    developer = tostring(customDimensions["developer_upn"]),
+    model     = tostring(customDimensions["deployment_name"]),
+    backend   = tostring(customDimensions["backend"])
+| summarize Calls = sum(itemCount), TotalVal = sum(value), Last = max(timestamp) by name, developer, model, backend
+| order by name asc, developer asc

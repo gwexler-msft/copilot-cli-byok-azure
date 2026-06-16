@@ -1,0 +1,60 @@
+[
+  {
+    "name": "BYOK Foundry (chat/completions)",
+    "vendor": "customendpoint",
+    "apiType": "chat-completions",
+    "apiKey": "<APIM_SUBSCRIPTION_KEY>",
+    "models": [
+      {
+        "id": "gpt-5.1",
+        "name": "BYOK gpt-5.1",
+        "url": "https://<APIM_HOSTNAME>/openai/v1/chat/completions",
+        "requestHeaders": { "api-key": "<APIM_SUBSCRIPTION_KEY>" },
+        "toolCalling": true,
+        "vision": false,
+        "thinking": false,
+        "supportsReasoningEffort": ["minimal", "low", "medium", "high"],
+        "reasoningEffortFormat": "chat-completions",
+        "streaming": true,
+        "maxInputTokens": 272000,
+        "maxOutputTokens": 32768,
+        "zeroDataRetentionEnabled": true
+      },
+      {
+        "id": "gpt-4.1-mini",
+        "name": "BYOK gpt-4.1-mini",
+        "url": "https://<APIM_HOSTNAME>/openai/v1/chat/completions",
+        "requestHeaders": { "api-key": "<APIM_SUBSCRIPTION_KEY>" },
+        "toolCalling": true,
+        "vision": false,
+        "streaming": true,
+        "maxInputTokens": 128000,
+        "maxOutputTokens": 32768,
+        "zeroDataRetentionEnabled": true
+      }
+    ]
+  },
+  {
+    "name": "BYOK Foundry (responses)",
+    "vendor": "customendpoint",
+    "apiType": "responses",
+    "apiKey": "<APIM_SUBSCRIPTION_KEY>",
+    "models": [
+      {
+        "id": "gpt-5.1",
+        "name": "BYOK gpt-5.1",
+        "url": "https://<APIM_HOSTNAME>/openai/v1/responses",
+        "requestHeaders": { "api-key": "<APIM_SUBSCRIPTION_KEY>" },
+        "toolCalling": true,
+        "vision": false,
+        "thinking": true,
+        "supportsReasoningEffort": ["minimal", "low", "medium", "high"],
+        "reasoningEffortFormat": "responses",
+        "streaming": true,
+        "maxInputTokens": 272000,
+        "maxOutputTokens": 32768,
+        "zeroDataRetentionEnabled": true
+      }
+    ]
+  }
+]

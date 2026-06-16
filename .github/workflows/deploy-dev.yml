@@ -1,0 +1,199 @@
+# Auto-deploy to the ephemeral dev envs on every push to main, then chain
+# into smoke-test for an end-to-end regression check. Pilots are NEVER touched
+# by this workflow — they remain manual-only via deploy.yml.
+#
+# This workflow is also the SCHEDULED smoke entry point (it owns the cron, not
+# smoke-test.yml). Smoke needs a dev runner that is VNet-injected into the dev
+# env to reach APIM Internal; that runner only exists while the dev env exists.
+# teardown-dev.yml deletes the dev RGs nightly at 04:00 UTC, so a smoke-only cron
+# would hang forever against a torn-down env (no runner -> job queues ~24h).
+# Instead the schedule drives THIS workflow, which lazily (re)provisions the env
+# only when it's absent, then chains smoke. Net daily lifecycle:
+#   04:00 teardown -> 09:00 clean provision + smoke -> 12/15/18:00 smoke-only
+#   (env reused, provision SKIPPED so pilot does no incremental dev work).
+#
+# Cost shape: each push/first-of-day spins up Foundry + APIM Developer + 1 ACA
+# Job runner in each cloud (~$0/hr idle; ~cents per smoke). Subsequent same-day
+# smokes are runner-only (no redeploy). teardown-dev.yml reclaims it all nightly.
+name: deploy-dev
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - 'policies/**'
+      - 'azure.yaml'
+      - '.github/workflows/deploy-dev.yml'
+      - '.github/workflows/smoke-test.yml'
+  schedule:
+    # Through-the-day smoke against both dev envs. The first run after the 04:00
+    # teardown finds the env absent and does a clean provision; later runs reuse
+    # it (provision is gated on existence below, so pilot does no repeat work).
+    - cron: '0 9,12,15,18 * * *'
+  workflow_dispatch:
+    inputs:
+      smoke:
+        description: Run smoke-test after deploy
+        type: boolean
+        default: true
+      envs:
+        description: Which dev envs to deploy (comma-separated subset of comm-dev,gov-dev)
+        type: string
+        default: comm-dev,gov-dev
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  # Coalesce queued pushes per env so we don't deploy obsolete commits, but
+  # never cancel an in-flight provision (azd is not safe to interrupt).
+  group: deploy-dev-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    name: Build dev matrix
+    # Self-hosted (#52). Hosted runners are disabled at the EMU enterprise level
+    # for this repo, so every job in every workflow must target the pilot's
+    # KEDA-scaled ACA Job runner (label = envName = `comm-pilot`).
+    runs-on: [self-hosted, comm-pilot]
+    outputs:
+      envs: ${{ steps.build.outputs.envs }}
+    steps:
+      - id: build
+        shell: bash
+        run: |
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
+            raw='${{ inputs.envs }}'
+          else
+            raw='comm-dev,gov-dev'
+          fi
+          # csv -> JSON array, trim whitespace, dedupe
+          envs=$(echo "$raw" | tr ',' '\n' | awk 'NF' | sort -u \
+            | jq -R . | jq -sc .)
+          echo "envs=$envs" >> "$GITHUB_OUTPUT"
+          echo "Will deploy: $envs"
+
+  provision:
+    name: Provision ${{ matrix.env }}
+    needs: matrix
+    if: needs.matrix.outputs.envs != '[]'
+    # The dev env's own runner doesn't exist yet (we're about to create it), so
+    # bootstrap provisioning has to run on the matching cloud's pilot runner.
+    # Routing: comm-dev -> comm-pilot (AzureCloud); gov-dev -> gov-pilot (AzureUSGovernment).
+    # Each pilot's UAMI must hold the FIC for the dev env it bootstraps (#53).
+    runs-on: [self-hosted, "${{ matrix.env == 'gov-dev' && 'gov-pilot' || 'comm-pilot' }}"]
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJson(needs.matrix.outputs.envs) }}
+    environment: ${{ matrix.env }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install azd
+        uses: Azure/setup-azd@v2
+
+      - name: Resolve per-env config
+        id: cfg
+        shell: bash
+        run: |
+          case "${{ matrix.env }}" in
+            comm-dev)
+              echo "cloud=AzureCloud"                                  >> "$GITHUB_OUTPUT"
+              echo "params=infra/main.parameters.ci.commercial-dev.json" >> "$GITHUB_OUTPUT"
+              ;;
+            gov-dev)
+              echo "cloud=AzureUSGovernment"                           >> "$GITHUB_OUTPUT"
+              echo "params=infra/main.parameters.ci.gov-dev.json"      >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Unknown env '${{ matrix.env }}' — only comm-dev / gov-dev are auto-deployable"
+              exit 2
+              ;;
+          esac
+
+      - name: Stage CI parameters
+        run: |
+          azd config set cloud.name "${{ steps.cfg.outputs.cloud }}"
+          cp "${{ steps.cfg.outputs.params }}" infra/main.parameters.json
+
+      - name: azd auth login (OIDC)
+        run: |
+          azd auth login \
+            --client-id "${{ vars.AZURE_CLIENT_ID }}" \
+            --tenant-id "${{ vars.AZURE_TENANT_ID }}" \
+            --federated-credential-provider github
+
+      # Self-hosted ACA Job runner image (myoung34/github-runner) ships azd but
+      # NOT az. azure/login@v2 shells out to `az`, so install it on demand.
+      # Idempotent — no-op if a prior step (or pre-baked image) already has it.
+      - name: Install Azure CLI (self-hosted runner)
+        shell: bash
+        run: |
+          if ! command -v az >/dev/null 2>&1; then
+            echo "az not found — installing"
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          else
+            echo "az already installed: $(az version --query '\"azure-cli\"' -o tsv)"
+          fi
+
+      - name: Azure CLI login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ steps.cfg.outputs.cloud }}
+
+      # Lazy-provision gate. On the schedule trigger we only want to do a clean
+      # deploy when the dev env is actually gone (first smoke after the nightly
+      # 04:00 teardown). Subsequent same-day scheduled smokes find the RG present
+      # and SKIP azd provision entirely, so the pilot runner never burns time on
+      # incremental dev validations. push/dispatch always provision (to apply
+      # infra changes / honor manual intent) regardless of existence.
+      - name: Preflight — does the dev env already exist?
+        id: preflight
+        shell: bash
+        run: |
+          rg="rg-copilot-byok-${{ matrix.env }}"
+          exists=$(az group exists --name "$rg")
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+          echo "RG $rg exists=$exists (event=${{ github.event_name }})"
+
+      - name: azd provision
+        # Provision when: env is absent (always bootstrap), OR this is not a
+        # scheduled run (push/dispatch must apply changes / honor manual intent).
+        if: ${{ steps.preflight.outputs.exists == 'false' || github.event_name != 'schedule' }}
+        run: azd provision --no-prompt
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+          APIM_PUBLISHER_EMAIL: ${{ vars.APIM_PUBLISHER_EMAIL }}
+          ENTRA_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          API_APP_ID_URI: ${{ vars.API_APP_ID_URI }}
+          API_AUDIENCE: ${{ vars.API_AUDIENCE }}
+          GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
+
+      - name: Skip note (env already present)
+        if: ${{ steps.preflight.outputs.exists == 'true' && github.event_name == 'schedule' }}
+        run: echo "dev env rg-copilot-byok-${{ matrix.env }} already exists — skipping provision, running smoke only."
+
+  smoke-comm-dev:
+    name: Smoke comm-dev
+    needs: [matrix, provision]
+    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.smoke) && contains(needs.matrix.outputs.envs, 'comm-dev') }}
+    uses: ./.github/workflows/smoke-test.yml
+    with:
+      env: comm-dev
+
+  smoke-gov-dev:
+    name: Smoke gov-dev
+    needs: [matrix, provision]
+    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.smoke) && contains(needs.matrix.outputs.envs, 'gov-dev') }}
+    uses: ./.github/workflows/smoke-test.yml
+    with:
+      env: gov-dev

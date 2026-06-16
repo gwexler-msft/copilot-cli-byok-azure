@@ -1,0 +1,139 @@
+// =====================================================================
+// VS Code 1.122+ Custom Endpoint provider - chatLanguageModels.json
+// =====================================================================
+// VS Code asks you to fill out this file when you go through
+//   Command Palette -> "Chat: Manage Language Models" ->
+//   "Add Models" -> "Custom Endpoint".
+//
+// The schema is provider-wrapped: each top-level object is ONE provider
+// group (one apiType, one set of credentials), and the `models[]` array
+// inside lists the deployments served by that provider. Because apiType
+// is provider-level, exposing the SAME backend through both
+// chat-completions AND responses needs TWO provider blocks.
+//
+// Replace BEFORE saving:
+//   <APIM_HOSTNAME>          e.g. apim-byok-gov-pilot-jzjre3.azure-api.us
+//   <APIM_SUBSCRIPTION_KEY>  per-developer key from APIM > Subscriptions
+//
+// API path picker:
+//   Foundry (default backend, recommended) -> /openai/v1/{chat/completions,responses}
+//   Legacy AOAI (deployAoai=true)          -> /aoai/v1/{chat/completions,responses}
+// =====================================================================
+[
+  {
+    // -------- Provider 1: Chat Completions surface --------
+    // `name` is the GROUP label shown in the model picker and
+    // Language Models editor; pick something the developer recognises.
+    "name": "BYOK Foundry (chat/completions)",
+
+    // `vendor` selects VS Code's built-in Custom Endpoint provider.
+    "vendor": "customendpoint",
+
+    // `apiType` is provider-level. Wire format VS Code emits:
+    //   chat-completions -> OpenAI /chat/completions schema
+    //   responses        -> OpenAI /responses schema
+    //   messages         -> Anthropic /messages schema
+    "apiType": "chat-completions",
+
+    // `apiKey` is provider-level. VS Code defaults to sending it as
+    // `Authorization: Bearer`, which APIM doesn't read. The model-level
+    // requestHeaders override below ALSO sends the key as `api-key`,
+    // which is what APIM's subscription-key validation reads. Keep both
+    // fields set to the same value - harmless duplication, works for
+    // either auth path. In jwt mode, set apiKey to a fresh Entra access
+    // token and drop the per-model requestHeaders block (VS Code does
+    // not refresh JWTs - they're good for ~1 hour).
+    "apiKey": "<APIM_SUBSCRIPTION_KEY>",
+
+    "models": [
+      {
+        // `id` is what VS Code puts in the request body's `model` field.
+        // For this gateway it must match a Foundry/AOAI deployment name.
+        "id": "gpt-5.1",
+
+        // `name` is the label shown inside the picker.
+        "name": "BYOK gpt-5.1",
+
+        // `url` is the full request URL. Path determines the wire format,
+        // so it MUST line up with the provider-level apiType above.
+        "url": "https://<APIM_HOSTNAME>/openai/v1/chat/completions",
+
+        // requestHeaders is a MODEL-level field per the VS Code schema -
+        // a provider-level requestHeaders is silently ignored. Repeat
+        // this block on every model that hits the same gateway.
+        "requestHeaders": { "api-key": "<APIM_SUBSCRIPTION_KEY>" },
+
+        // Capability flags. Must reflect what the model truly supports;
+        // tool-calling=false hides the model from agentic chat entirely.
+        "toolCalling": true,
+        "vision": false,
+        "thinking": false,
+
+        // Reasoning effort levels offered in the picker. gpt-5.x accepts
+        // these; legacy 4.x families ignore the field. ARRAY of strings,
+        // not a boolean - VS Code silently ignores a boolean value.
+        "supportsReasoningEffort": ["minimal", "low", "medium", "high"],
+
+        // Body shape used to forward reasoning effort. MUST match the
+        // surface in `url`:
+        //   chat-completions -> root field { "reasoning_effort": "..." }
+        //   responses        -> nested      { "reasoning": { "effort": "..." } }
+        // Mismatch silently strips the field; the model runs at default effort.
+        "reasoningEffortFormat": "chat-completions",
+
+        "streaming": true,
+
+        // Context-window tuning. The gateway's auto-route safe defaults:
+        //   maxInputTokens  = 272000 (gpt-5.1 prompt cap)
+        //   maxOutputTokens = 32768  (shared output ceiling)
+        "maxInputTokens": 272000,
+        "maxOutputTokens": 32768,
+
+        // True suppresses VS Code's GitHub-data-handling banner because the
+        // gateway already enforces ZDR via the private AOAI/Foundry account.
+        // Also affects /responses behaviour: when true, previous_response_id
+        // is NOT sent (so conversations are stateless on the gateway).
+        "zeroDataRetentionEnabled": true
+      },
+      {
+        "id": "gpt-4.1-mini",
+        "name": "BYOK gpt-4.1-mini",
+        "url": "https://<APIM_HOSTNAME>/openai/v1/chat/completions",
+        "requestHeaders": { "api-key": "<APIM_SUBSCRIPTION_KEY>" },
+        "toolCalling": true,
+        "vision": false,
+        "streaming": true,
+        "maxInputTokens": 128000,
+        "maxOutputTokens": 32768,
+        "zeroDataRetentionEnabled": true
+      }
+    ]
+  },
+  {
+    // -------- Provider 2: Responses surface --------
+    // Same APIM, same key, same backend - just a second provider block
+    // because apiType is provider-level. Most reasoning models prefer
+    // Responses; non-reasoning models work best on chat-completions.
+    "name": "BYOK Foundry (responses)",
+    "vendor": "customendpoint",
+    "apiType": "responses",
+    "apiKey": "<APIM_SUBSCRIPTION_KEY>",
+    "models": [
+      {
+        "id": "gpt-5.1",
+        "name": "BYOK gpt-5.1",
+        "url": "https://<APIM_HOSTNAME>/openai/v1/responses",
+        "requestHeaders": { "api-key": "<APIM_SUBSCRIPTION_KEY>" },
+        "toolCalling": true,
+        "vision": false,
+        "thinking": true,
+        "supportsReasoningEffort": ["minimal", "low", "medium", "high"],
+        "reasoningEffortFormat": "responses",
+        "streaming": true,
+        "maxInputTokens": 272000,
+        "maxOutputTokens": 32768,
+        "zeroDataRetentionEnabled": true
+      }
+    ]
+  }
+]

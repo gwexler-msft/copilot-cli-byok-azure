@@ -1,0 +1,36 @@
+name: copilot-cli-byok-azure
+metadata:
+  template: copilot-cli-byok-azure@1.0.0
+infra:
+  provider: bicep
+  path: infra
+  module: main
+hooks:
+  # Pre-deployment gate: verify the signed-in principal can create resources and grant the
+  # APIM MI its RBAC role (Owner, or Contributor + User Access Administrator). Aborts azd on
+  # hard failure. Set `azd env set assignAoaiRbac true` to make it strict about RBAC.
+  preprovision:
+    posix:
+      shell: sh
+      run: ./scripts/check-deploy-access.sh
+      continueOnError: false
+      interactive: false
+    windows:
+      shell: pwsh
+      run: ./scripts/check-deploy-access.ps1
+      continueOnError: false
+      interactive: false
+  # Post-deployment RBAC: grant the APIM managed identity "Cognitive Services OpenAI User"
+  # on the AOAI + Foundry accounts (idempotent). Needed when assignAoaiRbac=false (the
+  # in-template RBAC module is skipped). Harmless when it ran (az returns the existing grant).
+  postprovision:
+    posix:
+      shell: sh
+      run: ./scripts/grant-apim-mi-rbac.sh
+      continueOnError: false
+      interactive: false
+    windows:
+      shell: pwsh
+      run: ./scripts/grant-apim-mi-rbac.ps1
+      continueOnError: false
+      interactive: false

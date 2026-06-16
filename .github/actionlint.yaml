@@ -1,0 +1,10 @@
+# Custom self-hosted runner labels used by this repo. Workflow runners are
+# provisioned by infra/modules/gh-runner.bicep (one ACA Job per env, KEDA
+# scaled, label = envName). Hosted runners are disabled at the EMU enterprise
+# level for this repo, so every workflow MUST target one of these.
+self-hosted-runner:
+  labels:
+    - comm-pilot
+    - gov-pilot
+    - comm-dev
+    - gov-dev
