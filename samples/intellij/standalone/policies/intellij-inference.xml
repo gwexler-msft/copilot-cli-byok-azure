@@ -1,0 +1,283 @@
+<!--
+  ===========================================================================
+  IntelliJ BYOK bolt-on — dedicated /intellij inference policy (subscription key)
+  ===========================================================================
+  Trimmed, standalone variant of the main gateway's foundry inference policy for a
+  customer's EXISTING Internal APIM that already fronts Foundry with an API KEY.
+
+  Differences from the main policy (deliberately simpler):
+   - Auth to Foundry is the customer's EXISTING backend + api-key, NOT managed identity.
+     We set-backend-service to the backend ({{intellij-foundry-backend-id}}); if the
+     api-key is applied in policy (not on the backend entity) we set it from
+     {{intellij-foundry-api-key}} — empty means "the backend carries its own credential".
+   - No AOAI route, no multi-backend selection, no Level-2 classifier auto-route.
+   - Auto-route is the Level-1 heuristic only, and no-ops when {{intellij-auto-sentinel}} is empty.
+   - Metrics emit only when {{intellij-metrics-enabled}} is "true" (opt-in App Insights).
+
+  The caller's APIM subscription key rides in the 'api-key' header and is validated NATIVELY
+  by APIM (subscriptionRequired=true) before this policy runs.
+  ===========================================================================
+-->
+<policies>
+  <inbound>
+    <base />
+
+    <!-- 1. Developer identity = the APIM subscription that authenticated the call. -->
+    <set-variable name="developerOid" value="@(context.Subscription?.Id ?? "unknown")" />
+    <set-variable name="developerUpn" value="@(context.Subscription?.Name ?? context.Subscription?.Id ?? "unknown")" />
+
+    <!-- 2. Requested model/deployment: from the URL (/deployments/{model}/...) if present,
+         else from the request BODY 'model' field. -->
+    <set-variable name="pathHasDeployment" value="@(context.Request.OriginalUrl.Path.ToLowerInvariant().Contains("/deployments/"))" />
+    <set-variable name="deploymentName" value="@{
+        try {
+            if ((bool)context.Variables["pathHasDeployment"]) {
+                var segs = context.Request.OriginalUrl.Path.Split('/');
+                for (int i = 0; i < segs.Length - 1; i++) {
+                    if (segs[i].ToLowerInvariant() == "deployments") { return segs[i + 1]; }
+                }
+            }
+            var body = context.Request.Body?.As<JObject>(preserveContent: true);
+            return (string)(body?["model"]?.ToString()) ?? "unknown";
+        } catch { return "unknown"; }
+    }" />
+
+    <!-- 2a. Guard: 400 if no model could be read from the body. -->
+    <choose>
+      <when condition="@(string.IsNullOrEmpty((string)context.Variables["deploymentName"]) || (string)context.Variables["deploymentName"] == "unknown")">
+        <return-response>
+          <set-status code="400" reason="Could not determine model from request body" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>{"error":{"code":"ModelNotSpecified","message":"Could not parse a 'model' field from the JSON request body. Ensure the body is valid JSON, e.g. {\"model\":\"&lt;deployment&gt;\",\"messages\":[...]}."}}</set-body>
+        </return-response>
+      </when>
+    </choose>
+
+    <!-- 2b. TIERED AUTO ROUTING (Level-1 heuristic only). When the caller sends the sentinel
+         model ({{intellij-auto-sentinel}}, comma-separated; empty disables this entirely) we
+         pick the cheap "mini" tier for short, non-coding prompts and the full model otherwise.
+         Ambiguous prompts go to the full model (quality-first, zero added latency). -->
+    <set-variable name="autoDecision" value="none" />
+    <set-variable name="autoRouteReason" value="none" />
+    <set-variable name="autoTextLength" value="0" />
+    <set-variable name="autoLengthBand" value="none" />
+    <set-variable name="autoIsCoding" value="false" />
+    <set-variable name="isAutoRoute" value="@{
+        var d = ((string)context.Variables["deploymentName"]).Trim().ToLowerInvariant();
+        var s = "{{intellij-auto-sentinel}}";
+        var mini = "{{intellij-auto-mini-deployment}}";
+        var full = "{{intellij-auto-full-deployment}}";
+        // Auto-route only when the sentinel AND both tier deployments are configured (so 'auto'
+        // can be a safe default: with no mini/full set it stays inert instead of 404ing).
+        if (string.IsNullOrWhiteSpace(s) || string.IsNullOrWhiteSpace(mini) || string.IsNullOrWhiteSpace(full)) { return false; }
+        return s.Split(',').Any(x => x.Trim().ToLowerInvariant() == d);
+    }" />
+    <choose>
+      <when condition="@((bool)context.Variables["isAutoRoute"])">
+        <set-variable name="autoUserText" value="@{
+            try {
+                var body = context.Request.Body?.As<JObject>(preserveContent: true);
+                if (body == null) { return ""; }
+                var msgs = body["messages"] as JArray;
+                if (msgs != null) {
+                    for (int i = msgs.Count - 1; i >= 0; i--) {
+                        var roleTok = msgs[i]["role"];
+                        var role = roleTok == null ? "" : ((string)roleTok).ToLowerInvariant();
+                        if (role != "user") { continue; }
+                        var content = msgs[i]["content"];
+                        if (content == null) { return ""; }
+                        if (content.Type == JTokenType.String) { return (string)content; }
+                        if (content.Type == JTokenType.Array) {
+                            var sb = new System.Text.StringBuilder();
+                            foreach (var part in (JArray)content) {
+                                var t = part["text"] ?? part["input_text"] ?? part["output_text"];
+                                if (t != null && t.Type == JTokenType.String) { sb.Append((string)t); sb.Append('\n'); }
+                            }
+                            return sb.ToString();
+                        }
+                        return "";
+                    }
+                    return "";
+                }
+                var input = body["input"];
+                if (input != null) {
+                    if (input.Type == JTokenType.String) { return (string)input; }
+                    if (input.Type == JTokenType.Array) {
+                        var arr = (JArray)input;
+                        for (int i = arr.Count - 1; i >= 0; i--) {
+                            var item = arr[i];
+                            if (item.Type == JTokenType.String) { return (string)item; }
+                            var roleTok = item["role"];
+                            if (roleTok != null && ((string)roleTok).ToLowerInvariant() != "user") { continue; }
+                            var content = item["content"];
+                            if (content == null) { continue; }
+                            if (content.Type == JTokenType.String) { return (string)content; }
+                            if (content.Type == JTokenType.Array) {
+                                var sb = new System.Text.StringBuilder();
+                                foreach (var part in (JArray)content) {
+                                    var t = part["text"] ?? part["input_text"] ?? part["output_text"];
+                                    if (t != null && t.Type == JTokenType.String) { sb.Append((string)t); sb.Append('\n'); }
+                                }
+                                return sb.ToString();
+                            }
+                        }
+                    }
+                }
+                return "";
+            } catch { return ""; }
+        }" />
+        <set-variable name="autoTextLength" value="@(((string)context.Variables["autoUserText"]).Length)" />
+        <set-variable name="autoLengthBand" value="@{
+          int len = (int)context.Variables["autoTextLength"];
+          int threshold = int.Parse("{{intellij-auto-length-threshold}}");
+          int band = int.Parse("{{intellij-auto-ambiguous-band}}");
+          if (len < threshold - band) { return "short"; }
+          if (len >= threshold + band) { return "long"; }
+          return "ambiguous";
+        }" />
+        <set-variable name="autoIsCoding" value="@{
+            var text = (string)context.Variables["autoUserText"];
+            if (string.IsNullOrEmpty(text)) { return false; }
+            var rx = new System.Text.RegularExpressions.Regex(@"```|=>|@@ |(^|\n)\s*(def |class |function |func |import |from |#include|public |private |protected |const |let |var |return |if \(|for \(|while \()|;\s*\n|\{\s*\n|\}\s*\n|Traceback|Exception|\.(py|ts|js|tsx|jsx|cs|java|go|rb|cpp|rs|sql|sh|ps1|ya?ml|html|css)\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            return rx.IsMatch(text);
+        }" />
+        <set-variable name="autoRouteReason" value="@((bool)context.Variables["autoIsCoding"] ? "coding" : (string)context.Variables["autoLengthBand"])" />
+        <set-variable name="autoDecision" value="@((string)context.Variables["autoRouteReason"] == "short" ? "mini" : "full")" />
+        <set-variable name="deploymentName" value="@((string)context.Variables["autoDecision"] == "mini" ? "{{intellij-auto-mini-deployment}}" : "{{intellij-auto-full-deployment}}")" />
+      </when>
+    </choose>
+
+    <!-- 2c. Per-request counter (opt-in App Insights). -->
+    <choose>
+      <when condition="@("{{intellij-metrics-enabled}}".ToLowerInvariant() == "true")">
+        <emit-metric name="copilot_byok_request" value="1" namespace="copilot.byok">
+          <dimension name="developer_oid" value="@((string)context.Variables["developerOid"])" />
+          <dimension name="developer_upn" value="@((string)context.Variables["developerUpn"])" />
+          <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+          <dimension name="auto_route" value="@((string)context.Variables["autoDecision"])" />
+        </emit-metric>
+      </when>
+    </choose>
+    <!-- Separate metric because APIM allows at most 5 custom dimensions per emit-metric policy. -->
+    <choose>
+      <when condition="@("{{intellij-metrics-enabled}}".ToLowerInvariant() == "true" &amp;&amp; (bool)context.Variables["isAutoRoute"])">
+        <emit-metric name="copilot_byok_auto_route" value="1" namespace="copilot.byok">
+          <dimension name="developer_upn" value="@((string)context.Variables["developerUpn"])" />
+          <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+          <dimension name="auto_route" value="@((string)context.Variables["autoDecision"])" />
+          <dimension name="auto_route_reason" value="@((string)context.Variables["autoRouteReason"])" />
+          <dimension name="auto_length_band" value="@((string)context.Variables["autoLengthBand"])" />
+        </emit-metric>
+      </when>
+    </choose>
+
+    <!-- 3. Request-body normalization: strip reasoning-model sampling params and remap
+         max_tokens -> max_completion_tokens for gpt-5 / o1 / o3 / o4; inject
+         stream_options.include_usage on streaming chat-completions (skipped for /responses). -->
+    <set-body>@{
+        try {
+            var body = context.Request.Body?.As<JObject>(preserveContent: true);
+            if (body == null) { return context.Request.Body?.As<string>(preserveContent: true); }
+            bool changed = false;
+            var model = (context.Variables.ContainsKey("deploymentName") ? (string)context.Variables["deploymentName"] : "").ToLowerInvariant();
+            bool isReasoning = model.StartsWith("gpt-5") || model.StartsWith("o1") || model.StartsWith("o3") || model.StartsWith("o4");
+            if (isReasoning) {
+                foreach (var p in new[] { "temperature", "top_p", "presence_penalty", "frequency_penalty" }) {
+                    if (body.Remove(p)) { changed = true; }
+                }
+                var maxTok = body["max_tokens"];
+                if (maxTok != null) {
+                    if (body["max_completion_tokens"] == null) { body["max_completion_tokens"] = maxTok; }
+                    body.Remove("max_tokens");
+                    changed = true;
+                }
+            }
+            var path = context.Request.OriginalUrl.Path.ToLowerInvariant();
+            if (!path.EndsWith("/responses")) {
+                var stream = body["stream"];
+                if (stream != null && stream.Type == JTokenType.Boolean && (bool)stream) {
+                    var opts = body["stream_options"] as JObject;
+                    if (opts == null) { opts = new JObject(); body["stream_options"] = opts; }
+                    opts["include_usage"] = true;
+                    changed = true;
+                }
+            }
+            return changed ? body.ToString() : context.Request.Body?.As<string>(preserveContent: true);
+        } catch {
+            return context.Request.Body?.As<string>(preserveContent: true);
+        }
+    }</set-body>
+
+    <!-- 4. Strip the caller's credential (the APIM subscription key rode in 'api-key'). -->
+    <set-header name="api-key" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+
+    <!-- 5. Operation from the path. -->
+    <set-variable name="aoaiOp" value="@{
+        var p = context.Request.OriginalUrl.Path.ToLowerInvariant();
+        if (p.EndsWith("/chat/completions")) { return "chat/completions"; }
+        if (p.EndsWith("/embeddings")) { return "embeddings"; }
+        if (p.EndsWith("/responses")) { return "responses"; }
+        return "completions";
+    }" />
+
+    <!-- 6. Route to the customer's EXISTING Foundry backend (api-key auth). If the api-key
+         is applied in policy rather than on the backend entity, {{intellij-foundry-api-key}}
+         carries it; empty => the backend adds its own credential. NO managed identity. -->
+    <set-backend-service backend-id="{{intellij-foundry-backend-id}}" />
+    <set-variable name="fdKey" value="{{intellij-foundry-api-key}}" />
+    <choose>
+      <when condition="@(!string.IsNullOrWhiteSpace((string)context.Variables["fdKey"]))">
+        <set-header name="api-key" exists-action="override">
+          <value>@((string)context.Variables["fdKey"])</value>
+        </set-header>
+      </when>
+    </choose>
+
+    <!-- 7. Rewrite the OpenAI-style /v1/<op> path to the Foundry data-plane path.
+         Chat/Completions/Embeddings are deployment-scoped; Responses is account-root v1. -->
+    <choose>
+      <when condition="@((string)context.Variables["aoaiOp"] == "responses")">
+        <rewrite-uri template="/openai/v1/responses" copy-unmatched-params="true" />
+      </when>
+      <otherwise>
+        <rewrite-uri template="@("/openai/deployments/" + (string)context.Variables["deploymentName"] + "/" + (string)context.Variables["aoaiOp"])" copy-unmatched-params="true" />
+      </otherwise>
+    </choose>
+
+    <!-- 8. Pin a known-good api-version on deployment-scoped paths (Responses is versionless). -->
+    <choose>
+      <when condition="@((string)context.Variables["aoaiOp"] != "responses")">
+        <set-query-parameter name="api-version" exists-action="override">
+          <value>{{intellij-api-version}}</value>
+        </set-query-parameter>
+      </when>
+    </choose>
+  </inbound>
+  <backend>
+    <retry condition="@(context.Response != null && (context.Response.StatusCode == 429 || context.Response.StatusCode >= 500))" count="2" interval="0" first-fast-retry="true">
+      <forward-request buffer-request-body="true" />
+    </retry>
+  </backend>
+  <outbound>
+    <base />
+    <choose>
+      <when condition="@("{{intellij-metrics-enabled}}".ToLowerInvariant() == "true" &amp;&amp; context.Response.StatusCode == 200 &amp;&amp; (context.Response.Headers.GetValueOrDefault("Content-Type","").StartsWith("application/json")))">
+        <set-variable name="responseBody" value="@(context.Response.Body.As<JObject>(preserveContent: true))" />
+        <emit-metric name="copilot_byok_prompt_tokens" value="@{ var u = ((JObject)context.Variables["responseBody"])?["usage"]; return (double)((int?)(u?["prompt_tokens"]) ?? (int?)(u?["input_tokens"]) ?? 0); }" namespace="copilot.byok">
+          <dimension name="developer_oid" value="@((string)context.Variables["developerOid"])" />
+          <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+        </emit-metric>
+        <emit-metric name="copilot_byok_completion_tokens" value="@{ var u = ((JObject)context.Variables["responseBody"])?["usage"]; return (double)((int?)(u?["completion_tokens"]) ?? (int?)(u?["output_tokens"]) ?? 0); }" namespace="copilot.byok">
+          <dimension name="developer_oid" value="@((string)context.Variables["developerOid"])" />
+          <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+        </emit-metric>
+      </when>
+    </choose>
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

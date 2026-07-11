@@ -1,0 +1,537 @@
+<policies>
+  <inbound>
+    <base />
+
+    <!-- ============================================================================
+         COMMERCIAL FOUNDRY ROUTE (parallel to the default /openai Gov/private route).
+         This policy is a faithful structural copy of byok-foundry-policy-subkey.xml.
+         The ONLY differences are the backend it targets (a COMMERCIAL Microsoft Foundry
+         endpoint reached over the public internet) and the auth it uses to reach it:
+           - backend-id   {{foundry-commercial-backend-id}}   (vs {{foundry-backend-id}})
+           - base-url     {{foundry-commercial-base-url}}     (vs {{foundry-private-base-url}})
+           - mi-audience  {{foundry-commercial-mi-audience}}  (vs {{foundry-mi-audience}})
+           - api-version  {{foundry-commercial-api-version}}  (vs {{aoai-default-api-version}})
+         Auth/identity, request parsing, metrics (same names + dimensions), reasoning-model
+         normalization, /responses rewrite, and outbound token metrics are UNCHANGED so the
+         two routes are diff-reviewable and emit backward-compatible telemetry.
+         ============================================================================ -->
+
+    <!-- ===== AUTH MODE: APIM SUBSCRIPTION KEY (caller-facing; UNCHANGED) ===========
+         The commercial API is configured with subscriptionRequired=true and the
+         subscription-key parameter mapped to the 'api-key' header (see
+         apim-foundry-commercial-api.bicep). Copilot CLI BYOK 'azure' mode puts
+         COPILOT_PROVIDER_API_KEY into the 'api-key' header, so the per-developer APIM
+         subscription key rides there and APIM validates it NATIVELY before this policy runs.
+         This is the CALLER credential; the BACKEND credential (to the commercial Foundry)
+         is minted separately in step 6 below.
+         ============================================================================ -->
+
+    <!-- 1. Developer identity = the APIM subscription that authenticated the call. -->
+    <set-variable name="developerOid" value="@(context.Subscription?.Id ?? "unknown")" />
+    <set-variable name="developerUpn" value="@(context.Subscription?.Name ?? context.Subscription?.Id ?? "unknown")" />
+
+    <!-- 2. Requested model/deployment comes from the request BODY ("model": "..."). -->
+    <set-variable name="deploymentName" value="@{
+        try {
+            var body = context.Request.Body?.As<JObject>(preserveContent: true);
+            return (string)(body?["model"]?.ToString()) ?? "unknown";
+        } catch { return "unknown"; }
+    }" />
+
+    <!-- 2a. Guard: fail fast with 400 if we could not read a model name from the body. -->
+    <choose>
+      <when condition="@(string.IsNullOrEmpty((string)context.Variables["deploymentName"]) || (string)context.Variables["deploymentName"] == "unknown")">
+        <return-response>
+          <set-status code="400" reason="Could not determine model from request body" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>{"error":{"code":"ModelNotSpecified","message":"Could not parse a 'model' field from the JSON request body. Ensure the body is valid JSON, e.g. {\"model\":\"&lt;deployment&gt;\",\"messages\":[...]}. (A common cause is shell quote mangling of the JSON payload.)"}}</set-body>
+        </return-response>
+      </when>
+    </choose>
+
+    <!-- 2a2. TIERED AUTO MODEL-ROUTING (sentinel "auto"). Structurally identical to the
+         default route. Explicit (non-sentinel) model names skip this block entirely.
+         TODO(<COMMERCIAL_DEPLOYMENT_NAMES>): the {{auto-route-mini-deployment}} /
+         {{auto-route-full-deployment}} named values resolve to the DEFAULT (Gov) route's
+         deployment names. If the Commercial Foundry account exposes different deployment
+         names, auto-routed ("auto") requests on THIS route will 404 at the backend. Either
+         (a) tell commercial callers to send explicit model names (recommended initially), or
+         (b) parameterize commercial-specific auto-route deployment named values. The Level 2
+         classifier below also assumes MI works cross-cloud; leave it disabled
+         ({{auto-route-classifier-enabled}}=false) unless validated. -->
+    <set-variable name="autoDecision" value="none" />
+    <set-variable name="isAutoRoute" value="@{
+        var deploymentNameLower = ((string)context.Variables["deploymentName"]).Trim().ToLowerInvariant();
+        return "{{auto-route-sentinel}}".Split(',').Any(s => s.Trim().ToLowerInvariant() == deploymentNameLower);
+    }" />
+    <choose>
+      <when condition="@((bool)context.Variables["isAutoRoute"])">
+        <set-variable name="autoPromptText" value="@{
+            try {
+                var body = context.Request.Body?.As<JObject>(preserveContent: true);
+                if (body == null) { return ""; }
+                var sb = new System.Text.StringBuilder();
+                var msgs = body["messages"] as JArray;
+                if (msgs != null) {
+                    foreach (var m in msgs) {
+                        var content = m["content"];
+                        if (content == null) { continue; }
+                        if (content.Type == JTokenType.String) { sb.Append((string)content); sb.Append('\n'); }
+                        else if (content.Type == JTokenType.Array) {
+                            foreach (var part in (JArray)content) {
+                                var t = part["text"];
+                                if (t != null && t.Type == JTokenType.String) { sb.Append((string)t); sb.Append('\n'); }
+                            }
+                        }
+                    }
+                }
+                var input = body["input"];
+                if (input != null) {
+                    if (input.Type == JTokenType.String) { sb.Append((string)input); sb.Append('\n'); }
+                    else if (input.Type == JTokenType.Array) {
+                        foreach (var item in (JArray)input) {
+                            if (item.Type == JTokenType.String) { sb.Append((string)item); sb.Append('\n'); continue; }
+                            var content = item["content"];
+                            if (content == null) { continue; }
+                            if (content.Type == JTokenType.String) { sb.Append((string)content); sb.Append('\n'); }
+                            else if (content.Type == JTokenType.Array) {
+                                foreach (var part in (JArray)content) {
+                                    var t = part["text"] ?? part["input_text"] ?? part["output_text"];
+                                    if (t != null && t.Type == JTokenType.String) { sb.Append((string)t); sb.Append('\n'); }
+                                }
+                            }
+                        }
+                    }
+                }
+                return sb.ToString();
+            } catch { return ""; }
+        }" />
+        <!-- Scope complexity detection to the caller's ACTUAL last user turn. VS Code / CLI always
+             prepend a large system prompt + workspace context, so sizing/scanning the FULL payload
+             made even "what is 2+2" look large + code-ish and forced the full model. autoUserText =
+             the last user-role message (chat) or last user input item (Responses); falls back to the
+             full text only when no user turn is found. -->
+        <set-variable name="autoUserText" value="@{
+            try {
+                var body = context.Request.Body?.As<JObject>(preserveContent: true);
+                if (body == null) { return ""; }
+                var msgs = body["messages"] as JArray;
+                if (msgs != null) {
+                    for (int i = msgs.Count - 1; i >= 0; i--) {
+                        var roleTok = msgs[i]["role"];
+                        var role = roleTok == null ? "" : ((string)roleTok).ToLowerInvariant();
+                        if (role != "user") { continue; }
+                        var content = msgs[i]["content"];
+                        if (content == null) { return ""; }
+                        if (content.Type == JTokenType.String) { return (string)content; }
+                        if (content.Type == JTokenType.Array) {
+                            var sb = new System.Text.StringBuilder();
+                            foreach (var part in (JArray)content) {
+                                var t = part["text"] ?? part["input_text"] ?? part["output_text"];
+                                if (t != null && t.Type == JTokenType.String) { sb.Append((string)t); sb.Append('\n'); }
+                            }
+                            return sb.ToString();
+                        }
+                        return "";
+                    }
+                    return "";
+                }
+                var input = body["input"];
+                if (input != null) {
+                    if (input.Type == JTokenType.String) { return (string)input; }
+                    if (input.Type == JTokenType.Array) {
+                        var arr = (JArray)input;
+                        for (int i = arr.Count - 1; i >= 0; i--) {
+                            var item = arr[i];
+                            if (item.Type == JTokenType.String) { return (string)item; }
+                            var roleTok = item["role"];
+                            if (roleTok != null && ((string)roleTok).ToLowerInvariant() != "user") { continue; }
+                            var content = item["content"];
+                            if (content == null) { continue; }
+                            if (content.Type == JTokenType.String) { return (string)content; }
+                            if (content.Type == JTokenType.Array) {
+                                var sb = new System.Text.StringBuilder();
+                                foreach (var part in (JArray)content) {
+                                    var t = part["text"] ?? part["input_text"] ?? part["output_text"];
+                                    if (t != null && t.Type == JTokenType.String) { sb.Append((string)t); sb.Append('\n'); }
+                                }
+                                return sb.ToString();
+                            }
+                        }
+                    }
+                }
+                return "";
+            } catch { return ""; }
+        }" />
+        <set-variable name="autoIsCoding" value="@{
+            var text = (string)context.Variables["autoUserText"];
+            if (string.IsNullOrWhiteSpace(text)) { text = (string)context.Variables["autoPromptText"]; }
+            if (string.IsNullOrEmpty(text)) { return false; }
+            var rx = new System.Text.RegularExpressions.Regex(@"```|=>|@@ |(^|\n)\s*(def |class |function |func |import |from |#include|public |private |protected |const |let |var |return |if \(|for \(|while \()|;\s*\n|\{\s*\n|\}\s*\n|Traceback|Exception|\.(py|ts|js|tsx|jsx|cs|java|go|rb|cpp|rs|sql|sh|ps1|ya?ml|html|css)\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            return rx.IsMatch(text);
+        }" />
+        <set-variable name="autoDecision" value="@{
+            var sizeUser = (string)context.Variables["autoUserText"];
+            var sizeText = string.IsNullOrWhiteSpace(sizeUser) ? (string)context.Variables["autoPromptText"] : sizeUser;
+            int len = sizeText.Length;
+            bool coding = (bool)context.Variables["autoIsCoding"];
+            int threshold = int.Parse("{{auto-route-length-threshold}}");
+            int band = int.Parse("{{auto-route-ambiguous-band}}");
+            if (coding) { return "full"; }
+            if (len >= threshold + band) { return "full"; }
+            if (len < threshold - band) { return "mini"; }
+            return "ambiguous";
+        }" />
+        <choose>
+          <when condition="@((string)context.Variables["autoDecision"] == "ambiguous" &amp;&amp; "{{auto-route-classifier-enabled}}".ToLowerInvariant() == "true")">
+            <!-- TODO(<COMMERCIAL_BACKEND_AUTH_MODE>): this classifier call authenticates with a
+                 managed-identity token for {{foundry-commercial-mi-audience}}. If the commercial
+                 backend uses api-key auth (the cross-cloud default), this send-request must be
+                 refactored to send the api-key header instead. Disabled by default. -->
+            <authentication-managed-identity resource="{{foundry-commercial-mi-audience}}" output-token-variable-name="autoClassifierToken" ignore-error="true" />
+            <send-request mode="new" response-variable-name="autoClassifierResp" timeout="8" ignore-error="true">
+              <set-url>@("{{foundry-commercial-base-url}}/openai/deployments/{{auto-route-classifier-deployment}}/chat/completions?api-version={{foundry-commercial-api-version}}")</set-url>
+              <set-method>POST</set-method>
+              <set-header name="Authorization" exists-action="override">
+                <value>@("Bearer " + (string)context.Variables["autoClassifierToken"])</value>
+              </set-header>
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-body>@{
+                  var prompt = (string)context.Variables["autoUserText"];
+                  if (string.IsNullOrWhiteSpace(prompt)) { prompt = (string)context.Variables["autoPromptText"]; }
+                  if (prompt.Length > 4000) { prompt = prompt.Substring(0, 4000); }
+                  var payload = new JObject(
+                      new JProperty("messages", new JArray(
+                          new JObject(new JProperty("role", "system"), new JProperty("content", "You are a routing classifier. Reply with exactly one lowercase word and nothing else: simple or complex. complex = coding, debugging, multi-step reasoning, or long/technical context; simple = short factual or conversational requests.")),
+                          new JObject(new JProperty("role", "user"), new JProperty("content", prompt))
+                      )),
+                      new JProperty("max_tokens", 1),
+                      new JProperty("temperature", 0)
+                  );
+                  return payload.ToString();
+              }</set-body>
+            </send-request>
+            <set-variable name="autoClassifierLabel" value="@{
+                try {
+                    var resp = (IResponse)context.Variables["autoClassifierResp"];
+                    if (resp == null || resp.StatusCode != 200) { return "error"; }
+                    var j = resp.Body.As<JObject>();
+                    var c = (string)(j["choices"]?[0]?["message"]?["content"]);
+                    return (c ?? "").Trim().ToLowerInvariant();
+                } catch { return "error"; }
+            }" />
+            <set-variable name="autoDecision" value="@(((string)context.Variables["autoClassifierLabel"]).StartsWith("simple") ? "mini" : "full")" />
+          </when>
+          <when condition="@((string)context.Variables["autoDecision"] == "ambiguous")">
+            <set-variable name="autoDecision" value="full" />
+          </when>
+        </choose>
+        <set-variable name="deploymentName" value="@((string)context.Variables["autoDecision"] == "mini" ? "{{auto-route-mini-deployment}}" : "{{auto-route-full-deployment}}")" />
+      </when>
+    </choose>
+
+    <!-- 2b. Backend selection. Unlike the default route (which can pin specific models to a
+         sibling AOAI backend), the commercial route has a SINGLE backend: the commercial
+         Foundry endpoint. The backend dimension below stays "foundry-commercial" so per-route
+         telemetry is distinguishable while reusing the same metric names. -->
+    <set-variable name="backendName" value="foundry-commercial" />
+
+    <emit-metric name="copilot_byok_request" value="1" namespace="copilot.byok">
+      <dimension name="developer_oid" value="@((string)context.Variables["developerOid"])" />
+      <dimension name="developer_upn" value="@((string)context.Variables["developerUpn"])" />
+      <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+      <dimension name="backend" value="@((string)context.Variables["backendName"])" />
+      <dimension name="auto_route" value="@((string)context.Variables["autoDecision"])" />
+    </emit-metric>
+
+    <!-- 3. Throttling lives at PRODUCT scope (apim-products.bicep), keyed on the subscription —
+         identical to the default route. The commercial API is linked into the same product
+         tiers, so a tier-scoped key is throttled consistently across both routes. -->
+
+    <!-- 3b. Request-body normalization (reasoning-model strip + stream_options.include_usage).
+         Byte-for-byte identical to the default route. -->
+    <set-body>@{
+        try {
+            var body = context.Request.Body?.As<JObject>(preserveContent: true);
+            if (body == null) { return context.Request.Body?.As<string>(preserveContent: true); }
+            bool changed = false;
+            var model = (context.Variables.ContainsKey("deploymentName") ? (string)context.Variables["deploymentName"] : "").ToLowerInvariant();
+            bool isReasoning = model.StartsWith("gpt-5") || model.StartsWith("o1") || model.StartsWith("o3") || model.StartsWith("o4");
+            if (isReasoning) {
+                foreach (var p in new[] { "temperature", "top_p", "presence_penalty", "frequency_penalty" }) {
+                    if (body.Remove(p)) { changed = true; }
+                }
+                var maxTok = body["max_tokens"];
+                if (maxTok != null) {
+                    if (body["max_completion_tokens"] == null) {
+                        body["max_completion_tokens"] = maxTok;
+                    }
+                    body.Remove("max_tokens");
+                    changed = true;
+                }
+            }
+            var path = context.Request.OriginalUrl.Path.ToLowerInvariant();
+            if (!path.EndsWith("/responses")) {
+                var stream = body["stream"];
+                if (stream != null && stream.Type == JTokenType.Boolean && (bool)stream) {
+                    var opts = body["stream_options"] as JObject;
+                    if (opts == null) { opts = new JObject(); body["stream_options"] = opts; }
+                    opts["include_usage"] = true;
+                    changed = true;
+                }
+            }
+            return changed ? body.ToString() : context.Request.Body?.As<string>(preserveContent: true);
+        } catch {
+            return context.Request.Body?.As<string>(preserveContent: true);
+        }
+    }</set-body>
+
+    <!-- 4. Strip the CALLER credential before going to the backend. The BACKEND credential is
+         (re)applied in step 6. -->
+    <set-header name="api-key" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+
+    <!-- 5. Determine the AOAI-style operation from the path (UNCHANGED). -->
+    <set-variable name="aoaiOp" value="@{
+        var p = context.Request.OriginalUrl.Path.ToLowerInvariant();
+        if (p.EndsWith("/chat/completions")) { return "chat/completions"; }
+        if (p.EndsWith("/embeddings")) { return "embeddings"; }
+        if (p.EndsWith("/responses")) { return "responses"; }
+        return "completions";
+    }" />
+
+    <!-- 6. COMMERCIAL BACKEND AUTH + ROUTING. The caller credential (subscription key or JWT) was
+         already STRIPPED above and is NEVER forwarded to the commercial backend. APIM attaches a
+         SEPARATE backend credential selected by the {{foundry-commercial-auth-mode}} named value:
+
+           servicePrincipalFederated (DEFAULT, SECRETLESS) - workload identity federation. APIM
+             mints its OWN Gov managed-identity token (audience api://AzureADTokenExchange) and
+             presents it to the COMMERCIAL authority as an OAuth2 client_assertion (jwt-bearer); the
+             commercial SP carries a federated identity credential trusting this APIM MI, so NO
+             secret is stored. Caches the resulting token until shortly before expiry.
+
+           servicePrincipal (secret fallback, cross-tenant) - same client-credentials flow but
+             authenticated with the SECRET named value {{foundry-commercial-client-secret}} (never
+             logged). Use only if cross-cloud federation is unavailable. Either way a Gov-tenant
+             managed-identity token is rejected DIRECTLY by the commercial tenant
+             (TenantAccessDenied), so a Commercial-tenant SP is required. For both SP modes the
+             token endpoint AND the backend are public-internet from Gov, so BOTH must be in the
+             APIM egress allowlist (foundryCommercialEgressDestinations).
+
+           apikey - send the Commercial Foundry key {{foundry-commercial-api-key}} in the api-key
+             header (only if the commercial account permits key auth).
+
+           managedIdentity - mint an MI token for {{foundry-commercial-mi-audience}}. Kept for
+             same-tenant edge cases; NOT valid cross-tenant. -->
+    <choose>
+      <when condition="@("{{foundry-commercial-auth-mode}}".Equals("servicePrincipalFederated", System.StringComparison.OrdinalIgnoreCase))">
+        <!-- SECRETLESS workload identity federation. APIM mints its OWN Gov managed-identity token
+             with the federation exchange audience (api://AzureADTokenExchange) and presents it to
+             the COMMERCIAL authority as an OAuth2 client_assertion (jwt-bearer) instead of a client
+             secret. The commercial SP must carry a federated identity credential (FIC) trusting
+             this APIM MI: issuer = the Gov APIM MI token issuer, subject = the APIM MI object id,
+             audience = api://AzureADTokenExchange. Token cached per tenant+client until ~5 min
+             before expiry; value NEVER traced/logged. -->
+        <cache-lookup-value key="@("foundry-commercial-fedtoken|{{foundry-commercial-tenant-id}}|{{foundry-commercial-client-id}}")" variable-name="commercialSpToken" />
+        <choose>
+          <when condition="@(!context.Variables.ContainsKey("commercialSpToken"))">
+            <!-- 1. APIM's own (Gov) managed-identity token, audience = the token-exchange audience. -->
+            <authentication-managed-identity resource="api://AzureADTokenExchange" output-token-variable-name="govFederationAssertion" ignore-error="true" />
+            <!-- 2. OAuth2 client-credentials with client_assertion (no secret) at the COMMERCIAL authority. -->
+            <send-request mode="new" response-variable-name="commercialTokenResp" timeout="20" ignore-error="true">
+              <set-url>@("https://{{foundry-commercial-authority-host}}/{{foundry-commercial-tenant-id}}/oauth2/v2.0/token")</set-url>
+              <set-method>POST</set-method>
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/x-www-form-urlencoded</value>
+              </set-header>
+              <set-body>@{
+                  var assertion = context.Variables.ContainsKey("govFederationAssertion") ? (string)context.Variables["govFederationAssertion"] : "";
+                  return "grant_type=client_credentials"
+                    + "&amp;client_id=" + System.Uri.EscapeDataString("{{foundry-commercial-client-id}}")
+                    + "&amp;client_assertion_type=" + System.Uri.EscapeDataString("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+                    + "&amp;client_assertion=" + System.Uri.EscapeDataString(assertion)
+                    + "&amp;scope=" + System.Uri.EscapeDataString("{{foundry-commercial-token-resource}}".TrimEnd('/') + "/.default");
+              }</set-body>
+            </send-request>
+            <set-variable name="commercialSpToken" value="@{
+                try {
+                    var resp = context.Variables.ContainsKey("commercialTokenResp") ? (IResponse)context.Variables["commercialTokenResp"] : null;
+                    if (resp == null || resp.StatusCode != 200) { return ""; }
+                    var j = resp.Body.As<JObject>(preserveContent: true);
+                    return (string)(j["access_token"]) ?? "";
+                } catch { return ""; }
+            }" />
+            <choose>
+              <when condition="@(string.IsNullOrEmpty((string)context.Variables["commercialSpToken"]))">
+                <return-response>
+                  <set-status code="502" reason="Commercial backend token federation failed" />
+                  <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                  </set-header>
+                  <set-body>@{
+                      string code = "unreachable";
+                      try {
+                          var resp = context.Variables.ContainsKey("commercialTokenResp") ? (IResponse)context.Variables["commercialTokenResp"] : null;
+                          if (resp != null) {
+                              var j = resp.Body.As<JObject>(preserveContent: true);
+                              code = ((string)(j["error"]) ?? ("http_" + resp.StatusCode)) + ": " + ((string)(j["error_description"]) ?? "");
+                          }
+                      } catch { code = "token_endpoint_error"; }
+                      return "{\"error\":{\"code\":\"CommercialTokenFederationFailed\",\"message\":\"APIM could not federate to a Commercial-tenant token. Verify the commercial SP federated credential (issuer/subject/audience) trusts the Gov APIM managed identity, that cross-cloud federation is permitted, and that the commercial token endpoint is in the APIM egress allowlist. AAD error: " + code + "\"}}";
+                  }</set-body>
+                </return-response>
+              </when>
+            </choose>
+            <set-variable name="commercialTokenTtl" value="@{
+                try {
+                    var resp = (IResponse)context.Variables["commercialTokenResp"];
+                    var j = resp.Body.As<JObject>(preserveContent: true);
+                    int expires = (int?)j["expires_in"] ?? 3600;
+                    return System.Math.Max(expires - 300, 60);
+                } catch { return 300; }
+            }" />
+            <cache-store-value key="@("foundry-commercial-fedtoken|{{foundry-commercial-tenant-id}}|{{foundry-commercial-client-id}}")" value="@((string)context.Variables["commercialSpToken"])" duration="@((int)context.Variables["commercialTokenTtl"])" />
+          </when>
+        </choose>
+        <set-header name="Authorization" exists-action="override">
+          <value>@("Bearer " + (string)context.Variables["commercialSpToken"])</value>
+        </set-header>
+      </when>
+      <when condition="@("{{foundry-commercial-auth-mode}}".Equals("servicePrincipal", System.StringComparison.OrdinalIgnoreCase))">
+        <!-- Reuse a cached commercial token (client-credentials). Cache key is per tenant+client so
+             a credential rotation re-mints. Avoids a token round-trip on every request and AAD
+             throttling. The token value is NEVER traced/logged. -->
+        <cache-lookup-value key="@("foundry-commercial-sptoken|{{foundry-commercial-tenant-id}}|{{foundry-commercial-client-id}}")" variable-name="commercialSpToken" />
+        <choose>
+          <when condition="@(!context.Variables.ContainsKey("commercialSpToken"))">
+            <!-- OAuth2 v2.0 client-credentials against the COMMERCIAL authority. ignore-error=true
+                 so a network/NSG/TLS failure becomes our clean 502 below, not an opaque 500. -->
+            <send-request mode="new" response-variable-name="commercialTokenResp" timeout="20" ignore-error="true">
+              <set-url>@("https://{{foundry-commercial-authority-host}}/{{foundry-commercial-tenant-id}}/oauth2/v2.0/token")</set-url>
+              <set-method>POST</set-method>
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/x-www-form-urlencoded</value>
+              </set-header>
+              <set-body>@{
+                  return "grant_type=client_credentials"
+                    + "&amp;client_id=" + System.Uri.EscapeDataString("{{foundry-commercial-client-id}}")
+                    + "&amp;client_secret=" + System.Uri.EscapeDataString("{{foundry-commercial-client-secret}}")
+                    + "&amp;scope=" + System.Uri.EscapeDataString("{{foundry-commercial-token-resource}}".TrimEnd('/') + "/.default");
+              }</set-body>
+            </send-request>
+            <!-- Extract the token; empty string on ANY failure (null resp / non-200 / no token). -->
+            <set-variable name="commercialSpToken" value="@{
+                try {
+                    var resp = context.Variables.ContainsKey("commercialTokenResp") ? (IResponse)context.Variables["commercialTokenResp"] : null;
+                    if (resp == null || resp.StatusCode != 200) { return ""; }
+                    var j = resp.Body.As<JObject>(preserveContent: true);
+                    return (string)(j["access_token"]) ?? "";
+                } catch { return ""; }
+            }" />
+            <choose>
+              <when condition="@(string.IsNullOrEmpty((string)context.Variables["commercialSpToken"]))">
+                <return-response>
+                  <set-status code="502" reason="Commercial backend token acquisition failed" />
+                  <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                  </set-header>
+                  <!-- Non-secret diagnostic only: the short AAD error code (never the secret/token). -->
+                  <set-body>@{
+                      string code = "unreachable";
+                      try {
+                          var resp = context.Variables.ContainsKey("commercialTokenResp") ? (IResponse)context.Variables["commercialTokenResp"] : null;
+                          if (resp != null) {
+                              var j = resp.Body.As<JObject>(preserveContent: true);
+                              code = ((string)(j["error"]) ?? ("http_" + resp.StatusCode)) + ": " + ((string)(j["error_description"]) ?? "");
+                          }
+                      } catch { code = "token_endpoint_error"; }
+                      return "{\"error\":{\"code\":\"CommercialTokenAcquisitionFailed\",\"message\":\"APIM could not obtain a Commercial-tenant backend token. Check the service-principal credentials and that the commercial token endpoint is in the APIM egress allowlist. AAD error: " + code + "\"}}";
+                  }</set-body>
+                </return-response>
+              </when>
+            </choose>
+            <!-- Cache until 5 min before expiry (never < 60s). -->
+            <set-variable name="commercialTokenTtl" value="@{
+                try {
+                    var resp = (IResponse)context.Variables["commercialTokenResp"];
+                    var j = resp.Body.As<JObject>(preserveContent: true);
+                    int expires = (int?)j["expires_in"] ?? 3600;
+                    return System.Math.Max(expires - 300, 60);
+                } catch { return 300; }
+            }" />
+            <cache-store-value key="@("foundry-commercial-sptoken|{{foundry-commercial-tenant-id}}|{{foundry-commercial-client-id}}")" value="@((string)context.Variables["commercialSpToken"])" duration="@((int)context.Variables["commercialTokenTtl"])" />
+          </when>
+        </choose>
+        <set-header name="Authorization" exists-action="override">
+          <value>@("Bearer " + (string)context.Variables["commercialSpToken"])</value>
+        </set-header>
+      </when>
+      <when condition="@("{{foundry-commercial-auth-mode}}".Equals("managedIdentity", System.StringComparison.OrdinalIgnoreCase))">
+        <authentication-managed-identity resource="{{foundry-commercial-mi-audience}}" />
+      </when>
+      <otherwise>
+        <set-header name="api-key" exists-action="override">
+          <value>{{foundry-commercial-api-key}}</value>
+        </set-header>
+      </otherwise>
+    </choose>
+    <set-backend-service backend-id="{{foundry-commercial-backend-id}}" />
+
+    <!-- 7. Rewrite the OpenAI-style /v1/<op> path to the data-plane path (UNCHANGED logic). -->
+    <choose>
+      <when condition="@((string)context.Variables["aoaiOp"] == "responses")">
+        <rewrite-uri template="/openai/v1/responses" copy-unmatched-params="true" />
+      </when>
+      <otherwise>
+        <rewrite-uri template="@("/openai/deployments/" + (string)context.Variables["deploymentName"] + "/" + (string)context.Variables["aoaiOp"])" copy-unmatched-params="true" />
+      </otherwise>
+    </choose>
+
+    <!-- 8. Force a known-good api-version for deployment-scoped paths only (commercial value). -->
+    <choose>
+      <when condition="@((string)context.Variables["aoaiOp"] != "responses")">
+        <set-query-parameter name="api-version" exists-action="override">
+          <value>{{foundry-commercial-api-version}}</value>
+        </set-query-parameter>
+      </when>
+    </choose>
+  </inbound>
+
+  <backend>
+    <!-- In-request failover (UNCHANGED). No-op for a single Url backend. -->
+    <retry condition="@(context.Response != null && (context.Response.StatusCode == 429 || context.Response.StatusCode >= 500))" count="2" interval="0" first-fast-retry="true">
+      <forward-request buffer-request-body="true" />
+    </retry>
+  </backend>
+
+  <outbound>
+    <base />
+
+    <!-- Outbound token metrics (UNCHANGED names + dimensions; backend = foundry-commercial). -->
+    <choose>
+      <when condition="@(context.Response.StatusCode == 200 && (context.Response.Headers.GetValueOrDefault("Content-Type","").StartsWith("application/json")))">
+        <set-variable name="responseBody" value="@(context.Response.Body.As<JObject>(preserveContent: true))" />
+        <emit-metric name="copilot_byok_prompt_tokens"     value="@{ var u = ((JObject)context.Variables["responseBody"])?["usage"]; return (double)((int?)(u?["prompt_tokens"]) ?? (int?)(u?["input_tokens"]) ?? 0); }" namespace="copilot.byok">
+          <dimension name="developer_oid"   value="@((string)context.Variables["developerOid"])" />
+          <dimension name="developer_upn"   value="@((string)context.Variables["developerUpn"])" />
+          <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+          <dimension name="backend"         value="@((string)context.Variables["backendName"])" />
+        </emit-metric>
+        <emit-metric name="copilot_byok_completion_tokens" value="@{ var u = ((JObject)context.Variables["responseBody"])?["usage"]; return (double)((int?)(u?["completion_tokens"]) ?? (int?)(u?["output_tokens"]) ?? 0); }" namespace="copilot.byok">
+          <dimension name="developer_oid"   value="@((string)context.Variables["developerOid"])" />
+          <dimension name="developer_upn"   value="@((string)context.Variables["developerUpn"])" />
+          <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+          <dimension name="backend"         value="@((string)context.Variables["backendName"])" />
+        </emit-metric>
+      </when>
+    </choose>
+  </outbound>
+
+  <on-error>
+    <base />
+  </on-error>
+</policies>

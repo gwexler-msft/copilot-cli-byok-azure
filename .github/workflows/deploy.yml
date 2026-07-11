@@ -1,0 +1,379 @@
+name: deploy
+
+# CI/CD for the Copilot CLI BYOK → private Azure OpenAI/Foundry gateway.
+# Push to main (infra/policies/azure.yaml) runs a what-if VALIDATE/preview for BOTH
+# pilots automatically (continuous integration). The actual apply (`azd provision`)
+# is gated behind a manual workflow_dispatch with action=deploy for a single cloud
+# — GitHub Environment required-reviewers are not available on this private repo's
+# plan, so a human triggering the dispatch IS the approval gate. Authenticates with
+# OIDC federated credentials (no stored secrets).
+# See docs/deployment-guide.md → "CI/CD (GitHub Actions)" for setup.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cloud:
+        description: Target Azure cloud
+        type: choice
+        required: true
+        default: AzureUSGovernment
+        options:
+          - AzureUSGovernment
+          - AzureCloud
+      action:
+        description: validate (what-if only) or deploy (provision)
+        type: choice
+        required: true
+        default: validate
+        options:
+          - validate
+          - deploy
+  # Continuous integration: any change to the infra, the baked-in APIM policies, or
+  # the azd manifest runs a what-if VALIDATE/preview for both pilots (no apply). The
+  # real apply is a deliberate manual workflow_dispatch (action=deploy) — see header.
+  # NOTE: editing THIS workflow file does not trigger CI on purpose — a pipeline
+  # tweak should not re-preview infra.
+  # NOTE: app/register/** is intentionally NOT a trigger here. On push this workflow
+  # only runs the infra what-if (deploy=false); it never builds/deploys the register
+  # app, so a register-only change would trip a no-op infra preview. The register
+  # compile gate lives in validate.yml (PR) and the real build runs in deploy-dev.yml.
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - 'policies/**'
+      - 'azure.yaml'
+
+# OIDC: the workflow requests a federated token; nothing secret is stored in the repo.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # setup — resolve the target cloud matrix and whether to apply (deploy) or only
+  # preview (validate). workflow_dispatch honors the chosen cloud + action; a push
+  # to main fans out to both pilots but only ever validates (apply requires a manual
+  # dispatch). Runs on a persistent pilot runner because EMU hosted runners are
+  # disabled for this repo.
+  # ---------------------------------------------------------------------------
+  setup:
+    name: Resolve targets
+    runs-on: [self-hosted, comm-pilot]
+    outputs:
+      clouds: ${{ steps.m.outputs.clouds }}
+      deploy: ${{ steps.m.outputs.deploy }}
+    steps:
+      - id: m
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            printf 'clouds=["%s"]\n' "${{ inputs.cloud }}" >> "$GITHUB_OUTPUT"
+            if [[ "${{ inputs.action }}" == "deploy" ]]; then
+              echo 'deploy=true'  >> "$GITHUB_OUTPUT"
+            else
+              echo 'deploy=false' >> "$GITHUB_OUTPUT"
+            fi
+          else
+            # push to main -> validate/preview BOTH pilots; never auto-apply.
+            echo 'clouds=["AzureUSGovernment","AzureCloud"]' >> "$GITHUB_OUTPUT"
+            echo 'deploy=false' >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # validate — always runs. Builds/lints Bicep and runs an azd what-if preview.
+  # No resources are created here.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate (${{ matrix.cloud }})
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        cloud: ${{ fromJson(needs.setup.outputs.clouds) }}
+    # Self-hosted pilot runner (EMU hosted runners are disabled). Label = env name.
+    runs-on: [self-hosted, "${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}"]
+    environment: ${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}
+    env:
+      AZURE_ENV_NAME: ${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}
+      CI_PARAMS_FILE: ${{ matrix.cloud == 'AzureUSGovernment' && 'infra/main.parameters.ci.gov.json' || 'infra/main.parameters.ci.commercial.json' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install azd (skip if pre-baked)
+        shell: bash
+        run: |
+          if ! command -v azd >/dev/null 2>&1; then
+            echo "azd not found — installing"
+            curl -fsSL https://aka.ms/install-azd.sh | sudo bash
+          else
+            echo "azd already installed: $(azd version)"
+          fi
+
+      # The myoung34/github-runner image does not ship az; az bicep + azure/login
+      # shell out to it, so install on demand (mirrors smoke-test.yml).
+      - name: Install Azure CLI (self-hosted runner)
+        shell: bash
+        run: |
+          if ! command -v az >/dev/null 2>&1; then
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+
+      - name: Lint / build Bicep
+        shell: bash
+        run: |
+          # Prefer the standalone bicep baked into the ACR runner image (#94) so the
+          # egress-locked comm-pilot runner never reaches the bicep CDN. Fall back to
+          # `az bicep` on the myoung34 gov-pilot runner (has az, no standalone bicep).
+          if command -v bicep >/dev/null 2>&1; then
+            bicep build infra/main.bicep --stdout > /dev/null
+          else
+            az bicep install
+            az bicep build --file infra/main.bicep --stdout > /dev/null
+          fi
+
+      - name: Select cloud (azd) + stage CI parameters
+        run: |
+          azd config set cloud.name "${{ matrix.cloud }}"
+          cp "${CI_PARAMS_FILE}" infra/main.parameters.json
+
+      - name: azd auth login (OIDC federated)
+        run: |
+          azd auth login \
+            --client-id "${{ vars.AZURE_CLIENT_ID }}" \
+            --tenant-id "${{ vars.AZURE_TENANT_ID }}" \
+            --federated-credential-provider github
+
+      - name: Azure CLI login (OIDC) — used by azd pre/post hooks
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ matrix.cloud == 'AzureUSGovernment' && 'AzureUSGovernment' || 'AzureCloud' }}
+
+      - name: What-if preview (no changes applied)
+        run: azd provision --preview --no-prompt
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+          # Injected into the CI params file via azd ${...} substitution.
+          APIM_PUBLISHER_EMAIL: ${{ vars.APIM_PUBLISHER_EMAIL }}
+          ENTRA_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          API_APP_ID_URI: ${{ vars.API_APP_ID_URI }}
+          API_AUDIENCE: ${{ vars.API_AUDIENCE }}
+          # Pilots resolve the GitHub App private key from Key Vault (ghRunnerSecretFromKeyVault),
+          # so only the non-secret App IDs are injected here for the param-file substitution.
+          GH_APP_ID: ${{ vars.GH_APP_ID }}
+          GH_APP_INSTALLATION_ID: ${{ vars.GH_APP_INSTALLATION_ID }}
+          # Register Easy Auth is wired post-provision (two-phase); empty here so the
+          # preview substitutes '' (auth off) instead of erroring on an undefined var.
+          REGISTER_EASYAUTH_CLIENT_ID: ''
+          REGISTER_EASYAUTH_SECRET_KV_URI: ''
+          # Commercial Foundry route SP backend secret (servicePrincipal mode). Empty for the
+          # what-if preview; the real value is injected only on the gated deploy below.
+          COMMERCIAL_FOUNDRY_CLIENT_SECRET: ''
+          # Commercial Foundry route tenant + client IDs (NOT secrets) from repo Variables, so no
+          # real ID is committed (param-file ${COMMERCIAL_TENANT_ID}/${COMMERCIAL_CLIENT_ID}
+          # substitution). Empty unless the route is enabled. Mirrors the ENTRA_TENANT_ID posture.
+          COMMERCIAL_TENANT_ID: ${{ vars.COMMERCIAL_TENANT_ID }}
+          COMMERCIAL_CLIENT_ID: ${{ vars.COMMERCIAL_CLIENT_ID }}
+          # Commercial Foundry public base URL from a repo Variable (no account name committed).
+          COMMERCIAL_FOUNDRY_BASE_URL: ${{ vars.COMMERCIAL_FOUNDRY_BASE_URL }}
+
+  # ---------------------------------------------------------------------------
+  # deploy — applies ONLY on a manual workflow_dispatch with action=deploy. Push to
+  # main never reaches here (setup sets deploy=false), so infra is never applied
+  # unattended; the human running the dispatch is the approval gate (environment
+  # required reviewers aren't available on this repo's plan).
+  # Self-deploy note: the pilot runner is itself provisioned by main.bicep
+  # (gh-runner module). azd provision is incremental, so an unchanged runner spec
+  # is a no-op; a change that alters the runner job could terminate this run
+  # mid-deploy — just re-run to converge if that happens.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy (${{ matrix.cloud }})
+    needs: [setup, validate]
+    if: ${{ needs.setup.outputs.deploy == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        cloud: ${{ fromJson(needs.setup.outputs.clouds) }}
+    # One in-flight provision per cloud; never cancel a running deploy.
+    concurrency:
+      group: deploy-${{ matrix.cloud }}
+      cancel-in-progress: false
+    runs-on: [self-hosted, "${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}"]
+    # Apply target environment. Reaches here only via manual dispatch (action=deploy).
+    environment: ${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}
+    env:
+      AZURE_ENV_NAME: ${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}
+      CI_PARAMS_FILE: ${{ matrix.cloud == 'AzureUSGovernment' && 'infra/main.parameters.ci.gov.json' || 'infra/main.parameters.ci.commercial.json' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install azd (skip if pre-baked)
+        shell: bash
+        run: |
+          if ! command -v azd >/dev/null 2>&1; then
+            echo "azd not found — installing"
+            curl -fsSL https://aka.ms/install-azd.sh | sudo bash
+          else
+            echo "azd already installed: $(azd version)"
+          fi
+
+      - name: Install Azure CLI (self-hosted runner)
+        shell: bash
+        run: |
+          if ! command -v az >/dev/null 2>&1; then
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+
+      - name: Select cloud (azd) + stage CI parameters
+        run: |
+          azd config set cloud.name "${{ matrix.cloud }}"
+          cp "${CI_PARAMS_FILE}" infra/main.parameters.json
+
+      - name: azd auth login (OIDC federated)
+        run: |
+          azd auth login \
+            --client-id "${{ vars.AZURE_CLIENT_ID }}" \
+            --tenant-id "${{ vars.AZURE_TENANT_ID }}" \
+            --federated-credential-provider github
+
+      - name: Azure CLI login (OIDC) — used by azd pre/post hooks
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ matrix.cloud == 'AzureUSGovernment' && 'AzureUSGovernment' || 'AzureCloud' }}
+
+      # Register-app Easy Auth is a TWO-PHASE bring-up (redirect URI needs the
+      # Container App FQDN, which only exists after the first provision):
+      #   phase 1 : provision hosting + Key Vault + UAMI (Easy Auth params empty)
+      #   deploy  : push the real Blazor image
+      #   setup   : create the app reg + store its secret in Key Vault (degrades to manual)
+      #   phase 2 : provision again (Easy Auth params populated -> login attached)
+      - name: Provision (phase 1 — hosting + Key Vault)
+        run: azd provision --no-prompt
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+          APIM_PUBLISHER_EMAIL: ${{ vars.APIM_PUBLISHER_EMAIL }}
+          ENTRA_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          API_APP_ID_URI: ${{ vars.API_APP_ID_URI }}
+          API_AUDIENCE: ${{ vars.API_AUDIENCE }}
+          GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
+          # Pilots resolve the App private key from Key Vault (ghRunnerSecretFromKeyVault), so only the
+          # non-secret App IDs are injected here for the param-file substitution.
+          GH_APP_ID: ${{ vars.GH_APP_ID }}
+          GH_APP_INSTALLATION_ID: ${{ vars.GH_APP_INSTALLATION_ID }}
+          # Gov pre-creates the Easy Auth app reg out-of-band (its CI principal can't create app
+          # regs) and sets these as gov-pilot env vars, so auth attaches on phase 1. Commercial
+          # leaves them unset ('') and relies on the two-phase $GITHUB_ENV flow below.
+          REGISTER_EASYAUTH_CLIENT_ID: ${{ vars.REGISTER_EASYAUTH_CLIENT_ID }}
+          REGISTER_EASYAUTH_SECRET_KV_URI: ${{ vars.REGISTER_EASYAUTH_SECRET_KV_URI }}
+          # Commercial only: let the preprovision hook create/verify the BYOK tier groups.
+          MANAGE_BYOK_GROUPS: ${{ matrix.cloud == 'AzureCloud' && 'true' || '' }}
+          # Commercial Foundry route: SP client secret for the cross-tenant client-credentials
+          # token (param foundryCommercialClientSecret). Add the gov-pilot Environment secret
+          # COMMERCIAL_FOUNDRY_CLIENT_SECRET. Unused unless deployFoundryCommercial=true.
+          COMMERCIAL_FOUNDRY_CLIENT_SECRET: ${{ secrets.COMMERCIAL_FOUNDRY_CLIENT_SECRET }}
+          # Commercial Foundry route tenant + client IDs (NOT secrets) from repo Variables, so no
+          # real ID is committed (param-file ${COMMERCIAL_TENANT_ID}/${COMMERCIAL_CLIENT_ID}
+          # substitution). Empty unless the route is enabled. Mirrors the ENTRA_TENANT_ID posture.
+          COMMERCIAL_TENANT_ID: ${{ vars.COMMERCIAL_TENANT_ID }}
+          COMMERCIAL_CLIENT_ID: ${{ vars.COMMERCIAL_CLIENT_ID }}
+          # Commercial Foundry public base URL from a repo Variable (no account name committed).
+          COMMERCIAL_FOUNDRY_BASE_URL: ${{ vars.COMMERCIAL_FOUNDRY_BASE_URL }}
+          # Commercial (comm-pilot) only: gov NAT egress IPs to allowlist on THIS deploy's Foundry
+          # firewall via the postprovision hook (scripts/allow-foundry-ingress-ips). Space/comma-
+          # separated; empty on gov + other envs so the hook no-ops.
+          FOUNDRY_PUBLIC_INGRESS_IPS: ${{ vars.FOUNDRY_PUBLIC_INGRESS_IPS }}
+
+      - name: Deploy register app image
+        run: azd deploy register --no-prompt
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+          # main.bicep creates the RG subscription-scoped, so azd can't infer the deploy
+          # target from the env — point it at the deterministic RG holding the tagged app.
+          AZURE_RESOURCE_GROUP: rg-copilot-byok-${{ env.AZURE_ENV_NAME }}
+
+      - name: Easy Auth setup (app reg + secret -> Key Vault)
+        # Idempotent + degrades to a printed manual command when the deploy
+        # principal lacks Entra app-management rights (expected in Gov) — never
+        # fails the deployment; Easy Auth simply stays off until an admin runs it.
+        shell: bash
+        run: |
+          rg="rg-copilot-byok-${AZURE_ENV_NAME}"
+          # The workflow runs in azd's DEFAULT project env, so `azd env get-values` is usually
+          # EMPTY here — which silently skipped Easy Auth. Resolve fqdn/kv straight from Azure:
+          # the app carries the azd-service-name=register tag and the register Key Vault name
+          # starts with 'kvreg'. (Linux runner -> JMESPath --query is safe.)
+          vals="$(azd env get-values 2>/dev/null || true)"
+          fqdn="$(printf '%s\n' "$vals" | sed -n 's/^REGISTER_APP_FQDN="\?\([^"]*\)"\?$/\1/p')"
+          kv="$(printf '%s\n' "$vals" | sed -n 's/^REGISTER_KEY_VAULT_NAME="\?\([^"]*\)"\?$/\1/p')"
+          if [ -z "$fqdn" ]; then
+            fqdn="$(az containerapp list -g "$rg" --query "[?tags.\"azd-service-name\"=='register'].properties.configuration.ingress.fqdn | [0]" -o tsv 2>/dev/null || true)"
+          fi
+          if [ -z "$kv" ]; then
+            kv="$(az keyvault list -g "$rg" --query "[?starts_with(name,'kvreg')].name | [0]" -o tsv 2>/dev/null || true)"
+          fi
+          ./scripts/setup-register-entra.sh "$fqdn" "$kv" "${AZURE_ENV_NAME}"
+          grep -q '^REGISTER_EASYAUTH_CLIENT_ID='     "$GITHUB_ENV" || echo "REGISTER_EASYAUTH_CLIENT_ID="     >> "$GITHUB_ENV"
+          grep -q '^REGISTER_EASYAUTH_SECRET_KV_URI=' "$GITHUB_ENV" || echo "REGISTER_EASYAUTH_SECRET_KV_URI=" >> "$GITHUB_ENV"
+
+      - name: Provision (phase 2 — attach Easy Auth)
+        # Commercial: REGISTER_EASYAUTH_* arrive via $GITHUB_ENV from the setup step. Gov: that
+        # step degrades (no app-reg rights), so fall back to the pre-set gov-pilot env vars.
+        run: azd provision --no-prompt
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+          APIM_PUBLISHER_EMAIL: ${{ vars.APIM_PUBLISHER_EMAIL }}
+          ENTRA_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          API_APP_ID_URI: ${{ vars.API_APP_ID_URI }}
+          API_AUDIENCE: ${{ vars.API_AUDIENCE }}
+          GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
+          GH_APP_ID: ${{ vars.GH_APP_ID }}
+          GH_APP_INSTALLATION_ID: ${{ vars.GH_APP_INSTALLATION_ID }}
+          REGISTER_EASYAUTH_CLIENT_ID: ${{ env.REGISTER_EASYAUTH_CLIENT_ID || vars.REGISTER_EASYAUTH_CLIENT_ID }}
+          REGISTER_EASYAUTH_SECRET_KV_URI: ${{ env.REGISTER_EASYAUTH_SECRET_KV_URI || vars.REGISTER_EASYAUTH_SECRET_KV_URI }}
+          MANAGE_BYOK_GROUPS: ${{ matrix.cloud == 'AzureCloud' && 'true' || '' }}
+          # Commercial Foundry route: must ALSO be present on phase 2 — every azd provision
+          # re-substitutes the param file, so omitting it here would overwrite the
+          # foundry-commercial-client-secret named value with a blank.
+          COMMERCIAL_FOUNDRY_CLIENT_SECRET: ${{ secrets.COMMERCIAL_FOUNDRY_CLIENT_SECRET }}
+          # Tenant + client IDs (NOT secrets) from repo Variables — also required on phase 2 so the
+          # re-substitution keeps the commercial named values populated. Mirrors ENTRA_TENANT_ID.
+          COMMERCIAL_TENANT_ID: ${{ vars.COMMERCIAL_TENANT_ID }}
+          COMMERCIAL_CLIENT_ID: ${{ vars.COMMERCIAL_CLIENT_ID }}
+          # Base URL + gov NAT ingress IPs — also required on phase 2: it is the LAST provision, so
+          # it re-substitutes the param file (base URL) and runs the ingress hook (comm-pilot).
+          COMMERCIAL_FOUNDRY_BASE_URL: ${{ vars.COMMERCIAL_FOUNDRY_BASE_URL }}
+          FOUNDRY_PUBLIC_INGRESS_IPS: ${{ vars.FOUNDRY_PUBLIC_INGRESS_IPS }}
+
+  # ---------------------------------------------------------------------------
+  # smoke — after a successful pilot deploy (action=deploy), run the smoke suite
+  # against the deployed pilot (mirrors deploy-dev.yml's smoke chain). The
+  # `commercial-route` assertion in scripts/smoke-test.* validates the
+  # /openai-commercial cross-cloud path end-to-end on gov-pilot; it SKIPs on
+  # comm-pilot (the route isn't deployed there). Never runs on a push/validate.
+  # ---------------------------------------------------------------------------
+  smoke-gov-pilot:
+    name: Smoke gov-pilot
+    needs: [setup, deploy]
+    if: ${{ needs.setup.outputs.deploy == 'true' && contains(needs.setup.outputs.clouds, 'AzureUSGovernment') }}
+    uses: ./.github/workflows/smoke-test.yml
+    with:
+      env: gov-pilot
+
+  smoke-comm-pilot:
+    name: Smoke comm-pilot
+    needs: [setup, deploy]
+    if: ${{ needs.setup.outputs.deploy == 'true' && contains(needs.setup.outputs.clouds, 'AzureCloud') }}
+    uses: ./.github/workflows/smoke-test.yml
+    with:
+      env: comm-pilot

@@ -1,0 +1,46 @@
+[
+  {
+    "name": "BYOK AOAI (chat/completions)",
+    "vendor": "customendpoint",
+    "apiType": "chat-completions",
+    "apiKey": "<APIM_SUBSCRIPTION_KEY>",
+    "models": [
+      {
+        "id": "gpt-5.1",
+        "name": "BYOK AOAI gpt-5.1",
+        "url": "https://<APIM_HOSTNAME>/aoai/v1/chat/completions?_vscodeauth=openai.azure",
+        "toolCalling": true,
+        "vision": false,
+        "thinking": false,
+        "supportsReasoningEffort": ["minimal", "low", "medium", "high"],
+        "reasoningEffortFormat": "chat-completions",
+        "streaming": true,
+        "maxInputTokens": 272000,
+        "maxOutputTokens": 32768,
+        "zeroDataRetentionEnabled": true
+      }
+    ]
+  },
+  {
+    "name": "BYOK AOAI (responses)",
+    "vendor": "customendpoint",
+    "apiType": "responses",
+    "apiKey": "<APIM_SUBSCRIPTION_KEY>",
+    "models": [
+      {
+        "id": "gpt-5.1",
+        "name": "BYOK AOAI gpt-5.1",
+        "url": "https://<APIM_HOSTNAME>/aoai/v1/responses?_vscodeauth=openai.azure",
+        "toolCalling": true,
+        "vision": false,
+        "thinking": true,
+        "supportsReasoningEffort": ["minimal", "low", "medium", "high"],
+        "reasoningEffortFormat": "responses",
+        "streaming": true,
+        "maxInputTokens": 272000,
+        "maxOutputTokens": 32768,
+        "zeroDataRetentionEnabled": true
+      }
+    ]
+  }
+]

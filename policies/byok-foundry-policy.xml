@@ -1,0 +1,520 @@
+<policies>
+  <inbound>
+    <base />
+
+    <!-- 1. Copilot CLI BYOK 'azure' mode sends our JWT as the 'api-key' header.
+         We pull it into a variable so the rest of the policy is explicit. -->
+    <set-variable name="incomingApiKey" value="@(context.Request.Headers.GetValueOrDefault("api-key",""))" />
+
+    <choose>
+      <when condition="@(string.IsNullOrEmpty((string)context.Variables["incomingApiKey"]))">
+        <return-response>
+          <set-status code="401" reason="Missing api-key header (expected Entra JWT)" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>{"error":"Missing api-key header. Set COPILOT_PROVIDER_API_KEY to an Entra JWT minted via 'az account get-access-token --resource {{api-app-id-uri}}'."}</set-body>
+        </return-response>
+      </when>
+    </choose>
+
+    <!-- 2. Re-inject the JWT as an Authorization Bearer header so validate-jwt can read it. -->
+    <set-header name="Authorization" exists-action="override">
+      <value>@("Bearer " + (string)context.Variables["incomingApiKey"])</value>
+    </set-header>
+
+    <!-- 3. Validate the JWT against Entra OIDC metadata. Audience and scope must match. -->
+    <validate-jwt header-name="Authorization"
+                  failed-validation-httpcode="401"
+                  failed-validation-error-message="Unauthorized: invalid Entra token."
+                  require-scheme="Bearer"
+                  require-signed-tokens="true"
+                  output-token-variable-name="parsedJwt">
+      <openid-config url="{{entra-openid-config-url}}" />
+      <audiences>
+        <!-- v2 access tokens carry aud = the app (client) ID GUID, not the api:// URI. -->
+        <audience>{{api-audience}}</audience>
+      </audiences>
+      <required-claims>
+        <claim name="scp" match="any">
+          <value>{{required-scope}}</value>
+        </claim>
+      </required-claims>
+    </validate-jwt>
+
+    <!-- 4. Extract developer identity + requested model for telemetry. Copilot CLI uses the
+         OpenAI-style /v1/* surface: the model/deployment name is in the request BODY. -->
+    <set-variable name="developerOid" value="@(((Jwt)context.Variables["parsedJwt"]).Claims.GetValueOrDefault("oid", "unknown"))" />
+    <set-variable name="developerUpn" value="@(((Jwt)context.Variables["parsedJwt"]).Claims.GetValueOrDefault("preferred_username", ((Jwt)context.Variables["parsedJwt"]).Claims.GetValueOrDefault("upn", "unknown")))" />
+    <!-- Requested model/deployment. TWO client conventions are supported:
+         (a) Our OpenAI-compatible SHORT path (/openai/v1/<op>): model is in the request BODY.
+         (b) Legacy / wizard Azure-OpenAI-native path (/openai/deployments/{model}/<op>?api-version=...):
+             the deployment is already in the URL. Honor it verbatim so client fleets provisioned
+             with the full deployment-scoped path keep working without reconfiguring. When the URL
+             carries the deployment we use it and skip auto-routing (an explicit deployment can't be
+             the 'auto' sentinel); the existing rewrite reconstructs the same deployment-scoped path. -->
+    <set-variable name="pathHasDeployment" value="@(context.Request.OriginalUrl.Path.ToLowerInvariant().Contains("/deployments/"))" />
+    <set-variable name="deploymentName" value="@{
+        try {
+            if ((bool)context.Variables["pathHasDeployment"]) {
+                var segs = context.Request.OriginalUrl.Path.Split('/');
+                for (int i = 0; i < segs.Length - 1; i++) {
+                    if (segs[i].ToLowerInvariant() == "deployments") { return segs[i + 1]; }
+                }
+            }
+            var body = context.Request.Body?.As<JObject>(preserveContent: true);
+            return (string)(body?["model"]?.ToString()) ?? "unknown";
+        } catch { return "unknown"; }
+    }" />
+
+    <!-- 4a. Guard: fail fast with 400 if we could not read a model name from the body. -->
+    <choose>
+      <when condition="@(string.IsNullOrEmpty((string)context.Variables["deploymentName"]) || (string)context.Variables["deploymentName"] == "unknown")">
+        <return-response>
+          <set-status code="400" reason="Could not determine model from request body" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>{"error":{"code":"ModelNotSpecified","message":"Could not parse a 'model' field from the JSON request body. Ensure the body is valid JSON, e.g. {\"model\":\"&lt;deployment&gt;\",\"messages\":[...]}. (A common cause is shell quote mangling of the JSON payload.)"}}</set-body>
+        </return-response>
+      </when>
+    </choose>
+
+    <!-- 4a2. TIERED AUTO MODEL-ROUTING. When the caller sends the sentinel model
+         ({{auto-route-sentinel}}, a comma-separated allow-list, default "auto,byok-auto") we pick a deployment instead of forwarding it
+         verbatim: the cheap "mini" tier for short, non-coding prompts and the full model
+         otherwise. Level 1 is this in-policy heuristic (prompt length + coding-signal scan).
+         Level 2 is an OPTIONAL classifier-model call (off unless {{auto-route-classifier-enabled}}
+         is "true") that only runs for the ambiguous band around the threshold. The resolved name
+         overwrites deploymentName so all downstream backend selection / metrics / rewrite see the
+         actual model. Explicit (non-sentinel) model names skip this block entirely. -->
+    <set-variable name="autoDecision" value="none" />
+    <set-variable name="autoRouteReason" value="none" />
+    <set-variable name="autoTextLength" value="0" />
+    <set-variable name="autoLengthBand" value="none" />
+    <set-variable name="autoIsCoding" value="false" />
+    <set-variable name="isAutoRoute" value="@{
+        var deploymentNameLower = ((string)context.Variables["deploymentName"]).Trim().ToLowerInvariant();
+        return "{{auto-route-sentinel}}".Split(',').Any(s => s.Trim().ToLowerInvariant() == deploymentNameLower);
+    }" />
+    <choose>
+      <when condition="@((bool)context.Variables["isAutoRoute"])">
+        <!-- Concatenate all prompt text to size + scan. Handles both chat-completions
+             (body.messages[].content as string or multimodal-array parts) and the
+             Responses API (body.input as a bare string or an array of items with content
+             parts; parts use 'text', 'input_text', or 'output_text'). -->
+        <set-variable name="autoPromptText" value="@{
+            try {
+                var body = context.Request.Body?.As<JObject>(preserveContent: true);
+                if (body == null) { return ""; }
+                var sb = new System.Text.StringBuilder();
+                var msgs = body["messages"] as JArray;
+                if (msgs != null) {
+                    foreach (var m in msgs) {
+                        var content = m["content"];
+                        if (content == null) { continue; }
+                        if (content.Type == JTokenType.String) { sb.Append((string)content); sb.Append('\n'); }
+                        else if (content.Type == JTokenType.Array) {
+                            foreach (var part in (JArray)content) {
+                                var t = part["text"];
+                                if (t != null && t.Type == JTokenType.String) { sb.Append((string)t); sb.Append('\n'); }
+                            }
+                        }
+                    }
+                }
+                var input = body["input"];
+                if (input != null) {
+                    if (input.Type == JTokenType.String) { sb.Append((string)input); sb.Append('\n'); }
+                    else if (input.Type == JTokenType.Array) {
+                        foreach (var item in (JArray)input) {
+                            if (item.Type == JTokenType.String) { sb.Append((string)item); sb.Append('\n'); continue; }
+                            var content = item["content"];
+                            if (content == null) { continue; }
+                            if (content.Type == JTokenType.String) { sb.Append((string)content); sb.Append('\n'); }
+                            else if (content.Type == JTokenType.Array) {
+                                foreach (var part in (JArray)content) {
+                                    var t = part["text"] ?? part["input_text"] ?? part["output_text"];
+                                    if (t != null && t.Type == JTokenType.String) { sb.Append((string)t); sb.Append('\n'); }
+                                }
+                            }
+                        }
+                    }
+                }
+                return sb.ToString();
+            } catch { return ""; }
+        }" />
+        <!-- Scope complexity detection to the caller's ACTUAL last user turn. VS Code / CLI always
+             prepend a large system prompt + workspace context, so sizing/scanning the FULL payload
+             made even "what is 2+2" look large + code-ish and forced the full model. autoUserText =
+             the last user-role message (chat) or last user input item (Responses); falls back to the
+             full text only when no user turn is found. -->
+        <set-variable name="autoUserText" value="@{
+            try {
+                var body = context.Request.Body?.As<JObject>(preserveContent: true);
+                if (body == null) { return ""; }
+                var msgs = body["messages"] as JArray;
+                if (msgs != null) {
+                    for (int i = msgs.Count - 1; i >= 0; i--) {
+                        var roleTok = msgs[i]["role"];
+                        var role = roleTok == null ? "" : ((string)roleTok).ToLowerInvariant();
+                        if (role != "user") { continue; }
+                        var content = msgs[i]["content"];
+                        if (content == null) { return ""; }
+                        if (content.Type == JTokenType.String) { return (string)content; }
+                        if (content.Type == JTokenType.Array) {
+                            var sb = new System.Text.StringBuilder();
+                            foreach (var part in (JArray)content) {
+                                var t = part["text"] ?? part["input_text"] ?? part["output_text"];
+                                if (t != null && t.Type == JTokenType.String) { sb.Append((string)t); sb.Append('\n'); }
+                            }
+                            return sb.ToString();
+                        }
+                        return "";
+                    }
+                    return "";
+                }
+                var input = body["input"];
+                if (input != null) {
+                    if (input.Type == JTokenType.String) { return (string)input; }
+                    if (input.Type == JTokenType.Array) {
+                        var arr = (JArray)input;
+                        for (int i = arr.Count - 1; i >= 0; i--) {
+                            var item = arr[i];
+                            if (item.Type == JTokenType.String) { return (string)item; }
+                            var roleTok = item["role"];
+                            if (roleTok != null && ((string)roleTok).ToLowerInvariant() != "user") { continue; }
+                            var content = item["content"];
+                            if (content == null) { continue; }
+                            if (content.Type == JTokenType.String) { return (string)content; }
+                            if (content.Type == JTokenType.Array) {
+                                var sb = new System.Text.StringBuilder();
+                                foreach (var part in (JArray)content) {
+                                    var t = part["text"] ?? part["input_text"] ?? part["output_text"];
+                                    if (t != null && t.Type == JTokenType.String) { sb.Append((string)t); sb.Append('\n'); }
+                                }
+                                return sb.ToString();
+                            }
+                        }
+                    }
+                }
+                return "";
+            } catch { return ""; }
+        }" />
+        <set-variable name="autoTextLength" value="@{
+          var sizeUser = (string)context.Variables["autoUserText"];
+          var sizeText = string.IsNullOrWhiteSpace(sizeUser) ? (string)context.Variables["autoPromptText"] : sizeUser;
+          return sizeText.Length;
+        }" />
+        <set-variable name="autoLengthBand" value="@{
+          int len = (int)context.Variables["autoTextLength"];
+          int threshold = int.Parse("{{auto-route-length-threshold}}");
+          int band = int.Parse("{{auto-route-ambiguous-band}}");
+          if (len < threshold - band) { return "short"; }
+          if (len >= threshold + band) { return "long"; }
+          return "ambiguous";
+        }" />
+        <set-variable name="autoIsCoding" value="@{
+            var text = (string)context.Variables["autoUserText"];
+            if (string.IsNullOrWhiteSpace(text)) { text = (string)context.Variables["autoPromptText"]; }
+            if (string.IsNullOrEmpty(text)) { return false; }
+            var rx = new System.Text.RegularExpressions.Regex(@"```|=>|@@ |(^|\n)\s*(def |class |function |func |import |from |#include|public |private |protected |const |let |var |return |if \(|for \(|while \()|;\s*\n|\{\s*\n|\}\s*\n|Traceback|Exception|\.(py|ts|js|tsx|jsx|cs|java|go|rb|cpp|rs|sql|sh|ps1|ya?ml|html|css)\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            return rx.IsMatch(text);
+        }" />
+        <set-variable name="autoRouteReason" value="@((bool)context.Variables["autoIsCoding"] ? "coding" : (string)context.Variables["autoLengthBand"])" />
+        <!-- Level 1 heuristic. -->
+        <set-variable name="autoDecision" value="@{
+            bool coding = (bool)context.Variables["autoIsCoding"];
+          var lengthBand = (string)context.Variables["autoLengthBand"];
+            if (coding) { return "full"; }
+          if (lengthBand == "long") { return "full"; }
+          if (lengthBand == "short") { return "mini"; }
+            return "ambiguous";
+        }" />
+        <!-- Level 2 classifier (opt-in) for the ambiguous band only. -->
+        <choose>
+          <when condition="@((string)context.Variables["autoDecision"] == "ambiguous" &amp;&amp; "{{auto-route-classifier-enabled}}".ToLowerInvariant() == "true")">
+            <authentication-managed-identity resource="{{foundry-mi-audience}}" output-token-variable-name="autoClassifierToken" ignore-error="true" />
+            <send-request mode="new" response-variable-name="autoClassifierResp" timeout="8" ignore-error="true">
+              <set-url>@("{{foundry-private-base-url}}/openai/deployments/{{auto-route-classifier-deployment}}/chat/completions?api-version={{aoai-default-api-version}}")</set-url>
+              <set-method>POST</set-method>
+              <set-header name="Authorization" exists-action="override">
+                <value>@("Bearer " + (string)context.Variables["autoClassifierToken"])</value>
+              </set-header>
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-body>@{
+                  var prompt = (string)context.Variables["autoUserText"];
+                  if (string.IsNullOrWhiteSpace(prompt)) { prompt = (string)context.Variables["autoPromptText"]; }
+                  if (prompt.Length > 4000) { prompt = prompt.Substring(0, 4000); }
+                  var payload = new JObject(
+                      new JProperty("messages", new JArray(
+                          new JObject(new JProperty("role", "system"), new JProperty("content", "You are a routing classifier. Reply with exactly one lowercase word and nothing else: simple or complex. complex = coding, debugging, multi-step reasoning, or long/technical context; simple = short factual or conversational requests.")),
+                          new JObject(new JProperty("role", "user"), new JProperty("content", prompt))
+                      )),
+                      new JProperty("max_tokens", 1),
+                      new JProperty("temperature", 0)
+                  );
+                  return payload.ToString();
+              }</set-body>
+            </send-request>
+            <set-variable name="autoClassifierLabel" value="@{
+                try {
+                    var resp = (IResponse)context.Variables["autoClassifierResp"];
+                    if (resp == null || resp.StatusCode != 200) { return "error"; }
+                    var j = resp.Body.As<JObject>();
+                    var c = (string)(j["choices"]?[0]?["message"]?["content"]);
+                    return (c ?? "").Trim().ToLowerInvariant();
+                } catch { return "error"; }
+            }" />
+            <!-- Fail-safe: only an explicit "simple" downgrades to mini; error/timeout/anything else -> full. -->
+            <set-variable name="autoDecision" value="@(((string)context.Variables["autoClassifierLabel"]).StartsWith("simple") ? "mini" : "full")" />
+            <set-variable name="autoRouteReason" value="@{
+              var label = (string)context.Variables["autoClassifierLabel"];
+              if (label.StartsWith("simple")) { return "classifier-simple"; }
+              if (label.StartsWith("complex")) { return "classifier-complex"; }
+              return "classifier-fallback";
+            }" />
+          </when>
+          <when condition="@((string)context.Variables["autoDecision"] == "ambiguous")">
+            <!-- Classifier disabled: ambiguous -> full model (zero added latency, quality-first). -->
+            <set-variable name="autoDecision" value="full" />
+          </when>
+        </choose>
+        <!-- Resolve the sentinel to a real deployment name. -->
+        <set-variable name="deploymentName" value="@((string)context.Variables["autoDecision"] == "mini" ? "{{auto-route-mini-deployment}}" : "{{auto-route-full-deployment}}")" />
+      </when>
+    </choose>
+
+    <!-- 4b. Backend selection. This is the DEFAULT route: traffic goes to Foundry (AIServices)
+         unless the requested model is pinned to the legacy AOAI backend via the
+         comma-separated {{aoai-pinned-models}} named value. -->
+    <set-variable name="routeToAoai" value="@{
+        var pinned = "{{aoai-pinned-models}}".Split(new[]{','}, System.StringSplitOptions.RemoveEmptyEntries);
+        var model = ((string)context.Variables["deploymentName"]).Trim().ToLowerInvariant();
+        foreach (var m in pinned) { if (m.Trim().ToLowerInvariant() == model) { return true; } }
+        return false;
+    }" />
+    <set-variable name="backendName" value="@((bool)context.Variables["routeToAoai"] ? "aoai" : "foundry")" />
+
+    <emit-metric name="copilot_byok_request" value="1" namespace="copilot.byok">
+      <dimension name="developer_oid" value="@((string)context.Variables["developerOid"])" />
+      <dimension name="developer_upn" value="@((string)context.Variables["developerUpn"])" />
+      <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+      <dimension name="backend" value="@((string)context.Variables["backendName"])" />
+      <dimension name="auto_route" value="@((string)context.Variables["autoDecision"])" />
+    </emit-metric>
+    <!-- Separate metric because APIM allows at most 5 custom dimensions per emit-metric policy. -->
+    <choose>
+      <when condition="@((bool)context.Variables["isAutoRoute"])">
+        <emit-metric name="copilot_byok_auto_route" value="1" namespace="copilot.byok">
+          <dimension name="developer_upn" value="@((string)context.Variables["developerUpn"])" />
+          <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+          <dimension name="auto_route" value="@((string)context.Variables["autoDecision"])" />
+          <dimension name="auto_route_reason" value="@((string)context.Variables["autoRouteReason"])" />
+          <dimension name="auto_length_band" value="@((string)context.Variables["autoLengthBand"])" />
+        </emit-metric>
+      </when>
+    </choose>
+
+    <!-- 5. Per-developer throttles (jwt mode keys on the Entra oid). Numbers come from named
+         values so they are tunable per deployment without editing this policy:
+           rate-limit-by-key        burst (calls/min)
+           azure-openai-token-limit AI-cost guard (tokens/min, prompt+completion)
+           quota-by-key             hard monthly call ceiling (30 days)
+         (In subscriptionKey mode these live at PRODUCT scope instead; see apim-products.) -->
+    <rate-limit-by-key calls="{{jwt-calls-per-minute}}" renewal-period="60"
+                       counter-key="@((string)context.Variables["developerOid"])"
+                       increment-condition="@(context.Response.StatusCode == 200)"
+                       remaining-calls-header-name="x-byok-calls-remaining" />
+    <azure-openai-token-limit tokens-per-minute="{{jwt-tokens-per-minute}}"
+                              counter-key="@((string)context.Variables["developerOid"])"
+                              estimate-prompt-tokens="true"
+                              remaining-tokens-header-name="x-byok-tokens-remaining"
+                              tokens-consumed-header-name="x-byok-tokens-consumed" />
+    <quota-by-key calls="{{jwt-monthly-call-quota}}" renewal-period="2592000"
+                  counter-key="@((string)context.Variables["developerOid"])" />
+
+    <!-- 5b. Request-body normalization. Two transformations happen here over a single body
+         parse:
+         (a) Reasoning-model sampling-parameter strip. The gpt-5 / o1 / o3 / o4 model families
+             reject any non-default `temperature`, `top_p`, `presence_penalty`, or
+             `frequency_penalty` with `400 unsupported_value`. Generic OpenAI clients
+             (including VS Code Copilot) send these by default. Strip them silently when the
+             resolved deployment looks like a reasoning model so the model defaults apply.
+         (b) Compatibility-only: ask the backend to include a `usage` object on the FINAL
+             streamed chunk by injecting stream_options.include_usage=true into streaming
+             chat-completions bodies. Our telemetry does NOT depend on it (inbound
+             copilot_byok_request + on-error copilot_byok_throttled both fire unconditionally
+             and the outbound token parser degrades to 0 when usage is absent) — this is
+             parity with the GenAI/llm-* wizard convention. The Responses API carries its own
+             SSE response.completed usage event and may reject unknown fields, so the
+             stream_options injection is skipped on /responses. Non-streaming or non-JSON
+             bodies are forwarded unchanged. -->
+    <set-body>@{
+        try {
+            var body = context.Request.Body?.As<JObject>(preserveContent: true);
+            if (body == null) { return context.Request.Body?.As<string>(preserveContent: true); }
+            bool changed = false;
+            // (a) Reasoning-model normalization. gpt-5 / o1 / o3 / o4 reject non-default
+            //     sampling params AND require `max_completion_tokens` instead of the legacy
+            //     `max_tokens`. Generic OpenAI clients (Copilot CLI, llm CLI, etc.) send
+            //     `max_tokens` regardless of model, so we transparently remap it.
+            var model = (context.Variables.ContainsKey("deploymentName") ? (string)context.Variables["deploymentName"] : "").ToLowerInvariant();
+            bool isReasoning = model.StartsWith("gpt-5") || model.StartsWith("o1") || model.StartsWith("o3") || model.StartsWith("o4");
+            if (isReasoning) {
+                foreach (var p in new[] { "temperature", "top_p", "presence_penalty", "frequency_penalty" }) {
+                    if (body.Remove(p)) { changed = true; }
+                }
+                // Remap max_tokens -> max_completion_tokens when client sent the legacy name.
+                // If the client already supplied max_completion_tokens, drop the redundant
+                // max_tokens to avoid the backend's 400 unsupported_parameter error.
+                var maxTok = body["max_tokens"];
+                if (maxTok != null) {
+                    if (body["max_completion_tokens"] == null) {
+                        body["max_completion_tokens"] = maxTok;
+                    }
+                    body.Remove("max_tokens");
+                    changed = true;
+                }
+            }
+            // (b) stream_options.include_usage injection (chat-completions only).
+            var path = context.Request.OriginalUrl.Path.ToLowerInvariant();
+            if (!path.EndsWith("/responses")) {
+                var stream = body["stream"];
+                if (stream != null && stream.Type == JTokenType.Boolean && (bool)stream) {
+                    var opts = body["stream_options"] as JObject;
+                    if (opts == null) { opts = new JObject(); body["stream_options"] = opts; }
+                    opts["include_usage"] = true;
+                    changed = true;
+                }
+            }
+            return changed ? body.ToString() : context.Request.Body?.As<string>(preserveContent: true);
+        } catch {
+            return context.Request.Body?.As<string>(preserveContent: true);
+        }
+    }</set-body>
+
+    <!-- 6. Strip the dev's credential before going to the backend. -->
+    <set-header name="api-key" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+
+    <!-- 7. Determine the AOAI-style operation from the path (common to both backends).
+         '/responses' is the VS Code 1.122 Custom Endpoint Responses route — the policy
+         later rewrites it to the account-root /openai/v1/responses (not deployment-scoped). -->
+    <set-variable name="aoaiOp" value="@{
+        var p = context.Request.OriginalUrl.Path.ToLowerInvariant();
+        if (p.EndsWith("/chat/completions")) { return "chat/completions"; }
+        if (p.EndsWith("/embeddings")) { return "embeddings"; }
+        if (p.EndsWith("/responses")) { return "responses"; }
+        return "completions";
+    }" />
+
+    <!-- 8. Mint a managed identity token for the chosen backend and route to it.
+         Both surfaces share the OpenAI-compatible MI audience (cognitiveservices.azure.*),
+         but keep them as separate named values so they can diverge later. -->
+    <choose>
+      <when condition="@((bool)context.Variables["routeToAoai"])">
+        <authentication-managed-identity resource="{{aoai-mi-audience}}" />
+        <set-backend-service backend-id="{{aoai-backend-id}}" />
+      </when>
+      <otherwise>
+        <authentication-managed-identity resource="{{foundry-mi-audience}}" />
+        <set-backend-service backend-id="{{foundry-backend-id}}" />
+      </otherwise>
+    </choose>
+
+    <!-- 9. Rewrite the OpenAI-style /v1/<op> path to the data-plane path the backend
+         expects. Chat/Completions/Embeddings are deployment-scoped:
+           /openai/deployments/{model}/<op>
+         Responses is account-root + versionless (v1):
+           /openai/v1/responses
+         The model stays in the request body for Responses. Identical for both backends. -->
+    <choose>
+      <when condition="@((string)context.Variables["aoaiOp"] == "responses")">
+        <rewrite-uri template="/openai/v1/responses" copy-unmatched-params="true" />
+      </when>
+      <otherwise>
+        <rewrite-uri template="@("/openai/deployments/" + (string)context.Variables["deploymentName"] + "/" + (string)context.Variables["aoaiOp"])" copy-unmatched-params="true" />
+      </otherwise>
+    </choose>
+
+    <!-- 10. Force a known-good api-version for deployment-scoped paths only.
+         The /openai/v1/responses surface is versionless ("v1 GA") and REJECTS a dated
+         api-version with HTTP 400 'API version not supported' — skip it for Responses calls. -->
+    <choose>
+      <when condition="@((string)context.Variables["aoaiOp"] != "responses")">
+        <set-query-parameter name="api-version" exists-action="override">
+          <value>{{aoai-default-api-version}}</value>
+        </set-query-parameter>
+      </when>
+    </choose>
+  </inbound>
+
+  <backend>
+    <!-- In-request failover. A pooled backend's circuit breaker isolates a region ACROSS
+         requests; this <retry> covers the SAME request: on a transient 429/5xx, re-run
+         <forward-request>, which re-selects the next healthy pool member (honoring priority
+         tiers / weights). No-op for a single Url backend, so it is safe in every deployment.
+         buffer-request-body keeps the body available for the resend. -->
+    <retry condition="@(context.Response != null && (context.Response.StatusCode == 429 || context.Response.StatusCode >= 500))" count="2" interval="0" first-fast-retry="true">
+      <forward-request buffer-request-body="true" />
+    </retry>
+  </backend>
+
+  <outbound>
+    <base />
+
+    <!-- Parse the 'usage' object from a JSON response and emit token metrics. -->
+    <choose>
+      <when condition="@(context.Response.StatusCode == 200 && (context.Response.Headers.GetValueOrDefault("Content-Type","").StartsWith("application/json")))">
+        <set-variable name="responseBody" value="@(context.Response.Body.As<JObject>(preserveContent: true))" />
+        <!-- Chat-completions returns usage.prompt_tokens / usage.completion_tokens.
+             Responses API returns usage.input_tokens / usage.output_tokens. Fall back so
+             one metric covers both surfaces and degrades to 0 if usage is missing. -->
+        <emit-metric name="copilot_byok_prompt_tokens"     value="@{ var u = ((JObject)context.Variables["responseBody"])?["usage"]; return (double)((int?)(u?["prompt_tokens"]) ?? (int?)(u?["input_tokens"]) ?? 0); }" namespace="copilot.byok">
+          <dimension name="developer_oid"   value="@((string)context.Variables["developerOid"])" />
+          <dimension name="developer_upn"   value="@((string)context.Variables["developerUpn"])" />
+          <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+          <dimension name="backend"         value="@((string)context.Variables["backendName"])" />
+        </emit-metric>
+        <emit-metric name="copilot_byok_completion_tokens" value="@{ var u = ((JObject)context.Variables["responseBody"])?["usage"]; return (double)((int?)(u?["completion_tokens"]) ?? (int?)(u?["output_tokens"]) ?? 0); }" namespace="copilot.byok">
+          <dimension name="developer_oid"   value="@((string)context.Variables["developerOid"])" />
+          <dimension name="developer_upn"   value="@((string)context.Variables["developerUpn"])" />
+          <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+          <dimension name="backend"         value="@((string)context.Variables["backendName"])" />
+        </emit-metric>
+      </when>
+    </choose>
+  </outbound>
+
+  <on-error>
+    <base />
+
+    <!-- jwt mode throttle attribution. The three throttles (rate-limit-by-key,
+         azure-openai-token-limit, quota-by-key) return 429 by jumping here. Gateway logs carry
+         no Entra oid, and the inbound copilot_byok_request metric already fired BEFORE the
+         throttles ran, so a jwt-mode 429 is otherwise invisible per developer. Emit a dedicated
+         throttle metric keyed on developerOid (set in inbound step 4, before the throttles) so
+         jwt-mode limit hits are attributable — the jwt-mode analogue of the subscriptionKey
+         gateway-log query in monitoring/kql/throttle-hits-per-developer.kql. Guarded on
+         developerOid existing so pre-identity failures (e.g. invalid JWT) are skipped. -->
+    <choose>
+      <when condition="@(context.Response != null &amp;&amp; context.Response.StatusCode == 429 &amp;&amp; context.Variables.ContainsKey("developerOid"))">
+        <emit-metric name="copilot_byok_throttled" value="1" namespace="copilot.byok">
+          <dimension name="developer_oid"   value="@((string)context.Variables["developerOid"])" />
+          <dimension name="developer_upn"   value="@(context.Variables.ContainsKey("developerUpn") ? (string)context.Variables["developerUpn"] : "unknown")" />
+          <dimension name="deployment_name" value="@(context.Variables.ContainsKey("deploymentName") ? (string)context.Variables["deploymentName"] : "unknown")" />
+          <dimension name="backend"         value="@(context.Variables.ContainsKey("backendName") ? (string)context.Variables["backendName"] : "unknown")" />
+          <dimension name="throttle"        value="@{
+              var src = context.LastError?.Source ?? "";
+              if (src.Contains("rate-limit-by-key")) { return "burst"; }
+              if (src.Contains("azure-openai-token-limit")) { return "tokens"; }
+              if (src.Contains("quota-by-key")) { return "quota"; }
+              return "other";
+          }" />
+        </emit-metric>
+      </when>
+    </choose>
+  </on-error>
+</policies>

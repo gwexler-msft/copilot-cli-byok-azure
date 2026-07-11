@@ -1,0 +1,71 @@
+name: copilot-cli-byok-azure
+metadata:
+  template: copilot-cli-byok-azure@1.0.0
+infra:
+  provider: bicep
+  path: infra
+  module: main
+# The self-serve register app (issue #64) is an OPT-IN stack: it only exists when the infra
+# is provisioned with deployRegisterApp=true (which also creates its ACR + Container App). It
+# is deployed with a TARGETED `azd deploy register` — do NOT run a blanket `azd up` in an
+# environment where deployRegisterApp=false, because azd would try (and fail) to build/push
+# this service with no registry. Register-less environments use `azd provision`.
+services:
+  register:
+    project: app/register
+    host: containerapp
+    language: docker
+    docker:
+      path: Dockerfile
+      context: .
+      # Build the image in ACR Tasks (cloud) instead of a local Docker daemon. Without this,
+      # azd's required-tools check demands Docker for ANY command (including `azd provision`),
+      # which breaks the CI runners that have no Docker daemon. remoteBuild keeps the targeted
+      # `azd deploy register` working too — it queues `az acr build` against the gated ACR, so
+      # no agent ever needs Docker installed.
+      remoteBuild: true
+hooks:
+  # Pre-deployment gate: verify the signed-in principal can create resources and grant the
+  # APIM MI its RBAC role (Owner, or Contributor + User Access Administrator). Aborts azd on
+  # hard failure. Set `azd env set assignAoaiRbac true` to make it strict about RBAC.
+  #
+  # Then a runner-auth guard (#58): when the runner deploys in `app` mode but the GitHub App
+  # credentials aren't resolvable, fail fast pointing at scripts/setup-gh-app.ps1 instead of
+  # silently shipping a Phase-1 placeholder runner. CI-safe; bypass with SKIP_RUNNER_AUTH_CHECK=true.
+  #
+  # Then ensure the BYOK tier security groups (BYOK Admins / BYOK Power Users) exist and
+  # publish their object-ids to the azd env so the register-app tier params can consume
+  # them. PRE-provision (not post) because those ids are bicep params read at provision
+  # time. Opt-in via MANAGE_BYOK_GROUPS (set by the commercial CI jobs); degrades to a
+  # manual notice + exit 0 when the deployer lacks group-creation rights, so azd never
+  # breaks and gov / non-register envs stay untouched.
+  preprovision:
+    posix:
+      shell: sh
+      run: ./scripts/check-deploy-access.sh && ./scripts/check-runner-auth.sh && ./scripts/ensure-byok-groups.sh
+      continueOnError: false
+      interactive: false
+    windows:
+      shell: pwsh
+      run: ./scripts/check-deploy-access.ps1 && ./scripts/check-runner-auth.ps1 && ./scripts/ensure-byok-groups.ps1
+      continueOnError: false
+      interactive: false
+  # Post-deployment RBAC: grant the APIM managed identity "Cognitive Services OpenAI User"
+  # on the AOAI + Foundry accounts (idempotent). Needed when assignAoaiRbac=false (the
+  # in-template RBAC module is skipped). Harmless when it ran (az returns the existing grant).
+  #
+  # Then grant the register-app managed identity the Microsoft Graph application permission
+  # (GroupMember.Read.All) used by the group-overage fallback (#67). That grant needs a
+  # tenant admin; when the deployer is not one the script prints the manual command and
+  # exits 0 so azd still succeeds. It also no-ops when the register app is not deployed.
+  postprovision:
+    posix:
+      shell: sh
+      run: ./scripts/grant-apim-mi-rbac.sh && ./scripts/grant-register-graph-perms.sh && ./scripts/allow-foundry-ingress-ips.sh
+      continueOnError: false
+      interactive: false
+    windows:
+      shell: pwsh
+      run: ./scripts/grant-apim-mi-rbac.ps1 && ./scripts/grant-register-graph-perms.ps1 && ./scripts/allow-foundry-ingress-ips.ps1
+      continueOnError: false
+      interactive: false

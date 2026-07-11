@@ -1,0 +1,9 @@
+// Token usage per AOAI deployment (model) over the last 7 days.
+customMetrics
+| where timestamp > ago(7d)
+| where name in ("copilot_byok_prompt_tokens","copilot_byok_completion_tokens")
+| extend
+    model = tostring(customDimensions["deployment_name"]),
+    kind  = iff(name == "copilot_byok_prompt_tokens", "prompt", "completion")
+| summarize tokens = sum(value) by bin(timestamp, 1d), model, kind
+| order by timestamp asc

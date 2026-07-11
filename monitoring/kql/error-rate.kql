@@ -1,0 +1,7 @@
+// APIM error rate (4xx/5xx) over the last 24h, sliced by status code.
+ApiManagementGatewayLogs
+| where TimeGenerated > ago(24h)
+| where ApiId == "copilot-byok-aoai"
+| extend bucket = bin(TimeGenerated, 15m), status = tostring(ResponseCode)
+| summarize cnt = count() by bucket, status
+| order by bucket asc

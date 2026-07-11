@@ -1,0 +1,90 @@
+<policies>
+  <inbound>
+    <!-- OPERATION-scope policy for GET /v1/models on the foundry inference API (jwt mode).
+         Same reasoning as the -subkey variant: it omits <base /> so the API-level inference
+         policy (which 400s on a body-less request) does NOT run, letting OpenAI-compatible
+         clients probe /v1/models under the same base URL as /v1/chat/completions.
+
+         Because we skip the API inbound, we MUST re-validate the Entra JWT here — otherwise
+         /v1/models would be unauthenticated in jwt mode. This validate-jwt block mirrors
+         byok-foundry-policy.xml (the CLI/clients send the JWT in the "api-key" header). After
+         validation we strip the caller creds, mint the Foundry managed-identity token, and
+         rewrite to the account-root /openai/v1/models surface. The outbound is intentionally
+         empty so the inference token-metric emit does not run on the model-list response. -->
+    <set-variable name="incomingApiKey" value="@(context.Request.Headers.GetValueOrDefault("api-key",""))" />
+    <choose>
+      <when condition="@(string.IsNullOrEmpty((string)context.Variables["incomingApiKey"]))">
+        <return-response>
+          <set-status code="401" reason="Missing api-key header (expected Entra JWT)" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>{"error":"Missing api-key header. Set the API key to an Entra JWT minted via 'az account get-access-token --resource {{api-app-id-uri}}'."}</set-body>
+        </return-response>
+      </when>
+    </choose>
+    <set-header name="Authorization" exists-action="override">
+      <value>@("Bearer " + (string)context.Variables["incomingApiKey"])</value>
+    </set-header>
+    <validate-jwt header-name="Authorization"
+                  failed-validation-httpcode="401"
+                  failed-validation-error-message="Unauthorized: invalid Entra token."
+                  require-scheme="Bearer"
+                  require-signed-tokens="true">
+      <openid-config url="{{entra-openid-config-url}}" />
+      <audiences>
+        <audience>{{api-audience}}</audience>
+      </audiences>
+      <required-claims>
+        <claim name="scp" match="any">
+          <value>{{required-scope}}</value>
+        </claim>
+      </required-claims>
+    </validate-jwt>
+    <set-header name="api-key" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+    <set-backend-service backend-id="{{foundry-backend-id}}" />
+    <authentication-managed-identity resource="{{foundry-mi-audience}}" />
+    <!-- Fetch the ACTUAL deployments (data-plane list) instead of the base-model catalog: the
+         account-root /openai/v1/models returns the wrong names + strict-parser-breaking fields.
+         2023-03-15-preview is the data-plane api-version that still serves the deployments list. -->
+    <rewrite-uri template="/openai/deployments?api-version=2023-03-15-preview" copy-unmatched-params="false" />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <!-- Reshape the Foundry deployments response into the OpenAI /v1/models shape the IDE clients
+         expect (clean minimal fields), advertising the auto-route sentinel "auto" FIRST so it is
+         selectable in the model picker (the inference policy recognises it for tiered auto-routing).
+         Fetched at request time, so newly-added deployments appear automatically. -->
+    <choose>
+      <when condition="@(context.Response.StatusCode == 200)">
+        <set-body><![CDATA[@{
+          var outData = new JArray();
+          outData.Add(new JObject(new JProperty("id","auto"), new JProperty("object","model"), new JProperty("created",0), new JProperty("owned_by","azure")));
+          try {
+            var src = context.Response.Body.As<JObject>(preserveContent: true);
+            var arr = src["data"] as JArray;
+            if (arr != null) {
+              foreach (var d in arr) {
+                var id = (string)d["id"];
+                var status = (string)d["status"];
+                if (!string.IsNullOrEmpty(id) && (status == null || status == "succeeded")) {
+                  outData.Add(new JObject(new JProperty("id",id), new JProperty("object","model"), new JProperty("created",0), new JProperty("owned_by","azure")));
+                }
+              }
+            }
+          } catch (Exception) { }
+          return new JObject(new JProperty("object","list"), new JProperty("data",outData)).ToString(Newtonsoft.Json.Formatting.None);
+        }]]></set-body>
+        <set-header name="Content-Type" exists-action="override">
+          <value>application/json</value>
+        </set-header>
+      </when>
+    </choose>
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

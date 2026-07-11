@@ -1,0 +1,404 @@
+# Auto-deploy to the ephemeral dev envs on every push to main, then chain
+# into smoke-test for an end-to-end regression check. Pilots are NEVER touched
+# by this workflow — they remain manual-only via deploy.yml.
+#
+# This workflow is also the SCHEDULED smoke entry point (it owns the cron, not
+# smoke-test.yml). Smoke needs a dev runner that is VNet-injected into the dev
+# env to reach APIM Internal; that runner only exists while the dev env exists.
+# teardown-dev.yml deletes the dev RGs nightly at 00:00 UTC (8pm ET), so a smoke-only
+# cron would hang forever against a torn-down env (no runner -> job queues ~24h).
+# Instead the schedule drives THIS workflow, which lazily (re)provisions the env
+# only when it's absent, then chains smoke. Net daily lifecycle (America/New_York):
+#   00:00 UTC (8pm ET) teardown -> 12:00 UTC (8am ET) clean provision + smoke ->
+#   15/18/21:00 UTC smoke-only (env reused, provision SKIPPED). The 8pm-8am ET gap
+#   leaves the dev envs DOWN ~12h overnight so we don't host what we won't use.
+#
+# Cost shape: each push/first-of-day spins up Foundry + APIM Developer + 1 ACA
+# Job runner in each cloud (~$0/hr idle; ~cents per smoke). Subsequent same-day
+# smokes are runner-only (no redeploy). teardown-dev.yml reclaims it all nightly.
+name: deploy-dev
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - 'policies/**'
+      - 'azure.yaml'
+      # provision/postprovision hook scripts (azure.yaml `hooks:`) run during a
+      # deploy but live under scripts/; include them so a hook fix actually gets
+      # exercised by deploy-dev instead of waiting for an unrelated infra push.
+      - 'scripts/**'
+      # Register app source (#64): a code-only change auto-redeploys the rebuilt
+      # image to the dev envs via the existing `azd deploy register` step.
+      - 'app/register/**'
+      - '.github/workflows/deploy-dev.yml'
+      - '.github/workflows/smoke-test.yml'
+  schedule:
+    # Through-the-day smoke against both dev envs. First run at 12:00 UTC (8am ET)
+    # finds the env absent (teardown ran at 00:00 UTC / 8pm ET) and does a clean
+    # provision; later runs (15/18/21:00 UTC) reuse it (provision is gated on
+    # existence below). NO overnight runs, so the envs stay DOWN 8pm-8am ET (~12h).
+    # GitHub cron is fixed-UTC / no DST, so under EST (winter) these land an hour
+    # earlier in local time. Working late? Manually dispatch deploy-dev to bring
+    # the envs back any time.
+    - cron: '0 12,15,18,21 * * *'
+  workflow_dispatch:
+    inputs:
+      smoke:
+        description: Run smoke-test after deploy
+        type: boolean
+        default: true
+      envs:
+        description: Which dev envs to deploy (comma-separated subset of comm-dev,gov-dev)
+        type: string
+        default: comm-dev,gov-dev
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  # SHARED dev-env lifecycle lock with teardown-dev.yml (identical group name): provisioning
+  # and tearing down the SAME dev RGs must never overlap. A delayed/scheduled deploy-dev once
+  # raced a manually-dispatched teardown — deploy-dev provisioned the dev env, the still-running
+  # teardown then deleted it, and the smoke jobs queued forever against a now-gone env. A static
+  # (not per-ref) group also coalesces queued pushes. Never cancel an in-flight run — neither
+  # `azd provision` nor `az group delete` is safe to interrupt, so queue instead of cancelling.
+  group: dev-env-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    name: Build dev matrix
+    # Self-hosted (#52). Hosted runners are disabled at the EMU enterprise level
+    # for this repo, so every job in every workflow must target the pilot's
+    # KEDA-scaled ACA Job runner (label = envName = `comm-pilot`).
+    runs-on: [self-hosted, comm-pilot]
+    outputs:
+      envs: ${{ steps.build.outputs.envs }}
+    steps:
+      - id: build
+        shell: bash
+        run: |
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
+            raw='${{ inputs.envs }}'
+          else
+            raw='comm-dev,gov-dev'
+          fi
+          # csv -> JSON array, trim whitespace, dedupe
+          envs=$(echo "$raw" | tr ',' '\n' | awk 'NF' | sort -u \
+            | jq -R . | jq -sc .)
+          echo "envs=$envs" >> "$GITHUB_OUTPUT"
+          echo "Will deploy: $envs"
+
+  provision:
+    name: Provision ${{ matrix.env }}
+    needs: matrix
+    if: needs.matrix.outputs.envs != '[]'
+    # The dev env's own runner doesn't exist yet (we're about to create it), so
+    # bootstrap provisioning has to run on the matching cloud's pilot runner.
+    # Routing: comm-dev -> comm-pilot (AzureCloud); gov-dev -> gov-pilot (AzureUSGovernment).
+    # Each pilot's UAMI must hold the FIC for the dev env it bootstraps (#53).
+    runs-on: [self-hosted, "${{ matrix.env == 'gov-dev' && 'gov-pilot' || 'comm-pilot' }}"]
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJson(needs.matrix.outputs.envs) }}
+    environment: ${{ matrix.env }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install azd (skip if pre-baked)
+        shell: bash
+        run: |
+          if ! command -v azd >/dev/null 2>&1; then
+            echo "azd not found — installing"
+            curl -fsSL https://aka.ms/install-azd.sh | sudo bash
+          else
+            echo "azd already installed: $(azd version)"
+          fi
+
+      - name: Resolve per-env config
+        id: cfg
+        shell: bash
+        run: |
+          case "${{ matrix.env }}" in
+            comm-dev)
+              echo "cloud=AzureCloud"                                  >> "$GITHUB_OUTPUT"
+              echo "params=infra/main.parameters.ci.commercial-dev.json" >> "$GITHUB_OUTPUT"
+              ;;
+            gov-dev)
+              echo "cloud=AzureUSGovernment"                           >> "$GITHUB_OUTPUT"
+              echo "params=infra/main.parameters.ci.gov-dev.json"      >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Unknown env '${{ matrix.env }}' — only comm-dev / gov-dev are auto-deployable"
+              exit 2
+              ;;
+          esac
+
+      - name: Stage CI parameters
+        run: |
+          azd config set cloud.name "${{ steps.cfg.outputs.cloud }}"
+          cp "${{ steps.cfg.outputs.params }}" infra/main.parameters.json
+
+      - name: azd auth login (OIDC)
+        run: |
+          azd auth login \
+            --client-id "${{ vars.AZURE_CLIENT_ID }}" \
+            --tenant-id "${{ vars.AZURE_TENANT_ID }}" \
+            --federated-credential-provider github
+
+      # Self-hosted ACA Job runner image (myoung34/github-runner) ships azd but
+      # NOT az. azure/login@v2 shells out to `az`, so install it on demand.
+      # Idempotent — no-op if a prior step (or pre-baked image) already has it.
+      - name: Install Azure CLI (self-hosted runner)
+        shell: bash
+        run: |
+          if ! command -v az >/dev/null 2>&1; then
+            echo "az not found — installing"
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          else
+            echo "az already installed: $(az version --query '\"azure-cli\"' -o tsv)"
+          fi
+
+      - name: Azure CLI login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ steps.cfg.outputs.cloud }}
+
+      # Lazy-provision gate. On the schedule trigger we only want to do a clean
+      # deploy when the dev env is actually gone (first smoke after the nightly
+      # 00:00 UTC / 8pm ET teardown). Subsequent same-day scheduled smokes find the
+      # RG present and SKIP azd provision entirely, so the pilot runner never burns
+      # time on incremental dev validations. push/dispatch always provision (to apply
+      # infra changes / honor manual intent) regardless of existence.
+      - name: Preflight — does the dev env already exist?
+        id: preflight
+        shell: bash
+        run: |
+          rg="rg-copilot-byok-${{ matrix.env }}"
+          exists=$(az group exists --name "$rg")
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+          echo "RG $rg exists=$exists (event=${{ github.event_name }})"
+
+      # Self-heal soft-delete collisions BEFORE provisioning. teardown-dev.yml purges
+      # tombstones on the clean nightly teardown, but a FAILED provision (or a manual
+      # delete) can also leave a soft-deleted APIM / Cognitive Services / Key Vault, and
+      # nothing purges those until the next teardown. azd's resource token is deterministic
+      # per env name, so the next provision regenerates the SAME names and collides
+      # ("A soft-deleted resource with this name exists"). Purge any matching tombstones
+      # first so provision is idempotent regardless of what left them. Purge only ever acts
+      # on already-deleted resources, so it's safe; a missing tombstone is a no-op. Names:
+      # APIM keeps dashes (apim-...-<env>-<token>); Cognitive/KV strip them
+      # (aifcopilotbyok<envnodash><token>, kvreg<envnodash><token>).
+      #
+      # ALSO delete any LIVE APIM in the RG stuck at provisioningState=Failed. A failed
+      # APIM VNet-injection activation ("ActivationFailed: Unable to activate API service")
+      # leaves the APIM Failed but NOT soft-deleted, and ARM refuses to redeploy over a
+      # same-named Failed APIM. Deleting a Failed-state APIM HARD-deletes it (no tombstone),
+      # so the name frees immediately and no purge is needed after.
+      - name: Purge soft-deleted tombstones (self-heal)
+        if: ${{ steps.preflight.outputs.exists == 'false' || github.event_name != 'schedule' }}
+        shell: bash
+        env:
+          ENV_NAME: ${{ matrix.env }}
+          LOC: ${{ vars.AZURE_LOCATION }}
+        run: |
+          set -uo pipefail
+          envnodash="${ENV_NAME//-/}"
+          rg="rg-copilot-byok-${ENV_NAME}"
+          echo "Self-heal: deleting any LIVE APIM stuck in Failed state for '$ENV_NAME'."
+          for name in $(az apim list -g "$rg" --query "[?provisioningState=='Failed'].name" -o tsv 2>/dev/null); do
+            echo "Deleting Failed-state APIM: $name"
+            az apim delete -g "$rg" -n "$name" --yes 2>&1 | tail -n 2 \
+              || echo "::warning::APIM delete for Failed '$name' failed"
+          done
+          echo "Self-heal: purging any soft-deleted APIM / Cognitive Services / Key Vault for '$ENV_NAME' (loc=$LOC)."
+          for name in $(az apim deletedservice list --query "[?contains(name,'${ENV_NAME}')].name" -o tsv 2>/dev/null); do
+            echo "Purging soft-deleted APIM: $name"
+            az apim deletedservice purge --service-name "$name" --location "$LOC" 2>&1 | tail -n 2 \
+              || echo "::warning::APIM purge for '$name' failed (already purged?)"
+          done
+          for name in $(az cognitiveservices account list-deleted --query "[?contains(name,'${envnodash}')].name" -o tsv 2>/dev/null); do
+            echo "Purging soft-deleted Cognitive Services: $name"
+            az cognitiveservices account purge --name "$name" --location "$LOC" --resource-group "$rg" 2>&1 | tail -n 2 \
+              || echo "::warning::Cognitive Services purge for '$name' failed (already purged?)"
+          done
+          for name in $(az keyvault list-deleted --query "[?contains(name,'${envnodash}')].name" -o tsv 2>/dev/null); do
+            echo "Purging soft-deleted Key Vault: $name"
+            az keyvault purge --name "$name" --location "$LOC" 2>&1 | tail -n 2 \
+              || echo "::warning::Key Vault purge for '$name' failed (already purged?)"
+          done
+          echo "Self-heal purge complete."
+
+      # Register-app Easy Auth is a TWO-PHASE bring-up (the redirect URI needs the
+      # Container App FQDN, which doesn't exist until the first provision):
+      #   phase 1  : provision hosting + Key Vault + UAMI (Easy Auth params empty -> auth off)
+      #   deploy   : push the real Blazor image
+      #   setup    : create the app reg + store its secret in Key Vault (degrades to manual)
+      #   phase 2  : provision again (Easy Auth params now populated -> login attached)
+      - name: azd provision (phase 1 — hosting + Key Vault)
+        # Provision when: env is absent (always bootstrap), OR this is not a
+        # scheduled run (push/dispatch must apply changes / honor manual intent).
+        if: ${{ steps.preflight.outputs.exists == 'false' || github.event_name != 'schedule' }}
+        # Bounded retry to ride out the transient APIM Internal VNet-injection
+        # "ActivationFailed: Unable to activate API service at this time ... this could be a
+        # temporary issue in the region" flake (aka.ms/apiminternalvnet). It hits comm-dev
+        # (eastus2) intermittently — the SAME template provisions gov-dev green in the same
+        # run and comm-dev succeeds on most runs — so it's region-side, not config. A failed
+        # activation leaves the APIM at provisioningState=Failed, which then blocks a same-name
+        # redeploy; between attempts we delete it (hard-delete, no tombstone) so the retry
+        # re-creates it clean. Everything else in phase 1 is idempotent, so re-running is safe.
+        shell: bash
+        run: |
+          set -uo pipefail
+          rg="rg-copilot-byok-${{ matrix.env }}"
+          max=2
+          attempt=1
+          while :; do
+            echo "::group::azd provision (phase 1) attempt ${attempt}/${max}"
+            if azd provision --no-prompt; then
+              echo "::endgroup::"
+              echo "Provision succeeded on attempt ${attempt}."
+              break
+            else
+              rc=$?
+              echo "::endgroup::"
+              if [ "${attempt}" -ge "${max}" ]; then
+                echo "::error::azd provision failed after ${attempt} attempt(s) (exit ${rc})."
+                exit "${rc}"
+              fi
+              echo "::warning::azd provision attempt ${attempt} failed (exit ${rc}); clearing any Failed-state APIM and retrying (likely transient APIM VNet-injection activation)."
+              for name in $(az apim list -g "${rg}" --query "[?provisioningState=='Failed'].name" -o tsv 2>/dev/null); do
+                echo "Deleting Failed-state APIM before retry: ${name}"
+                az apim delete -g "${rg}" -n "${name}" --yes 2>&1 | tail -n 2 \
+                  || echo "::warning::APIM delete for Failed '${name}' failed"
+              done
+              attempt=$((attempt + 1))
+              echo "Waiting 60s before retry..."
+              sleep 60
+            fi
+          done
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+          APIM_PUBLISHER_EMAIL: ${{ vars.APIM_PUBLISHER_EMAIL }}
+          ENTRA_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          API_APP_ID_URI: ${{ vars.API_APP_ID_URI }}
+          API_AUDIENCE: ${{ vars.API_AUDIENCE }}
+          GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
+          GH_APP_ID: ${{ vars.GH_APP_ID }}
+          GH_APP_INSTALLATION_ID: ${{ vars.GH_APP_INSTALLATION_ID }}
+          GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          # Empty on phase 1 so the register Easy Auth params substitute to '' (auth stays off).
+          REGISTER_EASYAUTH_CLIENT_ID: ''
+          REGISTER_EASYAUTH_SECRET_KV_URI: ''
+          # Commercial only: let the preprovision hook create/verify the BYOK tier groups.
+          MANAGE_BYOK_GROUPS: ${{ startsWith(matrix.env, 'comm') && 'true' || '' }}
+          # Commercial Foundry route (gov-dev): SP client secret for the cross-tenant
+          # client-credentials token (param foundryCommercialClientSecret), from the gov-dev
+          # Environment secret. Unused unless deployFoundryCommercial=true (off by default).
+          COMMERCIAL_FOUNDRY_CLIENT_SECRET: ${{ secrets.COMMERCIAL_FOUNDRY_CLIENT_SECRET }}
+          # Tenant + client IDs (NOT secrets) from repo Variables, so no real ID is committed
+          # (param-file ${COMMERCIAL_TENANT_ID}/${COMMERCIAL_CLIENT_ID} substitution). Empty unless
+          # the route is enabled. Mirrors the ENTRA_TENANT_ID posture.
+          COMMERCIAL_TENANT_ID: ${{ vars.COMMERCIAL_TENANT_ID }}
+          COMMERCIAL_CLIENT_ID: ${{ vars.COMMERCIAL_CLIENT_ID }}
+          # Commercial Foundry public base URL from a repo Variable (no account name committed).
+          COMMERCIAL_FOUNDRY_BASE_URL: ${{ vars.COMMERCIAL_FOUNDRY_BASE_URL }}
+          # Commercial only: gov NAT egress IPs to allowlist on THIS deploy's Foundry firewall via
+          # the postprovision hook (scripts/allow-foundry-ingress-ips). Empty on gov -> no-op.
+          FOUNDRY_PUBLIC_INGRESS_IPS: ${{ vars.FOUNDRY_PUBLIC_INGRESS_IPS }}
+
+      - name: Deploy register app image
+        if: ${{ steps.preflight.outputs.exists == 'false' || github.event_name != 'schedule' }}
+        run: azd deploy register --no-prompt
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+          # The workflow uses azd's default project environment (no AZURE_ENV_NAME), and the RG
+          # is created subscription-scoped by main.bicep, so azd can't infer the deploy target.
+          # Point it at the deterministic RG (rg-copilot-byok-<env>) holding the tagged app.
+          AZURE_RESOURCE_GROUP: rg-copilot-byok-${{ matrix.env }}
+
+      - name: Easy Auth setup (app reg + secret -> Key Vault)
+        # Idempotent + degrades to a printed manual command when the deploy principal lacks
+        # Entra app-management rights (expected in Gov) — never fails the deployment; Easy
+        # Auth simply stays off until an admin runs it.
+        if: ${{ steps.preflight.outputs.exists == 'false' || github.event_name != 'schedule' }}
+        shell: bash
+        run: |
+          rg="rg-copilot-byok-${{ matrix.env }}"
+          # Prefer azd outputs when present, but the workflow runs in azd's DEFAULT project env
+          # (no AZURE_ENV_NAME), so `azd env get-values` is usually EMPTY here — which silently
+          # skipped Easy Auth on every CI-managed env. Resolve fqdn/kv straight from Azure as the
+          # reliable source: the app carries the azd-service-name=register tag and the register
+          # Key Vault name starts with 'kvreg'. (Linux runner -> JMESPath --query is safe.)
+          vals="$(azd env get-values 2>/dev/null || true)"
+          fqdn="$(printf '%s\n' "$vals" | sed -n 's/^REGISTER_APP_FQDN="\?\([^"]*\)"\?$/\1/p')"
+          kv="$(printf '%s\n' "$vals" | sed -n 's/^REGISTER_KEY_VAULT_NAME="\?\([^"]*\)"\?$/\1/p')"
+          if [ -z "$fqdn" ]; then
+            fqdn="$(az containerapp list -g "$rg" --query "[?tags.\"azd-service-name\"=='register'].properties.configuration.ingress.fqdn | [0]" -o tsv 2>/dev/null || true)"
+          fi
+          if [ -z "$kv" ]; then
+            kv="$(az keyvault list -g "$rg" --query "[?starts_with(name,'kvreg')].name | [0]" -o tsv 2>/dev/null || true)"
+          fi
+          ./scripts/setup-register-entra.sh "$fqdn" "$kv" "${{ matrix.env }}"
+          # Guarantee the phase-2 provision sees these defined even if setup degraded.
+          grep -q '^REGISTER_EASYAUTH_CLIENT_ID='     "$GITHUB_ENV" || echo "REGISTER_EASYAUTH_CLIENT_ID="     >> "$GITHUB_ENV"
+          grep -q '^REGISTER_EASYAUTH_SECRET_KV_URI=' "$GITHUB_ENV" || echo "REGISTER_EASYAUTH_SECRET_KV_URI=" >> "$GITHUB_ENV"
+
+      - name: azd provision (phase 2 — attach Easy Auth)
+        # REGISTER_EASYAUTH_* now arrive via $GITHUB_ENV from the setup step.
+        if: ${{ steps.preflight.outputs.exists == 'false' || github.event_name != 'schedule' }}
+        run: azd provision --no-prompt
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+          APIM_PUBLISHER_EMAIL: ${{ vars.APIM_PUBLISHER_EMAIL }}
+          ENTRA_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          API_APP_ID_URI: ${{ vars.API_APP_ID_URI }}
+          API_AUDIENCE: ${{ vars.API_AUDIENCE }}
+          GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
+          GH_APP_ID: ${{ vars.GH_APP_ID }}
+          GH_APP_INSTALLATION_ID: ${{ vars.GH_APP_INSTALLATION_ID }}
+          GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          MANAGE_BYOK_GROUPS: ${{ startsWith(matrix.env, 'comm') && 'true' || '' }}
+          # Commercial Foundry route (gov-dev): must ALSO be present on phase 2 — every azd
+          # provision re-substitutes the param file, so omitting it here would overwrite the
+          # foundry-commercial-client-secret named value with a blank.
+          COMMERCIAL_FOUNDRY_CLIENT_SECRET: ${{ secrets.COMMERCIAL_FOUNDRY_CLIENT_SECRET }}
+          # Tenant + client IDs (NOT secrets) from repo Variables — also required on phase 2 so the
+          # re-substitution keeps the commercial named values populated. Mirrors ENTRA_TENANT_ID.
+          COMMERCIAL_TENANT_ID: ${{ vars.COMMERCIAL_TENANT_ID }}
+          COMMERCIAL_CLIENT_ID: ${{ vars.COMMERCIAL_CLIENT_ID }}
+          # Commercial Foundry public base URL + gov NAT ingress IPs (also required on phase 2 so the
+          # re-substitution keeps the commercial named values and the ingress hook consistent).
+          COMMERCIAL_FOUNDRY_BASE_URL: ${{ vars.COMMERCIAL_FOUNDRY_BASE_URL }}
+          FOUNDRY_PUBLIC_INGRESS_IPS: ${{ vars.FOUNDRY_PUBLIC_INGRESS_IPS }}
+
+      - name: Skip note (env already present)
+        if: ${{ steps.preflight.outputs.exists == 'true' && github.event_name == 'schedule' }}
+        run: echo "dev env rg-copilot-byok-${{ matrix.env }} already exists — skipping provision, running smoke only."
+
+  smoke-comm-dev:
+    name: Smoke comm-dev
+    needs: [matrix, provision]
+    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.smoke) && contains(needs.matrix.outputs.envs, 'comm-dev') }}
+    uses: ./.github/workflows/smoke-test.yml
+    with:
+      env: comm-dev
+
+  smoke-gov-dev:
+    name: Smoke gov-dev
+    needs: [matrix, provision]
+    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.smoke) && contains(needs.matrix.outputs.envs, 'gov-dev') }}
+    uses: ./.github/workflows/smoke-test.yml
+    with:
+      env: gov-dev

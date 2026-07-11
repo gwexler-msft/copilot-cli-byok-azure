@@ -1,0 +1,217 @@
+# Nightly teardown for the ephemeral dev RGs. Pilots are NEVER touched.
+# Cost discipline: dev envs exist only between the 08:00-ET (12:00 UTC) deploy-dev
+# provision and this 20:00-ET (00:00 UTC) teardown, leaving them DOWN ~12h overnight
+# (8pm-8am ET) so we don't pay to host something no one uses. Keeps idle-time spend
+# near $0 while still giving us a real CI smoke target during the working day.
+name: teardown-dev
+
+on:
+  schedule:
+    # 00:00 UTC = 8pm America/New_York (EDT). GitHub cron is fixed-UTC and does NOT
+    # observe DST, so under EST (winter) this fires at 7pm ET. Paired with deploy-dev's
+    # 12:00 UTC (8am ET) first provision to keep the dev envs down ~12h overnight.
+    - cron: '0 0 * * *' # 00:00 UTC = 8pm ET (teardown)
+  workflow_dispatch:
+    inputs:
+      envs:
+        description: Which dev envs to tear down (comma-separated subset of comm-dev,gov-dev)
+        type: string
+        default: comm-dev,gov-dev
+      dry_run:
+        description: Plan only (list RGs but do NOT delete)
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  # SHARED dev-env lifecycle lock with deploy-dev.yml (identical group name) so a provision and
+  # a teardown of the SAME dev RGs can never run at once. The previous separate group name
+  # ('teardown-dev') did NOT serialize against deploy-dev despite the intent, so a manual
+  # teardown raced a scheduled deploy-dev and deleted a freshly-provisioned dev env out from
+  # under its smoke jobs. Never cancel an in-flight run — queue, don't cancel.
+  group: dev-env-lifecycle
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    name: Build teardown matrix
+    # Self-hosted (#52). EMU hosted runners are disabled; pilot runner is the
+    # only available pool for orchestration jobs.
+    runs-on: [self-hosted, comm-pilot]
+    outputs:
+      envs: ${{ steps.build.outputs.envs }}
+    steps:
+      - id: build
+        shell: bash
+        run: |
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
+            raw='${{ inputs.envs }}'
+          else
+            raw='comm-dev,gov-dev'
+          fi
+          envs=$(echo "$raw" | tr ',' '\n' | awk 'NF' | sort -u | jq -R . | jq -sc .)
+          echo "envs=$envs" >> "$GITHUB_OUTPUT"
+          echo "Will tear down: $envs"
+
+  teardown:
+    name: Teardown ${{ matrix.env }}
+    needs: matrix
+    if: needs.matrix.outputs.envs != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJson(needs.matrix.outputs.envs) }}
+    # Per-cloud pilot runner: tearing down a dev RG requires the matching cloud's
+    # az context (CLI endpoint, OIDC issuer). comm-dev -> comm-pilot (AzureCloud);
+    # gov-dev -> gov-pilot (AzureUSGovernment). The dev env's own runner is being
+    # deleted, so we can't run `az group delete` from inside it.
+    runs-on: [self-hosted, "${{ matrix.env == 'gov-dev' && 'gov-pilot' || 'comm-pilot' }}"]
+    # Use the matching env (comm-dev / gov-dev) so OIDC binds to the right cloud
+    # via the GitHub Environment's vars/secrets.
+    environment: ${{ matrix.env }}
+    # The delete is SYNCHRONOUS (not --no-wait) because the tombstone purge below can
+    # only run once soft-delete completes, and APIM deletion is the long pole (~30-45 min).
+    # A real teardown observed comm-dev at >60 min and gov-dev at ~50 min, so 60 was too
+    # tight — comm-dev was cancelled mid-run right before the purge step. 120 gives the
+    # APIM/Foundry delete + purge comfortable headroom.
+    timeout-minutes: 120
+    steps:
+      - name: Guardrail — never delete a pilot RG
+        shell: bash
+        run: |
+          case "${{ matrix.env }}" in
+            comm-dev|gov-dev) echo "OK: dev env '${{ matrix.env }}'";;
+            *) echo "::error::Refusing to tear down non-dev env '${{ matrix.env }}'"; exit 2;;
+          esac
+
+      - name: Resolve cloud
+        id: cfg
+        shell: bash
+        run: |
+          case "${{ matrix.env }}" in
+            comm-dev) echo "cloud=AzureCloud"          >> "$GITHUB_OUTPUT";;
+            gov-dev)  echo "cloud=AzureUSGovernment"   >> "$GITHUB_OUTPUT";;
+          esac
+
+      # Self-hosted ACA Job runner image (myoung34/github-runner) ships azd but
+      # NOT az. azure/login@v2 shells out to `az`, so install it on demand.
+      - name: Install Azure CLI (self-hosted runner)
+        shell: bash
+        run: |
+          if ! command -v az >/dev/null 2>&1; then
+            echo "az not found — installing"
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          else
+            echo "az already installed: $(az version --query '\"azure-cli\"' -o tsv)"
+          fi
+
+      - name: Azure CLI login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ steps.cfg.outputs.cloud }}
+
+      - name: Find dev RG(s)
+        id: find
+        shell: bash
+        run: |
+          set -e
+          # Match `rg-copilot-byok-<env>` exactly (matches the namePrefix used by
+          # the CI dev param files). Also belt-and-suspenders: require the
+          # `azd-env-name` tag if azd seeded it. We do NOT match by glob to avoid
+          # deleting pilot RGs by accident.
+          rg="rg-copilot-byok-${{ matrix.env }}"
+          exists=$(az group exists --name "$rg")
+          echo "rg=$rg" >> "$GITHUB_OUTPUT"
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+          if [ "$exists" = 'true' ]; then
+            echo "Found $rg"
+            az group show --name "$rg" --query '{name:name, tags:tags, location:location}' -o table
+          else
+            echo "No RG named $rg — nothing to do."
+          fi
+
+      - name: Belt-and-suspenders tag check (must have azd-env-name=${{ matrix.env }})
+        if: steps.find.outputs.exists == 'true'
+        shell: bash
+        run: |
+          set -e
+          tag=$(az group show --name "${{ steps.find.outputs.rg }}" \
+            --query "tags.\"azd-env-name\"" -o tsv 2>/dev/null || echo "")
+          if [ -z "$tag" ]; then
+            echo "::warning::RG ${{ steps.find.outputs.rg }} has no azd-env-name tag. Proceeding (RG name match is sufficient for dev)."
+          elif [ "$tag" != '${{ matrix.env }}' ]; then
+            echo "::error::RG ${{ steps.find.outputs.rg }} has azd-env-name='$tag' but matrix env is '${{ matrix.env }}'. Refusing to delete."
+            exit 3
+          fi
+
+      - name: Delete RG (or dry-run plan)
+        if: steps.find.outputs.exists == 'true'
+        shell: bash
+        run: |
+          set -e
+          rg="${{ steps.find.outputs.rg }}"
+          if [ '${{ github.event_name }}' = 'workflow_dispatch' ] && [ '${{ inputs.dry_run }}' = 'true' ]; then
+            echo "DRY RUN — would delete:"
+            az resource list -g "$rg" --query "[].{name:name,type:type}" -o table
+            echo "DRY RUN — would then purge any soft-deleted APIM / Cognitive Services / Key Vault it leaves behind."
+            exit 0
+          fi
+
+          # Capture soft-deletable resources BEFORE delete so we can purge their
+          # tombstones afterwards. APIM, Cognitive Services (Foundry/AOAI), and
+          # Key Vault all soft-delete at SUBSCRIPTION scope: `az group delete`
+          # removes the RG but leaves a named tombstone that blocks the next
+          # deploy-dev provision (azd's resource token is deterministic -> same
+          # names -> collision: ServiceAlreadyExistsInSoftDeletedState /
+          # FlagMustBeSetForRestore / "vault with the same name already exists in
+          # deleted state").
+          apims=$(az resource list -g "$rg" \
+            --resource-type Microsoft.ApiManagement/service \
+            --query "[].name" -o tsv 2>/dev/null || true)
+          cogs=$(az resource list -g "$rg" \
+            --resource-type Microsoft.CognitiveServices/accounts \
+            --query "[].name" -o tsv 2>/dev/null || true)
+          kvs=$(az resource list -g "$rg" \
+            --resource-type Microsoft.KeyVault/vaults \
+            --query "[].name" -o tsv 2>/dev/null || true)
+          echo "APIM to purge after delete: ${apims:-<none>}"
+          echo "Cognitive Services to purge after delete: ${cogs:-<none>}"
+          echo "Key Vaults to purge after delete: ${kvs:-<none>}"
+
+          # Synchronous delete (NOT --no-wait): purge can only succeed once the
+          # resources have finished soft-deleting, so we must block on the delete.
+          echo "Deleting $rg (waiting for completion)..."
+          az group delete --name "$rg" --yes
+          echo "RG deleted."
+
+          # Purge the tombstones. Each is idempotent-ish: a missing tombstone just
+          # errors, which we swallow so one stale name can't fail the whole run.
+          for name in $apims; do
+            echo "Purging soft-deleted APIM '$name' in ${{ vars.AZURE_LOCATION }}..."
+            az apim deletedservice purge \
+              --service-name "$name" \
+              --location "${{ vars.AZURE_LOCATION }}" \
+              2>&1 | tail -n 3 || echo "::warning::APIM purge for '$name' failed (already purged?)"
+          done
+          for name in $cogs; do
+            echo "Purging soft-deleted Cognitive Services '$name'..."
+            az cognitiveservices account purge \
+              --location "${{ vars.AZURE_LOCATION }}" \
+              --resource-group "$rg" \
+              --name "$name" \
+              2>&1 | tail -n 3 || echo "::warning::Cognitive Services purge for '$name' failed (already purged?)"
+          done
+          for name in $kvs; do
+            echo "Purging soft-deleted Key Vault '$name' in ${{ vars.AZURE_LOCATION }}..."
+            az keyvault purge \
+              --name "$name" \
+              --location "${{ vars.AZURE_LOCATION }}" \
+              2>&1 | tail -n 3 || echo "::warning::Key Vault purge for '$name' failed (already purged?)"
+          done
+          echo "Teardown + purge complete for $rg."

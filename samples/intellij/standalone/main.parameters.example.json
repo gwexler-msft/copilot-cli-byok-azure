@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "_comment": "IntelliJ BYOK bolt-on example params. Copy to main.parameters.json, fill in, then run deploy.ps1/deploy.sh (recommended — it preflights the inputs and passes any secret inline). appInsightsName + appInsightsResourceGroup point at an EXISTING Application Insights in the SAME subscription as APIM (the customer's, the pilot's, or any provided one) — no App Insights is created and the template reads its connection string itself. foundryApiKey is the key the bolt-on uses to reach the EXISTING Foundry backend (api-key auth, NOT managed identity — unlike the standard BYOK deployment); supply it via deploy.ps1/deploy.sh -FoundryApiKey (never in this file) UNLESS that backend already carries its own credential — empty when required => Foundry 401. vmAdminSshPublicKey is the operator's SSH public key (password auth is disabled). AUTO-ROUTE: autoRouteSentinel defaults to 'auto' and tiers requests — short non-coding prompts to the cheap mini deployment, coding/long prompts to the full deployment — but only ACTIVATES once autoRouteMiniDeployment + autoRouteFullDeployment name real Foundry deployments (leave them blank to disable; clients then just pass a specific model). proxyImageId (optional) is a pre-baked Compute Gallery image for air-gapped subnets — see README §9.",
+  "parameters": {
+    "apimResourceGroup":        { "value": "<customer-apim-resource-group>" },
+    "apimName":                 { "value": "<customer-apim-name>" },
+    "existingBackendName":      { "value": "<existing-foundry-backend-name>" },
+    "apiVersion":               { "value": "2025-04-01-preview" },
+    "intellijApiPath":          { "value": "intellij" },
+    "existingProductName":      { "value": "<primary-product-name-for-intellij-keys>" },
+    "additionalProductNames":   { "value": [] },
+    "autoRouteSentinel":        { "value": "auto" },
+    "autoRouteMiniDeployment":  { "value": "<mini-deployment-name>" },
+    "autoRouteFullDeployment":  { "value": "<full-deployment-name>" },
+    "autoRouteLengthThreshold": { "value": 500 },
+    "autoRouteAmbiguousBand":   { "value": 200 },
+    "appInsightsName":          { "value": "<app-insights-name>" },
+    "appInsightsResourceGroup": { "value": "<app-insights-resource-group>" },
+
+    "location":                 { "value": "<region>" },
+    "vmResourceGroup":          { "value": "<rg-for-the-proxy-vm>" },
+    "createVmResourceGroup":    { "value": true },
+    "proxyNicId":               { "value": "" },
+    "vmSubnetId":               { "value": "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<subnet>" },
+    "proxyStaticPrivateIp":     { "value": "<free-private-ip-in-that-subnet>" },
+    "apimPrivateIp":            { "value": "<apim-internal-private-ip>" },
+    "apimGatewayHost":          { "value": "<apim-name>.azure-api.net" },
+    "vmAdminUsername":          { "value": "byokadmin" },
+    "vmAdminSshPublicKey":      { "value": "ssh-rsa AAAA... operator-public-key" },
+    "vmSize":                   { "value": "Standard_B2s" },
+    "vmName":                   { "value": "vm-byok-intellij-proxy" },
+    "proxyImageId":             { "value": "" }
+  }
+}

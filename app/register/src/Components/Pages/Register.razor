@@ -1,0 +1,211 @@
+@page "/"
+@page "/register"
+@using Byok.Register.Services
+@inject IdentityContext Identity
+@inject GroupMembershipResolver Groups
+@inject TierResolver Tiers
+
+<PageTitle>BYOK · Self-serve register</PageTitle>
+
+<h1>Bring-Your-Own-Key — self-serve register</h1>
+
+@if (Identity.IsAuthenticated)
+{
+    <p class="who">
+        Signed in as <strong>@Identity.UserPrincipalName</strong>
+        @if (_isAdmin)
+        {
+            <span class="badge" title="Member of the BYOK Admins group">Admin</span>
+        }
+        else
+        {
+            <span class="badge badge-muted" title="Standard self-service user">User</span>
+        }
+    </p>
+
+    <section class="card">
+        <h2>1 · Get your key</h2>
+        <p>
+            Click below to provision (or re-fetch) your personal APIM subscription. The key is
+            shown <strong>once</strong> — copy it now, or just download the config/installer below
+            (the key is baked into both).
+        </p>
+        <button id="btn-register" class="primary">Register / get my key</button>
+        <button id="btn-regenerate" class="ghost" hidden>Regenerate key</button>
+
+        <div id="result" hidden>
+            <dl>
+                <dt>Tier (product)</dt><dd id="r-tier"></dd>
+                <dt>Gateway</dt><dd id="r-base"></dd>
+            </dl>
+            <label>Your key (shown once)</label>
+            <div class="keyrow">
+                <code id="r-key"></code>
+                <button id="btn-copy" class="ghost">Copy</button>
+            </div>
+            <p class="warn">⚠ You won't see this key again. It's also embedded in the downloads below.</p>
+        </div>
+
+        <p id="error" class="error" hidden></p>
+    </section>
+
+    <section class="card">
+        <h2>2 · Install locally</h2>
+        <p>
+            The installer merges your config into VS&nbsp;Code (<code>chatLanguageModels.json</code> +
+            <code>settings.json</code>) and the Copilot&nbsp;CLI environment, without clobbering your
+            other settings. Re-running is safe.
+        </p>
+        <div class="row">
+            <label for="os">Installer for</label>
+            <select id="os">
+                <option value="win">Windows (PowerShell)</option>
+                <option value="mac">macOS (bash/zsh)</option>
+                <option value="linux">Linux (bash)</option>
+            </select>
+            <button id="btn-installer" class="primary">Download installer</button>
+            <button id="btn-config" class="ghost">Download chatLanguageModels.json only</button>
+        </div>
+        <p class="hint">
+            Then reload VS&nbsp;Code and open a <strong>new</strong> terminal so the
+            <code>COPILOT_PROVIDER_*</code> variables load.
+        </p>
+    </section>
+
+    <section class="card">
+        <h2>3 · Manage your access</h2>
+        <p>
+            Revoking disables your personal APIM subscription so your current key stops working
+            immediately. You can re-register above at any time to get a fresh key.
+        </p>
+        <button id="btn-revoke-self" class="danger">Revoke my key</button>
+        <p id="revoke-self-result" class="hint" hidden></p>
+    </section>
+
+    @if (_isAdmin)
+    {
+        <section class="card admin">
+            <h2>Admin · Offboard a developer</h2>
+            <p>
+                Admin-only — you're in the <strong>BYOK Admins</strong> group. Revoke another
+                developer's APIM subscription by their sign-in name (UPN), e.g. when they leave
+                the team. Non-admins never see this panel.
+            </p>
+            <div class="row">
+                <input id="adm-upn" type="email" placeholder="dev@contoso.com" />
+                <button id="btn-offboard" class="danger">Revoke developer</button>
+            </div>
+            <p id="adm-result" class="hint" hidden></p>
+        </section>
+    }
+}
+else
+{
+    <p class="who">You're not signed in. Sign-in is handled by Entra Easy Auth in the deployed
+    environment; if you're seeing this locally, run behind the gateway to authenticate.</p>
+}
+
+<script>
+    (function () {
+        const $ = (id) => document.getElementById(id);
+        const reg = $('btn-register');
+        if (!reg) return; // anonymous view
+
+        let lastKey = '';
+
+        function showError(msg) {
+            const e = $('error');
+            e.textContent = msg;
+            e.hidden = false;
+        }
+        function clearError() { $('error').hidden = true; }
+
+        async function provision(url) {
+            clearError();
+            const resp = await fetch(url, { method: 'POST', headers: { 'Accept': 'application/json' } });
+            if (resp.status === 401) { showError('Not authenticated. Please sign in and retry.'); return null; }
+            if (!resp.ok) { showError('Request failed (HTTP ' + resp.status + ').'); return null; }
+            return await resp.json();
+        }
+
+        reg.addEventListener('click', async () => {
+            reg.disabled = true;
+            const data = await provision('/api/register');
+            reg.disabled = false;
+            if (!data) return;
+            lastKey = data.primaryKey;
+            $('r-tier').textContent = data.productId;
+            $('r-base').textContent = data.baseUrl;
+            $('r-key').textContent = data.primaryKey;
+            $('result').hidden = false;
+            $('btn-regenerate').hidden = false;
+        });
+
+        $('btn-regenerate').addEventListener('click', async () => {
+            const data = await provision('/api/regenerate');
+            if (!data) return;
+            lastKey = data.primaryKey;
+            $('r-key').textContent = data.primaryKey;
+        });
+
+        $('btn-copy').addEventListener('click', async () => {
+            try { await navigator.clipboard.writeText(lastKey); $('btn-copy').textContent = 'Copied'; }
+            catch { showError('Clipboard blocked — select the key and copy manually.'); }
+        });
+
+        $('btn-installer').addEventListener('click', () => {
+            window.location.href = '/api/installer?os=' + encodeURIComponent($('os').value);
+        });
+        $('btn-config').addEventListener('click', () => {
+            window.location.href = '/api/config';
+        });
+
+        const revokeSelf = $('btn-revoke-self');
+        if (revokeSelf) {
+            revokeSelf.addEventListener('click', async () => {
+                if (!confirm('Revoke your key? Your current key will stop working immediately.')) return;
+                const out = $('revoke-self-result');
+                revokeSelf.disabled = true;
+                try {
+                    const resp = await fetch('/api/revoke', { method: 'POST', headers: { 'Accept': 'application/json' } });
+                    if (!resp.ok) { out.textContent = 'Revoke failed (HTTP ' + resp.status + ').'; }
+                    else { const d = await resp.json(); out.textContent = d.revoked ? 'Your key was revoked.' : 'No active subscription to revoke.'; }
+                } catch { out.textContent = 'Revoke failed (network error).'; }
+                out.hidden = false;
+                revokeSelf.disabled = false;
+            });
+        }
+
+        const offboard = $('btn-offboard');
+        if (offboard) {
+            offboard.addEventListener('click', async () => {
+                const upn = ($('adm-upn').value || '').trim();
+                const out = $('adm-result');
+                if (!upn) { out.textContent = 'Enter the developer\u2019s UPN first.'; out.hidden = false; return; }
+                if (!confirm('Revoke ' + upn + '\u2019s key? Their key will stop working immediately.')) return;
+                offboard.disabled = true;
+                try {
+                    const resp = await fetch('/api/revoke?upn=' + encodeURIComponent(upn), { method: 'POST', headers: { 'Accept': 'application/json' } });
+                    if (resp.status === 403) { out.textContent = 'Forbidden \u2014 admin group membership required.'; }
+                    else if (!resp.ok) { out.textContent = 'Revoke failed (HTTP ' + resp.status + ').'; }
+                    else { const d = await resp.json(); out.textContent = d.revoked ? ('Revoked ' + d.upn + '.') : ('No active subscription found for ' + d.upn + '.'); }
+                } catch { out.textContent = 'Revoke failed (network error).'; }
+                out.hidden = false;
+                offboard.disabled = false;
+            });
+        }
+    })();
+</script>
+
+@code {
+    private bool _isAdmin;
+
+    protected override async Task OnInitializedAsync()
+    {
+        if (Identity.IsAuthenticated && !string.IsNullOrEmpty(Identity.ObjectId))
+        {
+            var groupIds = await Groups.GetEffectiveGroupIdsAsync();
+            _isAdmin = Tiers.IsAdmin(groupIds);
+        }
+    }
+}

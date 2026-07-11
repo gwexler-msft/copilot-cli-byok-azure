@@ -1,0 +1,65 @@
+<policies>
+  <inbound>
+    <!-- OPERATION-scope policy for GET /v1/models on the foundry inference API
+         (subscriptionKey mode). It DELIBERATELY omits <base /> so the API-level inference
+         policy does NOT run: that policy parses the request body for a "model" field and
+         returns 400 on any body-less request, which a GET /v1/models is. This lets
+         OpenAI-compatible clients (e.g. JetBrains AI Assistant's OpenAI-compatible provider)
+         probe /v1/models to validate the connection and populate the model list under the
+         SAME base URL they use for /v1/chat/completions.
+
+         Auth is still enforced: the API is configured with subscriptionRequired=true and the
+         key in the "api-key" header (see apim-foundry-api.bicep), so APIM validates the
+         subscription key NATIVELY before this policy runs. We then strip the caller creds,
+         mint the Foundry managed-identity token, and rewrite to the account-root
+         /openai/v1/models surface — the account-root list surface. The outbound is
+         intentionally empty (no <base />)
+         so the inference token-metric emit — which reads variables this path never sets —
+         does not run; model listing is not billable inference. -->
+    <set-header name="api-key" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+    <set-backend-service backend-id="{{foundry-backend-id}}" />
+    <authentication-managed-identity resource="{{foundry-mi-audience}}" />
+    <!-- Fetch the ACTUAL deployments (data-plane list) instead of the base-model catalog: the
+         account-root /openai/v1/models returns the wrong names + strict-parser-breaking fields.
+         2023-03-15-preview is the data-plane api-version that still serves the deployments list. -->
+    <rewrite-uri template="/openai/deployments?api-version=2023-03-15-preview" copy-unmatched-params="false" />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <!-- Reshape the Foundry deployments response into the OpenAI /v1/models shape the IDE clients
+         expect (clean minimal fields), advertising the auto-route sentinel "auto" FIRST so it is
+         selectable in the model picker (the inference policy recognises it for tiered auto-routing).
+         Fetched at request time, so newly-added deployments appear automatically. -->
+    <choose>
+      <when condition="@(context.Response.StatusCode == 200)">
+        <set-body><![CDATA[@{
+          var outData = new JArray();
+          outData.Add(new JObject(new JProperty("id","auto"), new JProperty("object","model"), new JProperty("created",0), new JProperty("owned_by","azure")));
+          try {
+            var src = context.Response.Body.As<JObject>(preserveContent: true);
+            var arr = src["data"] as JArray;
+            if (arr != null) {
+              foreach (var d in arr) {
+                var id = (string)d["id"];
+                var status = (string)d["status"];
+                if (!string.IsNullOrEmpty(id) && (status == null || status == "succeeded")) {
+                  outData.Add(new JObject(new JProperty("id",id), new JProperty("object","model"), new JProperty("created",0), new JProperty("owned_by","azure")));
+                }
+              }
+            }
+          } catch (Exception) { }
+          return new JObject(new JProperty("object","list"), new JProperty("data",outData)).ToString(Newtonsoft.Json.Formatting.None);
+        }]]></set-body>
+        <set-header name="Content-Type" exists-action="override">
+          <value>application/json</value>
+        </set-header>
+      </when>
+    </choose>
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

@@ -1,0 +1,48 @@
+# IntelliJ BYOK bolt-on — Terraform route. Copy to terraform.tfvars and fill in.
+# terraform.tfvars is gitignored (it holds environment specifics + secrets).
+
+# Cloud: public | usgovernment | china | german
+arm_environment = "public"
+
+# Existing APIM (the /intellij API + policy are added here)
+apim_resource_group   = "<customer-apim-resource-group>"
+apim_name             = "<customer-apim-name>"
+existing_backend_name = "<existing-foundry-backend-name>"
+existing_product_name = "<primary-product-name-for-intellij-keys>" # "" for all-APIs-scope keys
+# additional_product_names = ["<another-product-tier>"]             # e.g. standard + power products
+# Foundry api-key the bolt-on uses to reach the EXISTING backend. REQUIRED unless that backend entity
+# already carries its own credential — the bolt-on uses api-key auth, NOT managed identity. Empty when
+# required => Foundry 401 "Access denied due to invalid subscription key". Pass via TF_VAR_foundry_api_key;
+# keep out of VCS.
+# foundry_api_key     = "<foundry-api-key>"
+
+api_version       = "2025-04-01-preview"
+intellij_api_path = "intellij"
+
+# Auto-route (on by default; activates only once mini + full name real deployments; "" disables)
+auto_route_mini_deployment  = "<mini-deployment-name>" # e.g. gpt-4.1-mini
+auto_route_full_deployment  = "<full-deployment-name>" # e.g. gpt-5.1
+auto_route_length_threshold = 500
+auto_route_ambiguous_band   = 200
+
+# Metrics: an EXISTING Application Insights (none is created)
+app_insights_name           = "<app-insights-name>"
+app_insights_resource_group = "<app-insights-resource-group>"
+
+# Proxy VM
+location          = "<region>"
+vm_resource_group = "<rg-for-the-proxy-vm>" # can be the APIM RG to keep everything in one RG
+# create_vm_resource_group = true            # set false to deploy into an EXISTING RG (e.g. the APIM RG)
+# proxy_nic_id = "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Network/networkInterfaces/<customer-created-nic>"
+# When proxy_nic_id is set, leave vm_subnet_id empty; proxy_static_private_ip must match that NIC.
+vm_subnet_id            = "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Network/virtualNetworks/<vnet>/subnets/<subnet>"
+proxy_static_private_ip = "<free-private-ip-in-that-subnet>"
+apim_private_ip         = "<apim-internal-private-ip>"
+apim_gateway_host       = "<apim-name>.azure-api.net" # .azure-api.us in Gov
+vm_admin_username       = "byokadmin"
+vm_admin_ssh_public_key = "ssh-ed25519 AAAA... operator-public-key"
+vm_size                 = "Standard_B2s" # some regions (usgovvirginia) need e.g. Standard_D2as_v6
+vm_name                 = "vm-byok-intellij-proxy"
+
+# Air-gapped subnets only: pre-baked gallery image (build with ../scripts/build-proxy-image.*)
+proxy_image_id = ""

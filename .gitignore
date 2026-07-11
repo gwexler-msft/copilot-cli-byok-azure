@@ -1,0 +1,52 @@
+# Logs / local
+*.log
+.azuretmp/
+.vs/
+whatif.txt
+whatif*.json
+
+# azd state
+.azure/*
+!.azure/infrastructure-plan.json
+
+# Bicep build artifacts
+infra/**/*.json
+!infra/main.parameters.gov.example.json
+!infra/main.parameters.commercial.example.json
+# CI parameter profiles — committed; hold only non-secret defaults (secrets injected at runtime).
+!infra/main.parameters.ci.gov.json
+!infra/main.parameters.ci.commercial.json
+!infra/main.parameters.ci.gov-dev.json
+!infra/main.parameters.ci.commercial-dev.json
+
+# Real deployment parameters carry tenant/app-specific values — keep local only.
+# Copy infra/main.parameters.gov.example.json -> infra/main.parameters.json and fill in.
+infra/main.parameters.json
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vscode/*
+!.vscode/mcp.json
+*.code-workspace
+
+# Scratch / ad-hoc probe scripts (dot-prefixed, local only)
+scripts/.probe-*.ps1
+
+# Python (project-local venv + caches)
+.venv/
+__pycache__/
+*.pyc
+
+# Standalone bolt-on compiled ARM (build artifact; deploy uses main.bicep directly)
+samples/intellij/standalone/main.json
+samples/intellij/standalone/main.parameters.json
+samples/intellij/standalone/main.parameters.*-dryrun.json
+
+# Standalone bolt-on — Terraform route (state + secrets + provider cache; keep .example)
+samples/intellij/standalone/terraform/.terraform/
+samples/intellij/standalone/terraform/*.tfstate
+samples/intellij/standalone/terraform/*.tfstate.*
+samples/intellij/standalone/terraform/terraform.tfvars
+samples/intellij/standalone/terraform/*.auto.tfvars
+samples/intellij/standalone/terraform/byok-proxy-key*

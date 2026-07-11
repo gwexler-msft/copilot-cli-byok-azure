@@ -1,0 +1,43 @@
+#cloud-config
+# IntelliJ BYOK bolt-on — proxy VM bootstrap.
+#
+# Installs nginx and writes a config that translates `Authorization: Bearer <APIM subscription key>`
+# (what JetBrains AI Assistant sends) into the `api-key` header the Internal APIM validates, then
+# forwards to the APIM by PRIVATE IP with the gateway hostname as the Host header + TLS SNI — so the
+# VM needs no DNS. __APIM_PRIVATE_IP__ and __APIM_GATEWAY_HOST__ are substituted by Bicep at deploy.
+package_update: true
+packages:
+  - nginx
+write_files:
+  - path: /etc/nginx/conf.d/byok-proxy.conf
+    permissions: '0644'
+    content: |
+      map $http_authorization $byok_key {
+          default "";
+          "~*^Bearer (.+)$" $1;
+      }
+      server {
+          listen 8080;
+          server_name _;
+          location ^~ /__INTELLIJ_API_PATH__/ {
+              proxy_pass https://__APIM_PRIVATE_IP__;
+              proxy_set_header Host __APIM_GATEWAY_HOST__;
+              proxy_ssl_name __APIM_GATEWAY_HOST__;
+              proxy_ssl_server_name on;
+              proxy_set_header api-key $byok_key;
+              proxy_set_header Authorization "";
+              proxy_http_version 1.1;
+              proxy_buffering off;
+              proxy_request_buffering off;
+              proxy_read_timeout 600s;
+              client_max_body_size 50m;
+          }
+              location / {
+                return 404;
+              }
+      }
+runcmd:
+  - rm -f /etc/nginx/sites-enabled/default
+  - nginx -t
+  - systemctl enable nginx
+  - systemctl restart nginx

@@ -1,0 +1,78 @@
+<!--
+  ===========================================================================
+  IntelliJ BYOK bolt-on — GET /v1/models operation policy (subscription key)
+  ===========================================================================
+  Operation-scoped policy for GET /intellij/v1/models. It DELIBERATELY omits <base /> so the
+  API-level inference policy (which parses the body and 400s a body-less request) does NOT run.
+  APIM still validates the subscription key natively (subscriptionRequired=true) before this runs.
+
+  Fetches the customer Foundry's LIVE deployments list and reshapes it into the OpenAI
+  /v1/models shape JetBrains AI Assistant expects (so the connection validates + the model
+  dropdown populates). Auth is the customer's EXISTING backend + api-key (NO managed identity).
+  The "auto" sentinel is advertised first ONLY when auto-route is enabled ({{intellij-auto-sentinel}}).
+  ===========================================================================
+-->
+<policies>
+  <inbound>
+    <set-header name="api-key" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+    <set-backend-service backend-id="{{intellij-foundry-backend-id}}" />
+    <set-variable name="fdKey" value="{{intellij-foundry-api-key}}" />
+    <choose>
+      <when condition="@(!string.IsNullOrWhiteSpace((string)context.Variables["fdKey"]))">
+        <set-header name="api-key" exists-action="override">
+          <value>@((string)context.Variables["fdKey"])</value>
+        </set-header>
+      </when>
+    </choose>
+    <!-- The data-plane deployments list is served on 2023-03-15-preview (2024-* return 404). -->
+    <rewrite-uri template="/openai/deployments?api-version=2023-03-15-preview" copy-unmatched-params="false" />
+    <!-- Read the sentinel + tier deployments into variables so the outbound CDATA doesn't rely on
+         {{...}} substitution inside CDATA. 'auto' is advertised only when all three are set. -->
+    <set-variable name="autoSentinel" value="{{intellij-auto-sentinel}}" />
+    <set-variable name="autoMini" value="{{intellij-auto-mini-deployment}}" />
+    <set-variable name="autoFull" value="{{intellij-auto-full-deployment}}" />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <choose>
+      <when condition="@(context.Response.StatusCode == 200)">
+        <set-body><![CDATA[@{
+          var outData = new JArray();
+          var nowEpoch = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+          var sentinel = (string)context.Variables["autoSentinel"];
+          var mini = (string)context.Variables["autoMini"];
+          var full = (string)context.Variables["autoFull"];
+          if (!string.IsNullOrWhiteSpace(sentinel) && !string.IsNullOrWhiteSpace(mini) && !string.IsNullOrWhiteSpace(full)) {
+            var first = sentinel.Split(',')[0].Trim();
+            if (first.Length > 0) {
+              outData.Add(new JObject(new JProperty("id", first), new JProperty("object","model"), new JProperty("created",nowEpoch), new JProperty("owned_by","azure")));
+            }
+          }
+          try {
+            var src = context.Response.Body.As<JObject>(preserveContent: true);
+            var arr = src["data"] as JArray;
+            if (arr != null) {
+              foreach (var d in arr) {
+                var id = (string)d["id"];
+                var status = (string)d["status"];
+                if (!string.IsNullOrEmpty(id) && (status == null || status == "succeeded")) {
+                  outData.Add(new JObject(new JProperty("id",id), new JProperty("object","model"), new JProperty("created",nowEpoch), new JProperty("owned_by","azure")));
+                }
+              }
+            }
+          } catch (Exception) { }
+          return new JObject(new JProperty("object","list"), new JProperty("data",outData)).ToString(Newtonsoft.Json.Formatting.None);
+        }]]></set-body>
+        <set-header name="Content-Type" exists-action="override">
+          <value>application/json</value>
+        </set-header>
+      </when>
+    </choose>
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>
