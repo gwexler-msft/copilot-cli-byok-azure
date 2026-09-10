@@ -1,0 +1,159 @@
+name: discover-model-types
+
+# Automated model API-type discovery (issue #119 Phase 1 / #122). Runs the self-hosted VNet
+# runner against a deployed env's INTERNAL APIM gateway, probes each route to learn which API
+# surface(s) every deployed model supports (chat/completions, responses, messages, ...), and
+# writes the resulting per-route capability map into that env's committed CI param file
+# (foundryModelTypes / aoaiModelTypes). The param file is the
+# AUTHORITATIVE source — a subsequent provision applies the named values — so this workflow
+# opens a PR with the change rather than pushing to protected main. Optionally also does a live
+# `az apim nv update` for instant (non-authoritative) effect on the running gateway.
+#
+# The gateway is internal VNet-only, so this MUST run on the env's self-hosted runner (same
+# runner smoke uses); a laptop cannot reach it. Manual dispatch only — like smoke, a schedule
+# would just queue against an env whose ephemeral runner may not exist.
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: Target env
+        type: choice
+        required: true
+        default: comm-pilot
+        options:
+          - comm-pilot
+          - gov-pilot
+          - comm-dev
+          - gov-dev
+      routes:
+        description: Comma-separated routes to discover (self-skips absent routes)
+        type: string
+        required: false
+        default: openai
+      live_update:
+        description: Also `az apim nv update` the named values for instant (non-authoritative) effect
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  id-token: write        # OIDC federated token for the runner UAMI
+  contents: write        # push the discovery branch
+  pull-requests: write   # open the PR with the updated CI param file
+
+concurrency:
+  # One discovery run per env at a time; never cancel an in-flight run.
+  group: discover-${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    name: Discover model types (${{ inputs.env }})
+    # Self-hosted runner; label = env name (EMU hosted runners are disabled). VNet-injected so
+    # APIM Internal is directly reachable.
+    runs-on: [self-hosted, "${{ inputs.env }}"]
+    environment: ${{ inputs.env }}   # gates OIDC vars/secrets per env
+    timeout-minutes: 20
+    env:
+      AZURE_ENV_NAME: ${{ inputs.env }}
+      RESOURCE_GROUP: rg-copilot-byok-${{ inputs.env }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The ACA Job runner image ships azd but not az; azure/login shells out to az.
+      - name: Install Azure CLI (self-hosted runner)
+        shell: bash
+        run: |
+          if ! command -v az >/dev/null 2>&1; then
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y jq
+          fi
+
+      - name: Azure CLI login (OIDC, runner UAMI)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ startsWith(inputs.env, 'gov-') && 'AzureUSGovernment' || 'AzureCloud' }}
+
+      - name: Resolve APIM + dev subscription key
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          APIM_NAME="$(az resource list -g "$RESOURCE_GROUP" --resource-type Microsoft.ApiManagement/service --query '[0].name' -o tsv)"
+          [[ -n "$APIM_NAME" ]] || { echo "::error::cannot determine APIM name in $RESOURCE_GROUP"; exit 1; }
+          SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+          # Cloud-aware ARM endpoint (#59): hardcoding management.azure.com breaks gov.
+          ARM_ENDPOINT="$(az cloud show --query 'endpoints.resourceManager' -o tsv | sed 's:/*$::')"
+          : "${ARM_ENDPOINT:=https://management.azure.com}"
+          # APIM subscription primary key via ARM listSecrets (az apim subscription doesn't exist).
+          KEY="$(az rest --method POST \
+            --url "${ARM_ENDPOINT}/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ApiManagement/service/${APIM_NAME}/subscriptions/dev1/listSecrets?api-version=2024-05-01" \
+            --query 'primaryKey' -o tsv 2>/dev/null || true)"
+          [[ -n "$KEY" ]] || { echo "::error::could not resolve dev1 subscription key"; exit 1; }
+          echo "::add-mask::$KEY"
+          echo "BYOK_DISCOVERY_KEY=$KEY" >> "$GITHUB_ENV"
+          echo "APIM_NAME=$APIM_NAME" >> "$GITHUB_ENV"
+          echo "    APIM=$APIM_NAME"
+
+      - name: Map env -> CI param file
+        id: paramfile
+        shell: bash
+        run: |
+          case "${{ inputs.env }}" in
+            comm-pilot) f=infra/main.parameters.ci.commercial.json ;;
+            gov-pilot)  f=infra/main.parameters.ci.gov.json ;;
+            comm-dev)   f=infra/main.parameters.ci.commercial-dev.json ;;
+            gov-dev)    f=infra/main.parameters.ci.gov-dev.json ;;
+            *) echo "::error::no param-file mapping for ${{ inputs.env }}"; exit 1 ;;
+          esac
+          echo "param_file=$f" >> "$GITHUB_OUTPUT"
+
+      - name: Run discovery (scripts/discover-model-types.sh)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/discover-model-types.sh
+          ARGS=( --apim-name "$APIM_NAME" --resource-group "$RESOURCE_GROUP"
+                 --routes "${{ inputs.routes }}" --param-file "${{ steps.paramfile.outputs.param_file }}" )
+          if [[ "${{ inputs.live_update }}" == "true" ]]; then
+            ARGS+=( --also-write-named-value )
+          fi
+          ./scripts/discover-model-types.sh "${ARGS[@]}"
+
+      - name: Open PR if the capability map changed
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          f="${{ steps.paramfile.outputs.param_file }}"
+          if git diff --quiet -- "$f"; then
+            echo "No capability-map changes for ${{ inputs.env }} ($f unchanged)."
+            exit 0
+          fi
+          command -v gh >/dev/null 2>&1 || (sudo apt-get update -y && sudo apt-get install -y gh)
+          branch="chore/model-types-${{ inputs.env }}-${GITHUB_RUN_ID}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add "$f"
+          git commit -m "chore(apim): refresh model API-type map for ${{ inputs.env }} (#122)" \
+                     -m "Automated discovery via discover-model-types.yml. Merge to apply the named values on next provision."
+          git push origin "$branch"
+          # EMU orgs commonly disable "Allow GitHub Actions to create and approve pull requests",
+          # which fails `gh pr create` with a GraphQL permission error. The branch is already pushed
+          # (the valuable artifact), so treat PR auto-creation as best-effort: on failure, print the
+          # compare URL for a human/MCP to open the PR, and do NOT fail the job.
+          if ! gh pr create --base main --head "$branch" \
+            --title "chore(apim): model API-type map — ${{ inputs.env }} (#122)" \
+            --body "Automated model API-type discovery for **${{ inputs.env }}** (routes: \`${{ inputs.routes }}\`). Updates \`$f\` with the probed \`model -> [types]\` capability map. Closes the Phase 1 acceptance for #122; merge to apply on the next provision. Phase 2 policy (#120) then validates requested surface vs this map." \
+            --label roadmap 2> gh_pr_err.txt; then
+            echo "::warning::Automated PR creation blocked (likely EMU 'Actions cannot create PRs' policy): $(cat gh_pr_err.txt)"
+            echo "Branch pushed. Open the PR manually: ${{ github.server_url }}/${{ github.repository }}/compare/main...${branch}?expand=1"
+          fi

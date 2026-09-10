@@ -1,0 +1,80 @@
+{
+  "openapi": "3.0.1",
+  "info": {
+    "title": "Azure AI Foundry (BASIC profile)",
+    "version": "1.0",
+    "description": "Companion to policies/wizard-foundry-policy-basic.xml. Import this into APIM to create every operation the BASIC profile needs in one step, instead of hand-creating each Frontend form.\n\nON IMPORT: set the API URL suffix to exactly 'openai'. Copilot CLI with COPILOT_PROVIDER_TYPE=azure discards any path on the base URL and always calls <origin>/openai/..., so any other suffix is unreachable from the CLI.\n\nAFTER IMPORT:\n1. Apply wizard-foundry-policy-basic.xml at API scope (all operations inherit it).\n2. Apply wizard-foundry-policy-basic-models.xml at OPERATION scope on listModels only. It must not inherit the API policy, which parses a request body that a GET does not have.\n3. Point the API at a backend whose Runtime URL ENDS IN /openai, e.g. https://<account>.openai.azure.us/openai. Neither policy rewrites the path for inference, so the /openai has to come from the backend.\n\nRequest and response bodies are intentionally schema-free: APIM passes them through untouched and the policy does the only reshaping that happens."
+  },
+  "servers": [
+    {
+      "url": "https://REPLACE-WITH-YOUR-APIM-HOST/openai"
+    }
+  ],
+  "paths": {
+    "/v1/responses": {
+      "post": {
+        "operationId": "responses",
+        "summary": "Responses",
+        "description": "Responses API. Copilot CLI 1.0.81 was observed using this surface for gpt-5.1 with COPILOT_PROVIDER_WIRE_API unset, so it is required in practice, not optional.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "type": "object", "additionalProperties": true }
+            }
+          }
+        },
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "operationId": "chatCompletions",
+        "summary": "Chat Completions",
+        "description": "Versionless v1 chat surface. Used by VS Code and most OpenAI-compatible clients, and by Copilot CLI when COPILOT_PROVIDER_AZURE_API_VERSION is left at its default.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "type": "object", "additionalProperties": true }
+            }
+          }
+        },
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/deployments/{deployment}/chat/completions": {
+      "post": {
+        "operationId": "chatCompletionsDeployment",
+        "summary": "Chat Completions (deployment-scoped)",
+        "description": "Deployment-scoped chat surface. The Azure OpenAI SDK builds this shape when a dated api-version is configured, so create it alongside the versionless one to cover either mode.",
+        "parameters": [
+          {
+            "name": "deployment",
+            "in": "path",
+            "required": true,
+            "description": "Deployment name, e.g. gpt-5.1",
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "type": "object", "additionalProperties": true }
+            }
+          }
+        },
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "operationId": "listModels",
+        "summary": "List Models",
+        "description": "Model discovery. Copilot CLI and JetBrains AI Assistant probe this BEFORE sending any chat; without it they report \"Model '<name>' not found on provider (HTTP 404)\" even though the deployment is healthy. Needs the operation-scoped policy, not the API one.",
+        "responses": { "200": { "description": "OK" } }
+      }
+    }
+  }
+}

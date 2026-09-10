@@ -1,0 +1,408 @@
+@page "/"
+@page "/register"
+@using Byok.Register.Services
+@using Microsoft.Extensions.Options
+@inject IdentityContext Identity
+@inject GroupMembershipResolver Groups
+@inject TierResolver Tiers
+@inject IOptions<ByokOptions> Opts
+
+<PageTitle>BYOK · Self-serve register</PageTitle>
+
+<h1>Bring-Your-Own-Key — self-serve register</h1>
+
+@if (Identity.IsAuthenticated)
+{
+    <p class="who">
+        Signed in as <strong>@Identity.UserPrincipalName</strong>
+        @if (_isAdmin)
+        {
+            <span class="badge" title="Member of the BYOK Admins group">Admin</span>
+        }
+        else
+        {
+            <span class="badge badge-muted" title="Standard self-service user">User</span>
+        }
+        <button id="btn-signout" class="signout" data-signout-url="@_signOutUrl">Sign out</button>
+    </p>
+
+    <div id="signout-confirm" class="card confirm" hidden>
+        <p>
+            <strong>Sign out?</strong> You will be signed out automatically in
+            <span id="signout-count">15</span>s.
+        </p>
+        <button id="btn-signout-now" class="primary">Sign out now</button>
+        <button id="btn-signout-cancel" class="ghost">Stay signed in</button>
+    </div>
+
+    @if (_idleMinutes > 0)
+    {
+        <p id="idle-warn" class="warn" hidden>
+            You will be signed out in <span id="idle-count"></span>s. Move the mouse or press a key
+            to stay signed in.
+        </p>
+    }
+
+    <section class="card">
+        <h2>What you'll do</h2>
+        <ol>
+            <li>Get your subscription key (below) — it is shown <strong>once</strong>.</li>
+            <li>Download the installer and run it. It writes your VS&nbsp;Code config and the
+                Copilot&nbsp;CLI environment variables.</li>
+            <li>Reload VS&nbsp;Code, then <strong>re-enter the key in the VS&nbsp;Code UI</strong>.
+                This step is easy to skip and is the most common reason BYOK appears broken.</li>
+            <li>Pick a <strong>BYOK</strong> model in chat and send a message.</li>
+        </ol>
+    </section>
+
+    <section class="card">
+        <h2>1 · Get your key</h2>
+        <p>
+            Click below to provision (or re-fetch) your personal APIM subscription. The key is
+            shown <strong>once</strong> — copy it now, or just download the config/installer below
+            (the key is baked into both).
+        </p>
+        <button id="btn-register" class="primary">Register / get my key</button>
+        <button id="btn-regenerate" class="ghost" hidden>Regenerate key</button>
+
+        <div id="result" hidden>
+            <dl>
+                <dt>Tier (product)</dt><dd id="r-tier"></dd>
+                <dt>Gateway</dt><dd id="r-base"></dd>
+            </dl>
+            <label>Your key (shown once)</label>
+            <div class="keyrow">
+                <code id="r-key"></code>
+                <button id="btn-copy" class="ghost">Copy</button>
+            </div>
+            <p class="warn">⚠ You won't see this key again. It's also embedded in the downloads below.</p>
+        </div>
+
+        <p id="error" class="error" hidden></p>
+    </section>
+
+    <section class="card">
+        <h2>2 · Install locally</h2>
+        <p>
+            The installer merges your config into VS&nbsp;Code (<code>chatLanguageModels.json</code> +
+            <code>settings.json</code>) and the Copilot&nbsp;CLI environment, without clobbering your
+            other settings. Re-running is safe.
+        </p>
+        <div class="row">
+            <label for="os">Installer for</label>
+            <select id="os">
+                <option value="win">Windows (PowerShell)</option>
+                <option value="mac">macOS (bash/zsh)</option>
+                <option value="linux">Linux (bash)</option>
+            </select>
+            <button id="btn-installer" class="primary">Download installer</button>
+            <button id="btn-config" class="ghost">Download chatLanguageModels.json only</button>
+        </div>
+        <p class="hint">
+            <strong>Windows:</strong> the browser marks downloaded files as web content, so
+            PowerShell refuses to run the script until you clear that mark. From the folder you
+            downloaded it to:
+        </p>
+        <pre class="hint"><code>Unblock-File .\Use-Byok.ps1
+pwsh -File .\Use-Byok.ps1</code></pre>
+        <p class="hint">
+            Without the first line you get
+            <em>"cannot be loaded ... is not digitally signed"</em>. If your machine policy still
+            blocks it, run <code>pwsh -ExecutionPolicy Bypass -File .\Use-Byok.ps1</code>, which
+            applies to that one process only. The installer needs PowerShell&nbsp;7
+            (<code>pwsh</code>), not Windows&nbsp;PowerShell&nbsp;5.
+        </p>
+        <p class="hint">
+            <strong>macOS / Linux:</strong>
+            <code>chmod +x use-byok.sh && ./use-byok.sh</code>
+        </p>
+        <p class="hint">
+            Then reload VS&nbsp;Code and open a <strong>new</strong> terminal so the
+            <code>COPILOT_PROVIDER_*</code> variables load.
+        </p>
+    </section>
+
+    <section class="card">
+        <h2>3 · Set the key in VS&nbsp;Code</h2>
+        <p>
+            <strong>Do this even though the key is already in the file.</strong> VS&nbsp;Code keeps
+            its own copy of each provider's API key in secret storage, and when one exists it sends
+            that instead of the <code>apiKey</code> in <code>chatLanguageModels.json</code>. If you
+            have used this provider before, or you just regenerated your key, VS&nbsp;Code will keep
+            sending the old one and the gateway will reject it.
+        </p>
+        <ol class="hint">
+            <li>Run <em>Chat: Manage Language Models</em> from the Command Palette.</li>
+            <li>Select the gear icon next to the <strong>BYOK</strong> provider.</li>
+            <li>Paste the subscription key from step&nbsp;1.</li>
+        </ol>
+        <p class="hint">
+            Symptom if you skip it:
+            <em>"Access denied due to invalid subscription key"</em> — which means a key <em>was</em>
+            sent and matched nothing, as opposed to <em>"missing subscription key"</em> when none was
+            sent at all. A correct-looking config file does not rule this out.
+        </p>
+    </section>
+
+    <section class="card">
+        <h2>4 · Manage your access</h2>
+        <p>
+            Revoking disables your personal APIM subscription so your current key stops working
+            immediately. You can re-register above at any time to get a fresh key.
+        </p>
+        <button id="btn-revoke-self" class="danger">Revoke my key</button>
+        <p id="revoke-self-result" class="hint" hidden></p>
+    </section>
+
+    @if (_isAdmin)
+    {
+        <section class="card admin">
+            <h2>Admin · Offboard a developer</h2>
+            <p>
+                Admin-only — you're in the <strong>BYOK Admins</strong> group. Revoke another
+                developer's APIM subscription by their sign-in name (UPN), e.g. when they leave
+                the team. Non-admins never see this panel.
+            </p>
+            <div class="row">
+                <input id="adm-upn" type="email" placeholder="dev@contoso.com" />
+                <button id="btn-offboard" class="danger">Revoke developer</button>
+            </div>
+            <p id="adm-result" class="hint" hidden></p>
+        </section>
+    }
+}
+else
+{
+    <p class="who">You're not signed in. Sign-in is handled by Entra Easy Auth in the deployed
+    environment; if you're seeing this locally, run behind the gateway to authenticate.</p>
+}
+
+<script>
+    (function () {
+        const $ = (id) => document.getElementById(id);
+        const reg = $('btn-register');
+        if (!reg) return; // anonymous view
+
+        let lastKey = '';
+
+        function showError(msg) {
+            const e = $('error');
+            e.textContent = msg;
+            e.hidden = false;
+        }
+        function clearError() { $('error').hidden = true; }
+
+        async function provision(url) {
+            clearError();
+            const resp = await fetch(url, { method: 'POST', headers: { 'Accept': 'application/json' } });
+            if (resp.status === 401) { showError('Not authenticated. Please sign in and retry.'); return null; }
+            if (!resp.ok) { showError('Request failed (HTTP ' + resp.status + ').'); return null; }
+            return await resp.json();
+        }
+
+        reg.addEventListener('click', async () => {
+            reg.disabled = true;
+            const data = await provision('/api/register');
+            reg.disabled = false;
+            if (!data) return;
+            lastKey = data.primaryKey;
+            $('r-tier').textContent = data.productId;
+            $('r-base').textContent = data.baseUrl;
+            $('r-key').textContent = data.primaryKey;
+            $('result').hidden = false;
+            $('btn-regenerate').hidden = false;
+        });
+
+        $('btn-regenerate').addEventListener('click', async () => {
+            const data = await provision('/api/regenerate');
+            if (!data) return;
+            lastKey = data.primaryKey;
+            $('r-key').textContent = data.primaryKey;
+        });
+
+        $('btn-copy').addEventListener('click', async () => {
+            try { await navigator.clipboard.writeText(lastKey); $('btn-copy').textContent = 'Copied'; }
+            catch { showError('Clipboard blocked — select the key and copy manually.'); }
+        });
+
+        $('btn-installer').addEventListener('click', () => {
+            window.location.href = '/api/installer?os=' + encodeURIComponent($('os').value);
+        });
+        $('btn-config').addEventListener('click', () => {
+            window.location.href = '/api/config';
+        });
+
+        const revokeSelf = $('btn-revoke-self');
+        if (revokeSelf) {
+            revokeSelf.addEventListener('click', async () => {
+                if (!confirm('Revoke your key? Your current key will stop working immediately.')) return;
+                const out = $('revoke-self-result');
+                revokeSelf.disabled = true;
+                try {
+                    const resp = await fetch('/api/revoke', { method: 'POST', headers: { 'Accept': 'application/json' } });
+                    if (!resp.ok) { out.textContent = 'Revoke failed (HTTP ' + resp.status + ').'; }
+                    else { const d = await resp.json(); out.textContent = d.revoked ? 'Your key was revoked.' : 'No active subscription to revoke.'; }
+                } catch { out.textContent = 'Revoke failed (network error).'; }
+                out.hidden = false;
+                revokeSelf.disabled = false;
+            });
+        }
+
+        const offboard = $('btn-offboard');
+        if (offboard) {
+            offboard.addEventListener('click', async () => {
+                const upn = ($('adm-upn').value || '').trim();
+                const out = $('adm-result');
+                if (!upn) { out.textContent = 'Enter the developer\u2019s UPN first.'; out.hidden = false; return; }
+                if (!confirm('Revoke ' + upn + '\u2019s key? Their key will stop working immediately.')) return;
+                offboard.disabled = true;
+                try {
+                    const resp = await fetch('/api/revoke?upn=' + encodeURIComponent(upn), { method: 'POST', headers: { 'Accept': 'application/json' } });
+                    if (resp.status === 403) { out.textContent = 'Forbidden \u2014 admin group membership required.'; }
+                    else if (!resp.ok) { out.textContent = 'Revoke failed (HTTP ' + resp.status + ').'; }
+                    else { const d = await resp.json(); out.textContent = d.revoked ? ('Revoked ' + d.upn + '.') : ('No active subscription found for ' + d.upn + '.'); }
+                } catch { out.textContent = 'Revoke failed (network error).'; }
+                out.hidden = false;
+                offboard.disabled = false;
+            });
+        }
+    })();
+
+    // Sign-out and idle sign-out (#136). One shared exit path, because the page shows a live
+    // subscription key and both routes must clear it before navigating - the redirect is not
+    // instant and the key element is the sensitive artifact.
+    //
+    // Deliberate asymmetry: the button ASKS (and proceeds on its own if unanswered, so an
+    // abandoned click still ends the session); the idle timeout does NOT ask. A security control
+    // must not wait on a user who has already walked away.
+    //
+    // The destination comes from the button's data-signout-url (server-built) rather than a JS
+    // literal: Razor HTML-encodes inside <script>, which would turn the query string's & into &amp;.
+    (function () {
+        const SIGNOUT_GRACE_S = 15;
+
+        function signOutUrl() {
+            const b = document.getElementById('btn-signout');
+            return (b && b.dataset.signoutUrl) ? b.dataset.signoutUrl : '/.auth/logout';
+        }
+
+        function doSignOut() {
+            const key = document.getElementById('r-key');
+            if (key) { key.textContent = ''; }
+            const result = document.getElementById('result');
+            if (result) { result.hidden = true; }
+
+            const url = signOutUrl();
+            if (url.charAt(0) === '/') { window.location.href = url; return; }
+
+            // Entra must be visited EXACTLY ONCE. /.auth/logout clears the cookie and then runs its
+            // own Entra logout with no logout_hint; chaining it after the hinted logout left Entra
+            // asking "which account do you want to sign out of?" with an empty list, because the
+            // session was already gone. So clear the cookie here WITHOUT following that redirect,
+            // then go to Entra once. redirect:'manual' still applies the Set-Cookie that clears it.
+            fetch('/.auth/logout', { credentials: 'include', redirect: 'manual', cache: 'no-store' })
+                .catch(function () { /* ignore - the navigation below still ends the Entra session */ })
+                .then(function () { window.location.href = url; });
+        }
+
+        // --- explicit sign out: confirm, but proceed anyway if unanswered ---
+        const btn = document.getElementById('btn-signout');
+        const panel = document.getElementById('signout-confirm');
+        if (btn && panel) {
+            const count = document.getElementById('signout-count');
+            let graceTick, graceTimer;
+
+            function stopGrace() {
+                clearInterval(graceTick); clearTimeout(graceTimer);
+                panel.hidden = true;
+            }
+
+            btn.addEventListener('click', () => {
+                let left = SIGNOUT_GRACE_S;
+                count.textContent = left;
+                panel.hidden = false;
+                graceTick = setInterval(() => {
+                    left -= 1;
+                    count.textContent = left > 0 ? left : 0;
+                }, 1000);
+                graceTimer = setTimeout(doSignOut, SIGNOUT_GRACE_S * 1000);
+            });
+
+            document.getElementById('btn-signout-now').addEventListener('click', doSignOut);
+            document.getElementById('btn-signout-cancel').addEventListener('click', stopGrace);
+        }
+
+        // --- idle sign out: no confirmation ---
+        const idleMs = @(_idleMinutes) * 60 * 1000;
+        if (!idleMs) return;
+        const warnMs = Math.min(60000, Math.floor(idleMs / 3));
+        const warn = document.getElementById('idle-warn');
+        const count = document.getElementById('idle-count');
+        let idleTimer, warnTimer, tick;
+
+        function startWarning() {
+            if (!warn || !count) { return; }
+            let left = Math.floor(warnMs / 1000);
+            count.textContent = left;
+            warn.hidden = false;
+            tick = setInterval(() => {
+                left -= 1;
+                count.textContent = left > 0 ? left : 0;
+            }, 1000);
+        }
+
+        function reset() {
+            clearTimeout(idleTimer); clearTimeout(warnTimer); clearInterval(tick);
+            if (warn) { warn.hidden = true; }
+            warnTimer = setTimeout(startWarning, idleMs - warnMs);
+            idleTimer = setTimeout(doSignOut, idleMs);
+        }
+
+        ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll', 'focus'].forEach(
+            e => window.addEventListener(e, reset, { passive: true }));
+        reset();
+    })();
+</script>
+
+@code {
+    private const string EasyAuthLogout = "/.auth/logout";
+
+    private bool _isAdmin;
+    private int _idleMinutes;
+    private string _signOutUrl = EasyAuthLogout;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _idleMinutes = Math.Max(0, Opts.Value.SessionIdleTimeoutMinutes);
+        _signOutUrl = BuildSignOutUrl();
+
+        if (Identity.IsAuthenticated && !string.IsNullOrEmpty(Identity.ObjectId))
+        {
+            var groupIds = await Groups.GetEffectiveGroupIdsAsync();
+            _isAdmin = Tiers.IsAdmin(groupIds);
+        }
+    }
+
+    // Sign out via Entra's end_session endpoint, passing logout_hint so it does not stop to ask
+    // which account to sign out of. The Easy Auth cookie is cleared separately by the caller,
+    // BEFORE this runs - deliberately no post_logout_redirect_uri back to /.auth/logout, because
+    // that made Easy Auth run a second, hint-less Entra logout and Entra then rendered an empty
+    // account picker. Landing on Entra's own "you are signed out" page keeps it to one visit.
+    // Falls back to plain /.auth/logout whenever anything needed is missing (no login_hint claim,
+    // no request context), so sign-out never depends on this succeeding.
+    private string BuildSignOutUrl()
+    {
+        var o = Opts.Value;
+        var hint = Identity.LoginHint;
+
+        if (string.IsNullOrEmpty(hint) ||
+            string.IsNullOrEmpty(o.EntraLoginHost) ||
+            string.IsNullOrEmpty(o.TenantId))
+        {
+            return EasyAuthLogout;
+        }
+
+        return $"https://{o.EntraLoginHost}/{o.TenantId}/oauth2/v2.0/logout" +
+               $"?logout_hint={Uri.EscapeDataString(hint)}";
+    }
+}

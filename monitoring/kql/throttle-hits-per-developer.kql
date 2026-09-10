@@ -1,0 +1,51 @@
+// Throttle hits (HTTP 429) per developer over the last 24h, broken down by WHICH
+// throttle fired.
+//
+// WHY GATEWAY LOGS (not customMetrics): the inbound `copilot_byok_request` metric is
+// emitted BEFORE the three throttle policies run, so a rejected call still counts as a
+// request and customMetrics cannot see the 429. The gateway log, by contrast, records
+// the final ResponseCode AND the policy that produced it (LastErrorSource), so it is the
+// only place a throttle rejection is visible per developer.
+//
+// The three throttles all return 429; LastErrorSource tells them apart:
+//   rate-limit-by-key         -> burst (calls/min) exceeded
+//   azure-openai-token-limit  -> TPM (tokens/min) cost guard exceeded  <- the AI-cost limit
+//   quota-by-key              -> monthly call ceiling exceeded
+//
+// DEVELOPER IDENTITY: in subscriptionKey mode (default) the per-developer key is the APIM
+// subscription, surfaced here as ApimSubscriptionId. In jwt mode there are no subscriptions
+// (identity is the Entra oid, which is not in gateway logs) — see the note at the bottom.
+ApiManagementGatewayLogs
+| where TimeGenerated > ago(24h)
+| where ApiId in ("copilot-byok-aoai", "copilot-byok-foundry")
+| where ResponseCode == 429
+| extend
+    developerSub = tostring(ApimSubscriptionId),
+    throttle = case(
+        LastErrorSource has "rate-limit-by-key", "burst (calls/min)",
+        LastErrorSource has "azure-openai-token-limit", "AI-cost guard (tokens/min)",
+        LastErrorSource has "quota-by-key", "monthly call quota",
+        strcat("other: ", LastErrorSource))
+| summarize hits = count() by bin(TimeGenerated, 1h), developerSub, throttle
+| order by TimeGenerated asc, hits desc
+
+// ---------------------------------------------------------------------------------------
+// jwt mode: gateway logs have no Entra oid, so the query above cannot attribute 429s per
+// developer. Instead the jwt API policies emit a dedicated `copilot_byok_throttled` metric
+// from their <on-error> path (keyed on the developer's oid, set before the throttles run).
+// Use THIS query when authMode = jwt:
+//
+// customMetrics
+// | where timestamp > ago(24h)
+// | where name == "copilot_byok_throttled"
+// | extend
+//     developer = tostring(customDimensions["developer_upn"]),
+//     oid       = tostring(customDimensions["developer_oid"]),
+//     model     = tostring(customDimensions["deployment_name"]),
+//     throttle  = tostring(customDimensions["throttle"])   // burst | tokens | quota | other
+// | summarize hits = sum(value) by bin(timestamp, 1h), developer, throttle
+// | order by timestamp asc, hits desc
+//
+// (subscriptionKey mode does NOT emit copilot_byok_throttled — its throttles live at product
+// scope and 429s are already attributable via ApimSubscriptionId in the gateway-log query above.)
+

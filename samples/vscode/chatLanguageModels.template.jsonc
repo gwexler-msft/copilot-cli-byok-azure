@@ -1,0 +1,211 @@
+// =====================================================================
+// VS Code 1.122+ Custom Endpoint provider - chatLanguageModels.json
+// =====================================================================
+// VS Code asks you to fill out this file when you go through
+//   Command Palette -> "Chat: Manage Language Models" ->
+//   "Add Models" -> "Custom Endpoint".
+//
+// The schema is provider-wrapped: each top-level object is ONE provider
+// group (one apiType, one set of credentials), and the `models[]` array
+// inside lists the deployments served by that provider. Because apiType
+// is provider-level, exposing the SAME backend through both
+// chat-completions AND responses needs TWO provider blocks.
+//
+// Replace BEFORE saving:
+//   <APIM_HOSTNAME>          e.g. apim-byok-gov-pilot-<suffix>.azure-api.us
+//   <APIM_SUBSCRIPTION_KEY>  per-developer key from APIM > Subscriptions
+//
+// The key goes IN this file. VS Code's documented "apiKey": "${input:...}" form does NOT resolve
+// here - verified 2026-08-07: no prompt appeared, VS Code sent the literal token and APIM rejected
+// it (see issue #129). Also note VS Code keeps its own per-provider key in secret storage and sends
+// THAT in preference to the apiKey below, so if chat returns "invalid subscription key" against a
+// config that looks correct, update it via Chat: Manage Language Models -> gear icon.
+// ("invalid" = a key was sent and matched nothing; "missing" = none was sent at all.)
+//
+// API path picker:
+//   Foundry (default backend, recommended) -> /openai/v1/{chat/completions,responses}
+//   Legacy AOAI (deployAoai=true)          -> /aoai/v1/{chat/completions,responses}
+//   Anthropic / Claude (deployAnthropicRoute=true):
+//     apiType "messages"     -> /anthropic/v1/messages   (native wire format; streaming OK)
+//     Claude is NOT served on the OpenAI chat-completions surface - asking for a Claude model
+//     there returns a typed 400 WireFormatMismatch. The gateway explains; it never reshapes.
+//   Commercial-hosted models (deployFoundryCommercial=true) need NO separate URL: the gateway
+//   picks the commercial backend per request when the model matches the commercialModels
+//   sentinel, so keep using /openai (or /anthropic) and just ask for the model by name.
+// =====================================================================
+[
+  {
+    // -------- Provider 1: Chat Completions legacy examples --------
+    // `name` is the GROUP label shown in the model picker and
+    // Language Models editor; pick something the developer recognises.
+    "name": "BYOK Foundry (chat/completions legacy)",
+
+    // `vendor` selects VS Code's built-in Custom Endpoint provider.
+    "vendor": "customendpoint",
+
+    // `apiType` is provider-level. Wire format VS Code emits:
+    //   chat-completions -> OpenAI /chat/completions schema
+    //   responses        -> OpenAI /responses schema
+    //   messages         -> Anthropic /messages schema
+    "apiType": "chat-completions",
+
+    // `apiKey` is provider-level and IS stored in VS Code's encrypted
+    // secret storage. VS Code sends it as `Authorization: Bearer` by
+    // default (which APIM doesn't read) UNLESS the model `url` contains
+    // the literal substring `openai.azure`, in which case it sends the
+    // decrypted key as the `api-key` header APIM validates. We trigger
+    // that path via the `?_vscodeauth=openai.azure` query param on each
+    // model url below - see repo issue #96
+    // (https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/96).
+    // This lets us keep a single apiKey and DROP the plaintext per-model
+    // requestHeaders duplication that previously leaked the key to disk.
+    // In jwt mode, set apiKey to a fresh Entra access token instead
+    // (VS Code does not refresh JWTs - they're good for ~1 hour).
+    "apiKey": "<APIM_SUBSCRIPTION_KEY>",
+
+    "models": [
+      {
+        // `id` is what VS Code puts in the request body's `model` field.
+        // For this gateway it must match a Foundry/AOAI deployment name.
+        // Legacy compatibility example. Current GPT-5.6 deployments belong in the
+        // Responses provider below so reasoning and VS Code agent tools can coexist.
+        "id": "gpt-5.1",
+
+        // `name` is the label shown inside the picker.
+        "name": "BYOK gpt-5.1",
+
+        // `url` is the full request URL. Path determines the wire format,
+        // so it MUST line up with the provider-level apiType above.
+        // The trailing `?_vscodeauth=openai.azure` is a WORKAROUND for a
+        // VS Code bug (issue #96): the Custom Endpoint provider only sends
+        // the decrypted apiKey as the `api-key` header APIM reads when the
+        // URL contains the literal substring `openai.azure` - otherwise it
+        // sends `Authorization: Bearer`, which APIM ignores. The param NAME
+        // is arbitrary; only the `openai.azure` token matters. APIM and the
+        // backend ignore the unknown param.
+        "url": "https://<APIM_HOSTNAME>/openai/v1/chat/completions?_vscodeauth=openai.azure",
+
+        // requestHeaders is left here (commented out) for reference only.
+        // We previously duplicated the key as a plaintext `api-key` header,
+        // but that leaks the key to disk and is no longer needed with the
+        // URL workaround above. See issue #96.
+        // "requestHeaders": { "api-key": "<APIM_SUBSCRIPTION_KEY>" },
+
+        // Capability flags. Must reflect what the model truly supports;
+        // tool-calling=false hides the model from agentic chat entirely.
+        "toolCalling": true,
+        "vision": false,
+        "thinking": false,
+
+        // Reasoning effort levels offered in the picker. gpt-5.x accepts
+        // these; legacy 4.x families ignore the field. ARRAY of strings,
+        // not a boolean - VS Code silently ignores a boolean value.
+        "supportsReasoningEffort": ["minimal", "low", "medium", "high"],
+
+        // Body shape used to forward reasoning effort. MUST match the
+        // surface in `url`:
+        //   chat-completions -> root field { "reasoning_effort": "..." }
+        //   responses        -> nested      { "reasoning": { "effort": "..." } }
+        // Mismatch silently strips the field; the model runs at default effort.
+        "reasoningEffortFormat": "chat-completions",
+
+        "streaming": true,
+
+        // Context-window tuning. The gateway's auto-route safe defaults:
+        //   maxInputTokens  = 272000 (gpt-5.1 prompt cap)
+        //   maxOutputTokens = 32768  (shared output ceiling)
+        "maxInputTokens": 272000,
+        "maxOutputTokens": 32768,
+
+        // True suppresses VS Code's GitHub-data-handling banner because the
+        // gateway already enforces ZDR via the private AOAI/Foundry account.
+        // Also affects /responses behaviour: when true, previous_response_id
+        // is NOT sent (so conversations are stateless on the gateway).
+        "zeroDataRetentionEnabled": true
+      },
+      {
+        "id": "gpt-4.1-mini",
+        "name": "BYOK gpt-4.1-mini",
+        "url": "https://<APIM_HOSTNAME>/openai/v1/chat/completions?_vscodeauth=openai.azure",
+        // "requestHeaders": { "api-key": "<APIM_SUBSCRIPTION_KEY>" },  // not needed - see issue #96
+        "toolCalling": true,
+        "vision": false,
+        "streaming": true,
+        "maxInputTokens": 128000,
+        "maxOutputTokens": 32768,
+        "zeroDataRetentionEnabled": true
+      }
+    ]
+  },
+  {
+    // -------- Provider 2: Responses surface --------
+    // Same APIM, same key, same backend - just a second provider block
+    // because apiType is provider-level. Most reasoning models prefer
+    // Responses; non-reasoning models work best on chat-completions.
+    // GPT-5.6 and later MUST go here for VS Code agent use: Chat Completions
+    // cannot combine their reasoning with the function tools VS Code sends.
+    "name": "BYOK Foundry (responses)",
+    "vendor": "customendpoint",
+    "apiType": "responses",
+    "apiKey": "<APIM_SUBSCRIPTION_KEY>",
+    "models": [
+      {
+        "id": "gpt-5.6-sol",
+        "name": "BYOK gpt-5.6-sol",
+        "url": "https://<APIM_HOSTNAME>/openai/v1/responses?_vscodeauth=openai.azure",
+        // "requestHeaders": { "api-key": "<APIM_SUBSCRIPTION_KEY>" },  // not needed - see issue #96
+        "toolCalling": true,
+        "vision": false,
+        "thinking": true,
+        "supportsReasoningEffort": ["none", "low", "medium", "high", "xhigh", "max"],
+        "reasoningEffortFormat": "responses",
+        "streaming": true,
+        "maxInputTokens": 1050000,
+        "maxOutputTokens": 128000,
+        "zeroDataRetentionEnabled": true
+      }
+    ]
+  },
+  {
+    // -------- Provider 3: Anthropic Messages surface (Claude via the /anthropic route) --------
+    // Claude models speak the Anthropic Messages API, NOT OpenAI chat/completions, so they need
+    // their OWN provider block (apiType is provider-level). apiType "messages" makes VS Code emit
+    // the native Anthropic wire format and POST it to the /anthropic route's /v1/messages
+    // operation, which forwards the body untouched. Streaming IS supported - APIM relays SSE
+    // unbuffered, so no proxy or transcoder is involved.
+    //
+    // Requires deployAnthropicRoute=true, plus a Claude deployment on the commercial Foundry
+    // (deployFoundryCommercial=true) whose model name is listed in commercialModels - that
+    // sentinel is what points the request at the commercial backend. /anthropic is a second WIRE
+    // FORMAT, not a second backend or a second credential: same subscription key, same product
+    // tier, same quotas and telemetry as /openai.
+    //
+    // Do NOT point a Claude model at the chat-completions provider above - /openai returns a typed
+    // 400 WireFormatMismatch for Anthropic models instead of translating the request.
+    "name": "BYOK Foundry (Anthropic Messages / Claude)",
+    "vendor": "customendpoint",
+    "apiType": "messages",
+    "apiKey": "<APIM_SUBSCRIPTION_KEY>",
+    "models": [
+      {
+        // Must match a Claude deployment name on the COMMERCIAL Foundry account, and that name
+        // must appear in commercialModels.
+        "id": "claude-sonnet-5",
+        "name": "BYOK Claude Sonnet 5",
+        // NOTE: no ?_vscodeauth=openai.azure here. That trick (issue #96) forces the key into the
+        // `api-key` header, which is what the /openai route declares. The /anthropic API declares
+        // `x-api-key` instead - the native Anthropic credential header that apiType "messages"
+        // already sends - so the key validates as-is. VERIFY LIVE: if your VS Code build sends
+        // Authorization: Bearer instead, use jwt mode or the subkey proxy (#108).
+        "url": "https://<APIM_HOSTNAME>/anthropic/v1/messages",
+        "toolCalling": true,
+        "vision": false,
+        "thinking": false,
+        "streaming": true,
+        "maxInputTokens": 200000,
+        "maxOutputTokens": 64000,
+        "zeroDataRetentionEnabled": true
+      }
+    ]
+  }
+]

@@ -1,0 +1,20 @@
+// Token usage per deployment (model) over the last 7 days.
+//
+// Two metric families are unioned on purpose:
+//   * "Prompt Tokens" / "Completion Tokens" -- APIM's built-in `llm-emit-token-metric` (#126).
+//     Covers OpenAI chat-completions and Responses, STREAMED and non-streamed.
+//   * copilot_byok_*_tokens -- retained ONLY for Anthropic/Claude traffic on the commercial route,
+//     because the built-in policy supports the Anthropic Messages schema on v2 tiers only and
+//     Azure Government runs classic tiers. Non-streaming only (an outbound body read can't see SSE).
+// They never both fire for the same request, so summing is safe.
+//
+// NOTE: data from before the #126 migration undercounts streaming traffic, which the old
+// hand-rolled pair could not observe at all.
+customMetrics
+| where timestamp > ago(7d)
+| where name in ("Prompt Tokens","Completion Tokens","copilot_byok_prompt_tokens","copilot_byok_completion_tokens")
+| extend
+    model = tostring(customDimensions["deployment_name"]),
+    kind  = iff(name in ("Prompt Tokens","copilot_byok_prompt_tokens"), "prompt", "completion")
+| summarize tokens = sum(value) by bin(timestamp, 1d), model, kind
+| order by timestamp asc

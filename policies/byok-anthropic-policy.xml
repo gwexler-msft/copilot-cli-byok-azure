@@ -1,0 +1,421 @@
+<policies>
+  <inbound>
+    <base />
+
+    <!-- ===== NATIVE ANTHROPIC MESSAGES ROUTE (Entra JWT) ===========================
+         Path '<ANTHROPIC_API_PATH>' (default 'anthropic'), single operation POST /v1/messages.
+
+         WHY A SEPARATE API. A client configured with COPILOT_PROVIDER_TYPE=anthropic speaks
+         the native Anthropic Messages wire format and sends its credential as 'x-api-key',
+         or as 'Authorization: Bearer' when COPILOT_PROVIDER_BEARER_TOKEN is set. The /openai
+         route expects the credential in 'api-key'. This route is the second front door for
+         that client shape: SAME identity model, SAME product tier, SAME telemetry.
+
+         NO WIRE TRANSLATION BY DESIGN. The client declares its format; the gateway validates
+         and explains. An OpenAI shaped body arriving here is rejected with a typed 400 that
+         names the fix, rather than being silently reshaped.
+         ============================================================================ -->
+
+    <!-- 1. Pull the Entra JWT. BEARER_TOKEN mode sends 'Authorization: Bearer <jwt>' and drops
+         x-api-key; API_KEY mode sends the token in 'x-api-key'. Accept either. -->
+    <set-variable name="incomingApiKey" value="@{
+        var auth = context.Request.Headers.GetValueOrDefault("Authorization","");
+        if (!string.IsNullOrEmpty(auth)) {
+            return auth.StartsWith("Bearer ", System.StringComparison.OrdinalIgnoreCase) ? auth.Substring(7).Trim() : auth.Trim();
+        }
+        return context.Request.Headers.GetValueOrDefault("x-api-key","");
+    }" />
+
+    <choose>
+      <when condition="@(string.IsNullOrEmpty((string)context.Variables["incomingApiKey"]))">
+        <return-response>
+          <set-status code="401" reason="Missing Entra token" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>{"error":{"type":"authentication_error","code":"MissingCredential","message":"Missing credential. Set COPILOT_PROVIDER_BEARER_TOKEN (sent as 'Authorization: Bearer') or COPILOT_PROVIDER_API_KEY (sent as 'x-api-key') to an Entra JWT minted via 'az account get-access-token --resource {{api-app-id-uri}}'."}}</set-body>
+        </return-response>
+      </when>
+    </choose>
+
+    <!-- 2. Normalise to an Authorization Bearer header so validate-jwt can read it. -->
+    <set-header name="Authorization" exists-action="override">
+      <value>@("Bearer " + (string)context.Variables["incomingApiKey"])</value>
+    </set-header>
+
+    <!-- 3. Validate the JWT against Entra OIDC metadata. Audience and scope must match. -->
+    <validate-jwt header-name="Authorization"
+                  failed-validation-httpcode="401"
+                  failed-validation-error-message="Unauthorized: invalid Entra token."
+                  require-scheme="Bearer"
+                  require-signed-tokens="true"
+                  output-token-variable-name="parsedJwt">
+      <openid-config url="{{entra-openid-config-url}}" />
+      <audiences>
+        <audience>{{api-audience}}</audience>
+      </audiences>
+      <required-claims>
+        <claim name="scp" match="any">
+          <value>{{required-scope}}</value>
+        </claim>
+      </required-claims>
+    </validate-jwt>
+
+    <!-- 4. Developer identity for telemetry. -->
+    <set-variable name="developerOid" value="@(((Jwt)context.Variables["parsedJwt"]).Claims.GetValueOrDefault("oid", "unknown"))" />
+    <set-variable name="developerUpn" value="@(((Jwt)context.Variables["parsedJwt"]).Claims.GetValueOrDefault("preferred_username", ((Jwt)context.Variables["parsedJwt"]).Claims.GetValueOrDefault("upn", "unknown")))" />
+
+    <!-- 5. Requested model. A native Messages request always carries it in the body; there is
+         no deployment scoped URL form on this surface. -->
+    <set-variable name="deploymentName" value="@{
+        try {
+            var body = context.Request.Body?.As<JObject>(preserveContent: true);
+            return (string)(body?["model"]?.ToString()) ?? "unknown";
+        } catch { return "unknown"; }
+    }" />
+
+    <!-- 5a. Guard: fail fast with 400 if we could not read a model name from the body. -->
+    <choose>
+      <when condition="@(string.IsNullOrEmpty((string)context.Variables["deploymentName"]) || (string)context.Variables["deploymentName"] == "unknown")">
+        <return-response>
+          <set-status code="400" reason="Could not determine model from request body" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>{"error":{"type":"invalid_request_error","code":"ModelNotSpecified","message":"Could not parse a 'model' field from the JSON request body. This route expects a native Anthropic Messages body, e.g. {\"model\":\"&lt;deployment&gt;\",\"max_tokens\":1024,\"messages\":[...]}. (A common cause is shell quote mangling of the JSON payload.)"}}</set-body>
+        </return-response>
+      </when>
+    </choose>
+
+    <!-- 5b. WIRE FORMAT VALIDATION (the "explain, do not reshape" half of the decision).
+         An OpenAI chat/completions body and an Anthropic Messages body both carry a
+         'messages' array, so we detect only UNAMBIGUOUS OpenAI-only signals: a system role
+         message (Anthropic hoists system to a top level field and rejects the role), or any
+         OpenAI-only sampling/telemetry field. None of these can appear in a valid Anthropic
+         request, so a hit means the caller is pointed at the wrong route. Degrades to
+         "allow" on any parse error so a malformed body is answered by the backend, not by us. -->
+    <set-variable name="looksOpenAi" value="@{
+        try {
+            var body = context.Request.Body?.As<JObject>(preserveContent: true);
+            if (body == null) { return false; }
+            foreach (var f in new[] { "frequency_penalty", "presence_penalty", "stream_options", "max_completion_tokens", "logprobs", "top_logprobs", "n" }) {
+                if (body[f] != null) { return true; }
+            }
+            var msgs = body["messages"] as JArray;
+            if (msgs != null) {
+                foreach (var m in msgs) {
+                    var roleTok = m["role"];
+                    if (roleTok != null && ((string)roleTok).ToLowerInvariant() == "system") { return true; }
+                }
+            }
+            return false;
+        } catch { return false; }
+    }" />
+    <choose>
+      <when condition="@((bool)context.Variables["looksOpenAi"])">
+        <return-response>
+          <set-status code="400" reason="OpenAI-shaped body on the Anthropic route" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>{"error":{"type":"invalid_request_error","code":"WireFormatMismatch","message":"This endpoint serves the NATIVE Anthropic Messages API, but the request body is OpenAI chat/completions shaped (it contains a system role message and/or OpenAI-only fields such as frequency_penalty, presence_penalty, stream_options, max_completion_tokens, logprobs, top_logprobs or n). This gateway validates wire formats and does not silently convert between them. Fix: to send Anthropic Messages, hoist the system prompt to the top level 'system' field, include 'max_tokens', and drop the OpenAI-only fields. To keep sending OpenAI bodies, point the client at the '/openai' route instead (Copilot CLI: COPILOT_PROVIDER_TYPE=azure or openai). See docs/architecture.md.","expected_format":"anthropic.messages","alternate_route":"/openai"}}</set-body>
+        </return-response>
+      </when>
+    </choose>
+
+    <!-- 5c. Backend selection (#118 sentinel, identical semantics to the /openai route). If
+         the requested model is listed in {{commercial-models}} the request goes to the
+         COMMERCIAL Foundry backend cross cloud; otherwise it stays on the private Foundry.
+         '__none__'/empty keeps the commercial branch fully inert. -->
+    <set-variable name="isCommercialModel" value="@{
+        var list = "{{commercial-models}}";
+        if (string.IsNullOrWhiteSpace(list) || list == "__none__") { return false; }
+        var model = ((string)context.Variables["deploymentName"]).Trim().ToLowerInvariant();
+        return list.Split(new[]{','}, System.StringSplitOptions.RemoveEmptyEntries).Any(s => { var p = s.Trim().ToLowerInvariant(); return p.Length > 0 && p != "__none__" && (model == p || model.StartsWith(p)); });
+    }" />
+    <set-variable name="backendName" value="@((bool)context.Variables["isCommercialModel"] ? "foundry-commercial" : "foundry")" />
+
+    <!-- 6. Model capability validation (#119 Phase 2 / #120). When the discovered model type
+         map for the selected backend is populated, reject a model that does not advertise the
+         'messages' surface, naming the surfaces it DOES support. STRICTLY INERT while the map
+         is '{}' (default) or the model is absent from it, and never blocks on a parse error. -->
+    <set-variable name="modelTypesJson" value="{{foundry-model-types}}" />
+    <set-variable name="modelTypesCommercialJson" value="{{foundry-commercial-model-types}}" />
+    <set-variable name="activeModelTypesJson" value="@((bool)context.Variables["isCommercialModel"] ? (string)context.Variables["modelTypesCommercialJson"] : (string)context.Variables["modelTypesJson"])" />
+    <choose>
+      <when condition="@{
+          try {
+              var raw = context.Variables.ContainsKey("activeModelTypesJson") ? (string)context.Variables["activeModelTypesJson"] : "";
+              if (string.IsNullOrWhiteSpace(raw) || raw.Trim() == "{}") { return false; }
+              var map = Newtonsoft.Json.Linq.JObject.Parse(raw);
+              var model = ((string)context.Variables["deploymentName"]).Trim();
+              var entry = map[model] as Newtonsoft.Json.Linq.JArray;
+              if (entry == null) { return false; }
+              foreach (var t in entry) {
+                  if (((string)t).Equals("messages", System.StringComparison.OrdinalIgnoreCase)) { return false; }
+              }
+              return true;
+          } catch { return false; }
+      }">
+        <return-response>
+          <set-status code="400" reason="Unsupported API type for model" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>@{
+              var model = ((string)context.Variables["deploymentName"]).Trim();
+              string supported = "[]";
+              string supportedText = "";
+              try {
+                  var map = Newtonsoft.Json.Linq.JObject.Parse((string)context.Variables["activeModelTypesJson"]);
+                  var entry = map[model] as Newtonsoft.Json.Linq.JArray;
+                  if (entry != null) {
+                      supported = entry.ToString(Newtonsoft.Json.Formatting.None);
+                      var parts = new System.Collections.Generic.List<string>();
+                      foreach (var t in entry) { parts.Add((string)t); }
+                      supportedText = string.Join(", ", parts);
+                  }
+              } catch { }
+              return "{\"error\":{\"type\":\"invalid_request_error\",\"code\":\"UnsupportedApiTypeForModel\",\"message\":\"Model '" + model + "' does not support the Anthropic 'messages' API surface on this route. Supported surfaces: " + supportedText + ". Send this model to the '/openai' route instead.\",\"model\":\"" + model + "\",\"requested_type\":\"messages\",\"supported_types\":" + supported + "}}";
+          }</set-body>
+        </return-response>
+      </when>
+    </choose>
+
+    <!-- 7. Telemetry, identical dimensions to every other route. -->
+    <emit-metric name="copilot_byok_request" value="1" namespace="copilot.byok">
+      <dimension name="developer_oid" value="@((string)context.Variables["developerOid"])" />
+      <dimension name="developer_upn" value="@((string)context.Variables["developerUpn"])" />
+      <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+      <dimension name="backend" value="@((string)context.Variables["backendName"])" />
+      <dimension name="auto_route" value="none" />
+    </emit-metric>
+
+    <!-- Built in token metering (#126). Covers streaming AND non streaming, but the ANTHROPIC
+         Messages schema is only recognised on APIM v2 tiers, which do not exist in Azure
+         Government. On a classic tier this emits nothing for this route, so the outbound hand
+         rolled pair below is kept as the fallback. -->
+    <llm-emit-token-metric namespace="copilot.byok">
+      <dimension name="developer_oid" value="@((string)context.Variables["developerOid"])" />
+      <dimension name="developer_upn" value="@((string)context.Variables["developerUpn"])" />
+      <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+      <dimension name="backend" value="@((string)context.Variables["backendName"])" />
+    </llm-emit-token-metric>
+
+    <!-- 8. Anthropic parameter safety. The body is already Anthropic, so this is NOT a
+         translation: max_tokens is REQUIRED by the Messages API (a missing one is a hard 400
+         at the backend), and Foundry hosted Claude rejects some sampling combinations. -->
+    <set-body><![CDATA[@{
+        try {
+            var body = context.Request.Body?.As<JObject>(preserveContent: true);
+            if (body == null) { return context.Request.Body?.As<string>(preserveContent: true); }
+            bool changed = false;
+            if (body["max_tokens"] == null) { body["max_tokens"] = 4096; changed = true; }
+            var tpv = body["top_p"];
+            if (tpv != null && (tpv.Type == JTokenType.Float || tpv.Type == JTokenType.Integer) && (double)tpv < 0.99) { body.Remove("top_p"); changed = true; }
+            return changed ? body.ToString() : context.Request.Body?.As<string>(preserveContent: true);
+        } catch {
+            return context.Request.Body?.As<string>(preserveContent: true);
+        }
+    }]]></set-body>
+
+    <!-- 9. Strip the developer credential before going to the backend. -->
+    <set-header name="x-api-key" exists-action="delete" />
+    <set-header name="api-key" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+
+    <!-- 10. Mint the backend credential and select the backend. The commercial branch is the
+         same token mint the /openai route uses for commercial models and shares its cache
+         keys, so a warm token is reused across routes. -->
+    <choose>
+      <when condition="@((bool)context.Variables["isCommercialModel"])">
+        <choose>
+          <when condition="@("{{foundry-commercial-auth-mode}}".Equals("servicePrincipalFederated", System.StringComparison.OrdinalIgnoreCase))">
+            <cache-lookup-value key="@("foundry-commercial-fedtoken|{{foundry-commercial-tenant-id}}|{{foundry-commercial-client-id}}")" variable-name="commercialSpToken" />
+            <choose>
+              <when condition="@(!context.Variables.ContainsKey("commercialSpToken"))">
+                <authentication-managed-identity resource="api://AzureADTokenExchange" output-token-variable-name="govFederationAssertion" ignore-error="true" />
+                <send-request mode="new" response-variable-name="commercialTokenResp" timeout="20" ignore-error="true">
+                  <set-url>@("https://{{foundry-commercial-authority-host}}/{{foundry-commercial-tenant-id}}/oauth2/v2.0/token")</set-url>
+                  <set-method>POST</set-method>
+                  <set-header name="Content-Type" exists-action="override">
+                    <value>application/x-www-form-urlencoded</value>
+                  </set-header>
+                  <set-body>@{
+                      var assertion = context.Variables.ContainsKey("govFederationAssertion") ? (string)context.Variables["govFederationAssertion"] : "";
+                      return "grant_type=client_credentials"
+                        + "&amp;client_id=" + System.Uri.EscapeDataString("{{foundry-commercial-client-id}}")
+                        + "&amp;client_assertion_type=" + System.Uri.EscapeDataString("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+                        + "&amp;client_assertion=" + System.Uri.EscapeDataString(assertion)
+                        + "&amp;scope=" + System.Uri.EscapeDataString("{{foundry-commercial-token-resource}}".TrimEnd('/') + "/.default");
+                  }</set-body>
+                </send-request>
+                <set-variable name="commercialSpToken" value="@{
+                    try {
+                        var resp = context.Variables.ContainsKey("commercialTokenResp") ? (IResponse)context.Variables["commercialTokenResp"] : null;
+                        if (resp == null || resp.StatusCode != 200) { return ""; }
+                        var j = resp.Body.As<JObject>(preserveContent: true);
+                        return (string)(j["access_token"]) ?? "";
+                    } catch { return ""; }
+                }" />
+                <choose>
+                  <when condition="@(string.IsNullOrEmpty((string)context.Variables["commercialSpToken"]))">
+                    <return-response>
+                      <set-status code="502" reason="Commercial backend token federation failed" />
+                      <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                      </set-header>
+                      <set-body>@{
+                          string code = "unreachable";
+                          try {
+                              var resp = context.Variables.ContainsKey("commercialTokenResp") ? (IResponse)context.Variables["commercialTokenResp"] : null;
+                              if (resp != null) {
+                                  var j = resp.Body.As<JObject>(preserveContent: true);
+                                  code = ((string)(j["error"]) ?? ("http_" + resp.StatusCode)) + ": " + ((string)(j["error_description"]) ?? "");
+                              }
+                          } catch { code = "token_endpoint_error"; }
+                          return "{\"error\":{\"type\":\"api_error\",\"code\":\"CommercialTokenFederationFailed\",\"message\":\"APIM could not federate to a Commercial-tenant token. Verify the commercial SP federated credential (issuer/subject/audience) trusts the APIM managed identity, that cross-cloud federation is permitted, and that the commercial token endpoint is in the APIM egress allowlist. AAD error: " + code + "\"}}";
+                      }</set-body>
+                    </return-response>
+                  </when>
+                </choose>
+                <set-variable name="commercialTokenTtl" value="@{
+                    try {
+                        var resp = (IResponse)context.Variables["commercialTokenResp"];
+                        var j = resp.Body.As<JObject>(preserveContent: true);
+                        int expires = (int?)j["expires_in"] ?? 3600;
+                        return System.Math.Max(expires - 300, 60);
+                    } catch { return 300; }
+                }" />
+                <cache-store-value key="@("foundry-commercial-fedtoken|{{foundry-commercial-tenant-id}}|{{foundry-commercial-client-id}}")" value="@((string)context.Variables["commercialSpToken"])" duration="@((int)context.Variables["commercialTokenTtl"])" />
+              </when>
+            </choose>
+            <set-header name="Authorization" exists-action="override">
+              <value>@("Bearer " + (string)context.Variables["commercialSpToken"])</value>
+            </set-header>
+          </when>
+          <when condition="@("{{foundry-commercial-auth-mode}}".Equals("servicePrincipal", System.StringComparison.OrdinalIgnoreCase))">
+            <cache-lookup-value key="@("foundry-commercial-sptoken|{{foundry-commercial-tenant-id}}|{{foundry-commercial-client-id}}")" variable-name="commercialSpToken" />
+            <choose>
+              <when condition="@(!context.Variables.ContainsKey("commercialSpToken"))">
+                <send-request mode="new" response-variable-name="commercialTokenResp" timeout="20" ignore-error="true">
+                  <set-url>@("https://{{foundry-commercial-authority-host}}/{{foundry-commercial-tenant-id}}/oauth2/v2.0/token")</set-url>
+                  <set-method>POST</set-method>
+                  <set-header name="Content-Type" exists-action="override">
+                    <value>application/x-www-form-urlencoded</value>
+                  </set-header>
+                  <set-body>@{
+                      return "grant_type=client_credentials"
+                        + "&amp;client_id=" + System.Uri.EscapeDataString("{{foundry-commercial-client-id}}")
+                        + "&amp;client_secret=" + System.Uri.EscapeDataString("{{foundry-commercial-client-secret}}")
+                        + "&amp;scope=" + System.Uri.EscapeDataString("{{foundry-commercial-token-resource}}".TrimEnd('/') + "/.default");
+                  }</set-body>
+                </send-request>
+                <set-variable name="commercialSpToken" value="@{
+                    try {
+                        var resp = context.Variables.ContainsKey("commercialTokenResp") ? (IResponse)context.Variables["commercialTokenResp"] : null;
+                        if (resp == null || resp.StatusCode != 200) { return ""; }
+                        var j = resp.Body.As<JObject>(preserveContent: true);
+                        return (string)(j["access_token"]) ?? "";
+                    } catch { return ""; }
+                }" />
+                <choose>
+                  <when condition="@(string.IsNullOrEmpty((string)context.Variables["commercialSpToken"]))">
+                    <return-response>
+                      <set-status code="502" reason="Commercial backend token acquisition failed" />
+                      <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                      </set-header>
+                      <set-body>@{
+                          string code = "unreachable";
+                          try {
+                              var resp = context.Variables.ContainsKey("commercialTokenResp") ? (IResponse)context.Variables["commercialTokenResp"] : null;
+                              if (resp != null) {
+                                  var j = resp.Body.As<JObject>(preserveContent: true);
+                                  code = ((string)(j["error"]) ?? ("http_" + resp.StatusCode)) + ": " + ((string)(j["error_description"]) ?? "");
+                              }
+                          } catch { code = "token_endpoint_error"; }
+                          return "{\"error\":{\"type\":\"api_error\",\"code\":\"CommercialTokenAcquisitionFailed\",\"message\":\"APIM could not obtain a Commercial-tenant backend token. Check the service-principal credentials and that the commercial token endpoint is in the APIM egress allowlist. AAD error: " + code + "\"}}";
+                      }</set-body>
+                    </return-response>
+                  </when>
+                </choose>
+                <set-variable name="commercialTokenTtl" value="@{
+                    try {
+                        var resp = (IResponse)context.Variables["commercialTokenResp"];
+                        var j = resp.Body.As<JObject>(preserveContent: true);
+                        int expires = (int?)j["expires_in"] ?? 3600;
+                        return System.Math.Max(expires - 300, 60);
+                    } catch { return 300; }
+                }" />
+                <cache-store-value key="@("foundry-commercial-sptoken|{{foundry-commercial-tenant-id}}|{{foundry-commercial-client-id}}")" value="@((string)context.Variables["commercialSpToken"])" duration="@((int)context.Variables["commercialTokenTtl"])" />
+              </when>
+            </choose>
+            <set-header name="Authorization" exists-action="override">
+              <value>@("Bearer " + (string)context.Variables["commercialSpToken"])</value>
+            </set-header>
+          </when>
+          <when condition="@("{{foundry-commercial-auth-mode}}".Equals("managedIdentity", System.StringComparison.OrdinalIgnoreCase))">
+            <authentication-managed-identity resource="{{foundry-commercial-mi-audience}}" />
+          </when>
+          <otherwise>
+            <set-header name="api-key" exists-action="override">
+              <value>{{foundry-commercial-api-key}}</value>
+            </set-header>
+          </otherwise>
+        </choose>
+        <set-backend-service backend-id="{{foundry-commercial-backend-id}}" />
+      </when>
+      <otherwise>
+        <authentication-managed-identity resource="{{foundry-mi-audience}}" />
+        <set-backend-service backend-id="{{foundry-backend-id}}" />
+      </otherwise>
+    </choose>
+
+    <!-- 11. Rewrite to the backend Messages path and attach the Anthropic version header.
+         The Messages surface is versioned by the 'anthropic-version' header, NOT by an
+         api-version query parameter, so no api-version is set here. -->
+    <rewrite-uri template="{{foundry-commercial-anthropic-path}}" copy-unmatched-params="false" />
+    <set-header name="anthropic-version" exists-action="override">
+      <value>{{foundry-commercial-anthropic-version}}</value>
+    </set-header>
+  </inbound>
+
+  <backend>
+    <!-- In-request failover. No-op for a single Url backend. -->
+    <retry condition="@(context.Response != null &amp;&amp; (context.Response.StatusCode == 429 || context.Response.StatusCode >= 500))" count="2" interval="0" first-fast-retry="true">
+      <forward-request buffer-request-body="true" />
+    </retry>
+  </backend>
+
+  <outbound>
+    <base />
+
+    <!-- Token metering fallback for CLASSIC APIM tiers (Azure Government has no v2 tier, where
+         llm-emit-token-metric would understand the Anthropic Messages schema).
+         LIMITATION: an outbound body read cannot see a streamed response, so a STREAMING
+         /v1/messages call is not token metered on a classic tier. Request counting, quotas and
+         rate limits are unaffected because they are enforced inbound, per identity. -->
+    <choose>
+      <when condition="@(context.Response.StatusCode == 200 &amp;&amp; (context.Response.Headers.GetValueOrDefault("Content-Type","").StartsWith("application/json")))">
+        <set-variable name="responseBody" value="@(context.Response.Body.As<JObject>(preserveContent: true))" />
+        <emit-metric name="copilot_byok_prompt_tokens" value="@{ var u = ((JObject)context.Variables["responseBody"])?["usage"]; return (double)((int?)(u?["input_tokens"]) ?? (int?)(u?["prompt_tokens"]) ?? 0); }" namespace="copilot.byok">
+          <dimension name="developer_oid"   value="@((string)context.Variables["developerOid"])" />
+          <dimension name="developer_upn"   value="@((string)context.Variables["developerUpn"])" />
+          <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+          <dimension name="backend"         value="@((string)context.Variables["backendName"])" />
+        </emit-metric>
+        <emit-metric name="copilot_byok_completion_tokens" value="@{ var u = ((JObject)context.Variables["responseBody"])?["usage"]; return (double)((int?)(u?["output_tokens"]) ?? (int?)(u?["completion_tokens"]) ?? 0); }" namespace="copilot.byok">
+          <dimension name="developer_oid"   value="@((string)context.Variables["developerOid"])" />
+          <dimension name="developer_upn"   value="@((string)context.Variables["developerUpn"])" />
+          <dimension name="deployment_name" value="@((string)context.Variables["deploymentName"])" />
+          <dimension name="backend"         value="@((string)context.Variables["backendName"])" />
+        </emit-metric>
+      </when>
+    </choose>
+  </outbound>
+
+  <on-error>
+    <base />
+  </on-error>
+</policies>

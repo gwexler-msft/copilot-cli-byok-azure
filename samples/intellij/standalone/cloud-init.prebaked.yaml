@@ -1,0 +1,40 @@
+#cloud-config
+# IntelliJ BYOK bolt-on — proxy VM bootstrap for the PRE-BAKED image (Phase 6, air-gapped subnets).
+#
+# Unlike cloud-init.yaml, this variant does NOT install nginx — it assumes nginx is already present in
+# the Azure Compute Gallery image built by scripts/build-proxy-image.ps1/.sh. It only writes the
+# per-customer config (APIM private IP + gateway host) and (re)starts nginx, so the VM needs NO
+# outbound package egress. __APIM_PRIVATE_IP__ and __APIM_GATEWAY_HOST__ are substituted by Bicep.
+write_files:
+  - path: /etc/nginx/conf.d/byok-proxy.conf
+    permissions: '0644'
+    content: |
+      map $http_authorization $byok_key {
+          default "";
+          "~*^Bearer (.+)$" $1;
+      }
+      server {
+          listen 8080;
+          server_name _;
+          location ^~ /__INTELLIJ_API_PATH__/ {
+              proxy_pass https://__APIM_PRIVATE_IP__;
+              proxy_set_header Host __APIM_GATEWAY_HOST__;
+              proxy_ssl_name __APIM_GATEWAY_HOST__;
+              proxy_ssl_server_name on;
+              proxy_set_header api-key $byok_key;
+              proxy_set_header Authorization "";
+              proxy_http_version 1.1;
+              proxy_buffering off;
+              proxy_request_buffering off;
+              proxy_read_timeout 600s;
+              client_max_body_size 50m;
+          }
+              location / {
+                return 404;
+              }
+      }
+runcmd:
+  - rm -f /etc/nginx/sites-enabled/default
+  - nginx -t
+  - systemctl enable nginx
+  - systemctl restart nginx

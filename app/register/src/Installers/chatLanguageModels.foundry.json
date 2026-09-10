@@ -1,0 +1,59 @@
+[
+  {
+    "name": "BYOK Foundry (chat/completions legacy)",
+    "vendor": "customendpoint",
+    "apiType": "chat-completions",
+    "apiKey": "<APIM_SUBSCRIPTION_KEY>",
+    "models": []
+  },
+  {
+    "name": "BYOK Foundry (responses)",
+    "vendor": "customendpoint",
+    "apiType": "responses",
+    "apiKey": "<APIM_SUBSCRIPTION_KEY>",
+    "models": [
+      {
+        "id": "gpt-5.6-sol",
+        "name": "BYOK gpt-5.6-sol",
+        "url": "https://<APIM_HOSTNAME>/openai/v1/responses?_vscodeauth=openai.azure",
+        "toolCalling": true,
+        "vision": false,
+        "thinking": true,
+        "supportsReasoningEffort": ["none", "low", "medium", "high", "xhigh", "max"],
+        "reasoningEffortFormat": "responses",
+        "streaming": true,
+        "maxInputTokens": 1050000,
+        "maxOutputTokens": 128000,
+        "zeroDataRetentionEnabled": true
+      },
+      {
+        "id": "gpt-5.6-terra",
+        "name": "BYOK gpt-5.6-terra",
+        "url": "https://<APIM_HOSTNAME>/openai/v1/responses?_vscodeauth=openai.azure",
+        "toolCalling": true,
+        "vision": false,
+        "thinking": true,
+        "supportsReasoningEffort": ["none", "low", "medium", "high", "xhigh", "max"],
+        "reasoningEffortFormat": "responses",
+        "streaming": true,
+        "maxInputTokens": 1050000,
+        "maxOutputTokens": 128000,
+        "zeroDataRetentionEnabled": true
+      },
+      {
+        "id": "gpt-5.6-luna",
+        "name": "BYOK gpt-5.6-luna",
+        "url": "https://<APIM_HOSTNAME>/openai/v1/responses?_vscodeauth=openai.azure",
+        "toolCalling": true,
+        "vision": false,
+        "thinking": true,
+        "supportsReasoningEffort": ["none", "low", "medium", "high", "xhigh", "max"],
+        "reasoningEffortFormat": "responses",
+        "streaming": true,
+        "maxInputTokens": 1050000,
+        "maxOutputTokens": 128000,
+        "zeroDataRetentionEnabled": true
+      }
+    ]
+  }
+]

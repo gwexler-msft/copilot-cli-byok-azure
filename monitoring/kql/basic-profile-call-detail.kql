@@ -1,0 +1,52 @@
+// BASIC profile: per-call detail - when, who, how long, how big. Last 24h.
+//
+// All of it comes from the gateway log, so NO policy change is needed:
+//     TimeGenerated       when the call happened
+//     ApimSubscriptionId  which developer key made it
+//     TotalTime           end to end at the gateway, ms
+//     BackendTime         time waiting on Foundry, ms
+//     RequestSize         request payload, bytes
+//     ResponseSize        response payload, bytes
+//
+// TotalTime - BackendTime is the APIM overhead. That is the number to quote when
+// someone says the gateway is slow: it is usually single-digit ms, and anything
+// large is the model rather than APIM.
+//
+// This reads the APIM RESOURCE LOG, not Application Insights, so it works even when
+// emit-metric is being dropped (missing metrics:true on the diagnostic). If APIM
+// Analytics shows data, this table has data. What it CANNOT give is token counts -
+// those exist only as App Insights custom metrics.
+//
+// STREAMING CAVEAT: for a streamed reply both TotalTime and ResponseSize track how
+// long and how large the answer was, not gateway health. Compare BackendTime, or
+// filter to non-streaming calls, before drawing latency conclusions.
+//
+// If a column name is rejected, the schema varies slightly by APIM version - run
+//     ApiManagementGatewayLogs | getschema
+// and adjust. TotalTime / BackendTime / RequestSize / ResponseSize are the usual names.
+ApiManagementGatewayLogs
+| where TimeGenerated > ago(24h)
+| project
+    TimeGenerated,
+    Subscription = tostring(ApimSubscriptionId),
+    Operation    = OperationId,
+    Status       = ResponseCode,
+    TotalMs      = TotalTime,
+    BackendMs    = BackendTime,
+    GatewayMs    = TotalTime - BackendTime,
+    RequestBytes = RequestSize,
+    ResponseBytes = ResponseSize
+| order by TimeGenerated desc
+
+// Rolled up per developer, for volume and payload trends:
+//
+// ApiManagementGatewayLogs
+// | where TimeGenerated > ago(24h) and ResponseCode < 400
+// | summarize
+//     Calls        = count(),
+//     p95_total    = percentile(TotalTime, 95),
+//     p95_backend  = percentile(BackendTime, 95),
+//     ReqMB        = round(sum(RequestSize)  / 1048576.0, 2),
+//     RespMB       = round(sum(ResponseSize) / 1048576.0, 2)
+//   by bin(TimeGenerated, 1h), Subscription = tostring(ApimSubscriptionId)
+// | order by TimeGenerated asc

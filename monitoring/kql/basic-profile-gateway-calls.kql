@@ -1,0 +1,23 @@
+// BASIC profile: gateway calls by operation and status code, last 24h.
+//
+// This one does NOT depend on Application Insights custom metrics at all - it reads
+// the APIM resource log - so it still works when emit-metric is being dropped
+// (issue #16) or while you are still wiring diagnostics up. Best first stop when
+// something is failing.
+//
+// READING THE RESULT:
+//   404 on an operation you expect  -> that operation does not exist on the API
+//   404 with NO OperationId         -> nothing matched the path at all; check the
+//                                      API URL suffix (must be 'openai' for Copilot CLI)
+//   401                             -> subscription key rejected BEFORE policy ran:
+//                                      wrong header (APIM defaults to
+//                                      Ocp-Apim-Subscription-Key, the CLI can only
+//                                      send api-key), or the key is not scoped to
+//                                      this API/product
+//   200 here but the client still fails -> look at the BACKEND leg instead; use the
+//                                      end-to-end transaction view, whose dependency
+//                                      row shows the resolved upstream URL
+ApiManagementGatewayLogs
+| where TimeGenerated > ago(24h)
+| summarize Calls = count() by bin(TimeGenerated, 1h), OperationId, ResponseCode
+| order by TimeGenerated desc, Calls desc

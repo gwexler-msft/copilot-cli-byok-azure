@@ -1,0 +1,40 @@
+// Inspect IntelliJ `auto` routing decisions without collecting prompt content.
+// Routing diagnostics use a separate metric because APIM permits at most five
+// custom dimensions per `emit-metric`; `copilot_byok_request` already carries
+// its stable request/accounting dimensions.
+//
+// `auto_route_reason` is the decisive rule:
+//   short     -> mini
+//   coding    -> full (coding marker matched, regardless of length)
+//   ambiguous -> full (length is between threshold-band and threshold+band)
+//   long      -> full
+//
+// `auto_length_band` is independently useful for spotting short prompts promoted
+// to full by the coding regex. With the defaults (threshold=500, band=200):
+//   short=<300 chars, ambiguous=300-699 chars, long=700+ chars.
+// In this subscription-key policy, `developer_upn` stores the APIM subscription
+// display name (not an Entra UPN), so the query labels it `subscription_name`.
+customMetrics
+| where timestamp > ago(1h)
+| where name == "copilot_byok_auto_route"
+| extend
+    auto_route  = tostring(customDimensions["auto_route"]),
+    reason      = tostring(customDimensions["auto_route_reason"]),
+    length_band = tostring(customDimensions["auto_length_band"]),
+    deployment  = tostring(customDimensions["deployment_name"]),
+    subscription_name = tostring(customDimensions["developer_upn"]),
+    coding      = tostring(customDimensions["auto_route_reason"]) == "coding",
+    calls       = tolong(valueCount)
+| where auto_route in ("mini", "full")
+| project timestamp, calls, auto_route, reason, coding, length_band, deployment, subscription_name
+| order by timestamp desc
+
+// Run separately when `copilot_byok_request` rows need API-origin confirmation.
+// The request metric name is shared by the main /openai APIs and /intellij;
+// only ApiId == "intellij-byok" proves the call used the IntelliJ bolt-on.
+//
+// ApiManagementGatewayLogs
+// | where TimeGenerated > ago(1h)
+// | where ApimSubscriptionId == "dev2"
+// | summarize calls = count() by bin(TimeGenerated, 1m), ApiId, OperationId, ResponseCode
+// | order by TimeGenerated desc

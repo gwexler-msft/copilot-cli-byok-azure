@@ -1,0 +1,79 @@
+// BASIC profile: total tokens per developer and requested model, WITH a coverage column.
+//
+// WORKSPACE SCHEMA (AppMetrics). From the Application Insights blade the classic names
+// apply instead: customMetrics / timestamp / customDimensions / value, and ItemCount is
+// called `valueCount` there - customMetrics has no `itemCount` column at all.
+//
+// WHY CoveragePct EXISTS - READ THIS BEFORE QUOTING THE TOKEN NUMBERS.
+// llm-emit-token-metric reads the response's `usage` object, and a STREAMED reply does
+// not carry one. Copilot CLI and VS Code stream by default, so those calls count as
+// requests but contribute ZERO tokens. The result is a token total that can be orders of
+// magnitude below what Foundry's own meter reports (observed: 44 tokens here vs millions
+// at the account).
+//
+// CoveragePct = share of that developer's requests that actually carried token data.
+//   ~100%  -> the totals are trustworthy
+//   low    -> you are seeing only the non-streaming calls; the total is NOT their usage
+//
+// TO RAISE COVERAGE, either:
+//   * COPILOT_PROVIDER_WIRE_API=responses  - the Responses API reports usage natively,
+//     streaming or not. Preferred, and what the CLI recommends for the gpt-5 series.
+//   * flip streamUsageInjection to "on" in wizard-foundry-policy-basic.xml, which makes
+//     APIM add stream_options.include_usage so streamed chat/completions emit a final
+//     usage chunk. Older REST contracts reject that field with 400 Unknown parameter.
+//
+// For authoritative TOTALS regardless of streaming, use the Cognitive Services account
+// metrics in Azure Monitor - but those cannot attribute per developer, which is the
+// entire reason this metric exists.
+let period = 24h;
+let tokens =
+    AppMetrics
+    | where TimeGenerated > ago(period)
+    | where Name == "Total Tokens"
+    | extend Developer    = tostring(Properties["User ID"]),
+             Subscription = tostring(Properties["Subscription ID"]),
+             Model        = tostring(Properties["Model"])
+    | summarize TotalTokens = sum(Sum), CallsWithTokens = sum(ItemCount) by Developer, Subscription, Model;
+let calls =
+    AppMetrics
+    | where TimeGenerated > ago(period)
+    | where Name == "copilot_byok_request"
+    | extend Developer    = tostring(Properties["User ID"]),
+             Subscription = tostring(Properties["Subscription ID"]),
+             Model        = tostring(Properties["Model"])
+    | summarize Requests = sum(Sum) by Developer, Subscription, Model;
+calls
+| join kind=leftouter tokens on Developer, Subscription, Model
+| extend TotalTokens     = coalesce(TotalTokens, 0.0),
+         CallsWithTokens = coalesce(CallsWithTokens, 0.0)
+| extend CoveragePct = iff(Requests > 0, round(100.0 * CallsWithTokens / Requests, 1), 0.0)
+| project Developer, Subscription, Model, Requests, CallsWithTokens, CoveragePct, TotalTokens
+| order by Subscription asc, TotalTokens desc
+
+// CLASSIC APPLICATION INSIGHTS SCHEMA equivalent:
+//
+// customMetrics
+// | where timestamp > ago(24h)
+// | where name in ("Prompt Tokens", "Completion Tokens", "Total Tokens", "copilot_byok_request")
+// | extend
+//     Developer    = tostring(customDimensions["User ID"]),
+//     Subscription = tostring(customDimensions["Subscription ID"]),
+//     Model        = tostring(customDimensions["Model"]),
+//     Operation    = tostring(customDimensions["Operation ID"])
+// | summarize
+//     PromptTokens     = sumif(value, name == "Prompt Tokens"),
+//     CompletionTokens = sumif(value, name == "Completion Tokens"),
+//     TotalTokens      = sumif(value, name == "Total Tokens"),
+//     Requests         = sumif(value, name == "copilot_byok_request")
+//   by Developer, Subscription, Model, Operation
+// | where Requests > 0
+// | order by Subscription asc, TotalTokens desc
+
+// Prompt vs completion split for the same period:
+//
+// AppMetrics
+// | where TimeGenerated > ago(24h)
+// | where Name in ("Prompt Tokens", "Completion Tokens")
+// | extend Developer = tostring(Properties["User ID"])
+// | summarize Tokens = sum(Sum) by Developer, Name
+// | evaluate pivot(Name, sum(Tokens))

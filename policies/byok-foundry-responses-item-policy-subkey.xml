@@ -1,0 +1,49 @@
+<policies>
+  <inbound>
+    <!-- OPERATION-scope policy shared by the four stateful Responses sub-resources (#110,
+         subscriptionKey mode):
+             GET    /v1/responses/{response_id}
+             DELETE /v1/responses/{response_id}
+             POST   /v1/responses/{response_id}/cancel
+             GET    /v1/responses/{response_id}/input_items
+
+         It DELIBERATELY omits <base /> so the API-level inference policy does NOT run. That
+         policy parses the request body for a "model" field and 400s (ModelNotSpecified) on any
+         body-less request — which every operation here is, including the POST /cancel. Skipping
+         it also keeps auto-routing and the token-metric emit off these calls: they are stateful
+         follow-ups to an already-metered POST /v1/responses, not billable inference of their own,
+         so counting them would double-count the turn.
+
+         Auth is still enforced: the API is configured with subscriptionRequired=true and the key
+         in the "api-key" header (see apim-foundry-api.bicep), so APIM validates the subscription
+         key NATIVELY before this policy runs.
+
+         One policy serves all four operations because the backend path is the gateway path with
+         the account-root prefix restored — see the rewrite below. -->
+    <set-header name="api-key" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+    <set-backend-service backend-id="{{foundry-backend-id}}" />
+    <authentication-managed-identity resource="{{foundry-mi-audience}}" />
+    <!-- Rebuild the ACCOUNT-ROOT path: the Responses surface is versionless ("v1 GA") and NOT
+         deployment-scoped, exactly like the POST /v1/responses rewrite in the inference policy.
+         Deriving it from the original path (rather than hard-coding one per operation) is what
+         lets a single policy cover the bare id, /cancel and /input_items forms.
+         No api-version is set — the versionless surface REJECTS a dated api-version with
+         400 "API version not supported". -->
+    <rewrite-uri template="@{
+        var p = context.Request.OriginalUrl.Path;
+        var i = p.IndexOf("/v1/responses", System.StringComparison.OrdinalIgnoreCase);
+        return i < 0 ? p : "/openai" + p.Substring(i);
+    }" copy-unmatched-params="true" />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <!-- Intentionally empty (no <base />): the inference outbound reads variables this path never
+         sets, and these responses carry no usage to meter. -->
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

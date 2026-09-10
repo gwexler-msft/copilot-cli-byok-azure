@@ -1,0 +1,19 @@
+// BASIC profile: request volume per APIM subscription (i.e. per developer), last 24h.
+//
+// WORKSPACE SCHEMA (AppMetrics, not customMetrics) - see basic-profile-metric-probe.kql.
+//
+// NOTE the dimensions differ from the full BYOK gateway. The BASIC policy emits
+// Model / Subscription ID / Product ID / Operation ID / User ID; there is no
+// developer_upn, so per-developer attribution runs through the APIM SUBSCRIPTION.
+// That is the right unit anyway when each developer holds their own key.
+// tokens-per-developer.kql in this folder will NOT work against this profile.
+AppMetrics
+| where TimeGenerated > ago(24h)
+| where Name == "copilot_byok_request"
+| extend
+    Developer    = tostring(Properties["User ID"]),
+    Subscription = tostring(Properties["Subscription ID"]),
+    Model        = tostring(Properties["Model"]),
+    Operation    = tostring(Properties["Operation ID"])
+| summarize Requests = sum(ItemCount) by bin(TimeGenerated, 1h), Developer, Subscription, Model, Operation
+| order by TimeGenerated asc, Subscription asc

@@ -1,0 +1,132 @@
+name: build-runner-image
+
+# Pre-bakes the self-hosted runner image (infra/runner-image) into each pilot's shared ACR
+# (issue #94). Building with `az acr build` runs the Dockerfile SERVER-SIDE on ACR Tasks, so
+# the messy egress (ghcr.io base pull + azd/az/bicep/.NET/pwsh tool installs) happens on ACR's
+# build agents — NOT on the locked-down runner subnet. The runner then only ever pulls this one
+# image from ACR (covered by the AzureContainerRegistry + Storage service tags), which is what
+# lets restrictRunnerEgress=true work with zero CIDR params.
+#
+# Two-phase bring-up: this workflow builds + pushes the image; THEN flip useAcrRunnerImage=true
+# (and, after validation, restrictRunnerEgress=true) in the env's CI param file so the runner
+# Job is pointed at the ACR ref. Build the image BEFORE flipping the param or the Job can't start.
+#
+# Auth: OIDC federated credentials (no stored secrets), same as deploy.yml. Runs on the pilot
+# self-hosted runners (EMU hosted runners are disabled for this repo).
+
+on:
+  workflow_dispatch:
+    inputs:
+      cloud:
+        description: Target Azure cloud (omit to build BOTH pilots)
+        type: choice
+        required: false
+        default: both
+        options:
+          - both
+          - AzureUSGovernment
+          - AzureCloud
+  schedule:
+    # Weekly rebuild (Mondays 06:00 UTC) to pick up base-image + tool security patches.
+    - cron: '0 6 * * 1'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # Resolve which clouds to build. Scheduled runs and the default dispatch build both pilots;
+  # a dispatch that names a single cloud builds just that one.
+  setup:
+    name: Resolve targets
+    runs-on: [self-hosted, comm-pilot]
+    outputs:
+      clouds: ${{ steps.m.outputs.clouds }}
+    steps:
+      - id: m
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.cloud }}" != "both" ]]; then
+            printf 'clouds=["%s"]\n' "${{ inputs.cloud }}" >> "$GITHUB_OUTPUT"
+          else
+            echo 'clouds=["AzureUSGovernment","AzureCloud"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build runner image (${{ matrix.cloud }})
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        cloud: ${{ fromJson(needs.setup.outputs.clouds) }}
+    # Never run two builds against the same registry concurrently.
+    concurrency:
+      group: build-runner-image-${{ matrix.cloud }}
+      cancel-in-progress: false
+    runs-on: [self-hosted, "${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}"]
+    environment: ${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}
+    env:
+      AZURE_ENV_NAME: ${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}
+      AZURE_RESOURCE_GROUP: rg-copilot-byok-${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The myoung34/github-runner image does not ship az; install on demand (mirrors deploy.yml).
+      - name: Install Azure CLI (self-hosted runner)
+        shell: bash
+        run: |
+          if ! command -v az >/dev/null 2>&1; then
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+
+      - name: Azure CLI login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ matrix.cloud == 'AzureUSGovernment' && 'AzureUSGovernment' || 'AzureCloud' }}
+
+      # Resolve the shared ACR (acrreg<env><suffix>) created by main.bicep in this env's RG.
+      # The 6-char suffix is deployment-random, so discover the name rather than compute it.
+      - name: Resolve shared ACR
+        id: acr
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="$(az acr list \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --query "[?starts_with(name,'acrreg')].name | [0]" -o tsv)"
+          if [[ -z "${name}" || "${name}" == "None" ]]; then
+            echo "::error::No shared ACR (acrreg*) found in ${AZURE_RESOURCE_GROUP}. Provision with deployRegisterApp=true or useAcrRunnerImage=true first." >&2
+            exit 1
+          fi
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "Using ACR: ${name}"
+
+      # Build the Dockerfile on ACR Tasks (server-side). Tag both :latest and the commit SHA so
+      # an env can pin runnerImageTag to an immutable ref and roll deterministically.
+      - name: Build + push runner image (ACR Tasks)
+        shell: bash
+        run: |
+          set -euo pipefail
+          az acr build \
+            --registry "${{ steps.acr.outputs.name }}" \
+            --image "github-runner:latest" \
+            --image "github-runner:${GITHUB_SHA::12}" \
+            --file infra/runner-image/Dockerfile \
+            infra/runner-image
+
+      # Same ACR also holds the proxy DNS reconciler image (infra/proxy-dns-reconciler-image),
+      # pulled by the scheduled caj-proxydns job that keeps proxy.byok.internal pointed at the
+      # subkey proxy ACI's current IP. Build it here alongside the runner image.
+      - name: Build + push proxy-dns-reconciler image (ACR Tasks)
+        shell: bash
+        run: |
+          set -euo pipefail
+          az acr build \
+            --registry "${{ steps.acr.outputs.name }}" \
+            --image "proxy-dns-reconciler:latest" \
+            --image "proxy-dns-reconciler:${GITHUB_SHA::12}" \
+            --file infra/proxy-dns-reconciler-image/Dockerfile \
+            infra/proxy-dns-reconciler-image

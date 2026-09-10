@@ -1,0 +1,28 @@
+// Requests per backend region (multi-region APIM backend pool) over the last 24h.
+//
+// WHY THIS QUERY: In the App Insights dependency blade, the "Region" custom property
+// reflects the APIM GATEWAY's region (always the same), NOT the backend that served
+// the request. To see the true regional split across a load-balanced backend pool,
+// bucket by the dependency TARGET host instead:
+//   <name>.openai.azure.us          -> primary region  (e.g. usgovvirginia)
+//   <name>r1.openai.azure.us        -> secondary pool member (e.g. usgovarizona)
+//   <name>r2..., r3... etc.         -> additional regional pool members
+//
+// Adjust the account-name prefix below to match your deployment if needed.
+dependencies
+| where timestamp > ago(24h)
+| where target has "openai.azure"
+| extend backendHost = tostring(parse_url(tostring(target)).Host)
+// Regional pool members are named "<primaryAccount>r1", "r2", ... so the host carries
+// a trailing "r<n>" just before ".openai". The primary account has no such suffix.
+| extend regionalSuffix = extract(@"(r\d+)\.openai\.azure", 1, backendHost)
+| extend backendRegion = case(
+    regionalSuffix == "", "primary (foundry)",
+    strcat("secondary-", regionalSuffix, " (foundry-", regionalSuffix, ")"))
+| summarize
+    requests = count(),
+    succeeded = countif(resultCode startswith "2"),
+    failed = countif(resultCode !startswith "2")
+    by backendRegion, backendHost
+| extend successRatePct = round(100.0 * succeeded / requests, 1)
+| order by requests desc

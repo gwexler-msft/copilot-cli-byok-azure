@@ -1,0 +1,74 @@
+<policies>
+  <inbound>
+    <!-- OPERATION-scope policy shared by the four stateful Responses sub-resources (#110, jwt
+         mode):
+             GET    /v1/responses/{response_id}
+             DELETE /v1/responses/{response_id}
+             POST   /v1/responses/{response_id}/cancel
+             GET    /v1/responses/{response_id}/input_items
+
+         Same reasoning as the -subkey variant: it omits <base /> so the API-level inference
+         policy (which 400s ModelNotSpecified on a body-less request) does NOT run, and so these
+         stateful follow-ups are not counted as inference on top of the POST /v1/responses that
+         created the object.
+
+         Because we skip the API inbound we MUST re-validate the Entra JWT here — otherwise these
+         operations would be unauthenticated in jwt mode. The block mirrors byok-foundry-policy.xml
+         (clients send the JWT in the "api-key" header). -->
+    <set-variable name="incomingApiKey" value="@(context.Request.Headers.GetValueOrDefault("api-key",""))" />
+    <choose>
+      <when condition="@(string.IsNullOrEmpty((string)context.Variables["incomingApiKey"]))">
+        <return-response>
+          <set-status code="401" reason="Missing api-key header (expected Entra JWT)" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>{"error":"Missing api-key header. Set the API key to an Entra JWT minted via 'az account get-access-token --resource {{api-app-id-uri}}'."}</set-body>
+        </return-response>
+      </when>
+    </choose>
+    <set-header name="Authorization" exists-action="override">
+      <value>@("Bearer " + (string)context.Variables["incomingApiKey"])</value>
+    </set-header>
+    <validate-jwt header-name="Authorization"
+                  failed-validation-httpcode="401"
+                  failed-validation-error-message="Unauthorized: invalid Entra token."
+                  require-scheme="Bearer"
+                  require-signed-tokens="true">
+      <openid-config url="{{entra-openid-config-url}}" />
+      <audiences>
+        <audience>{{api-audience}}</audience>
+      </audiences>
+      <required-claims>
+        <claim name="scp" match="any">
+          <value>{{required-scope}}</value>
+        </claim>
+      </required-claims>
+    </validate-jwt>
+    <set-header name="api-key" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+    <set-backend-service backend-id="{{foundry-backend-id}}" />
+    <authentication-managed-identity resource="{{foundry-mi-audience}}" />
+    <!-- Rebuild the ACCOUNT-ROOT path: the Responses surface is versionless ("v1 GA") and NOT
+         deployment-scoped, exactly like the POST /v1/responses rewrite in the inference policy.
+         Deriving it from the original path (rather than hard-coding one per operation) is what
+         lets a single policy cover the bare id, /cancel and /input_items forms.
+         No api-version is set — the versionless surface REJECTS a dated api-version with
+         400 "API version not supported". -->
+    <rewrite-uri template="@{
+        var p = context.Request.OriginalUrl.Path;
+        var i = p.IndexOf("/v1/responses", System.StringComparison.OrdinalIgnoreCase);
+        return i < 0 ? p : "/openai" + p.Substring(i);
+    }" copy-unmatched-params="true" />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <!-- Intentionally empty (no <base />): the inference outbound reads variables this path never
+         sets, and these responses carry no usage to meter. -->
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

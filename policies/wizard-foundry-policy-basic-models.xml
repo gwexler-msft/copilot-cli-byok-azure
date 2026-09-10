@@ -1,0 +1,115 @@
+<!--
+  ===========================================================================
+  APIM policy  |  Azure AI Foundry  |  BASIC profile  |  GET /v1/models
+  ===========================================================================
+  Companion to wizard-foundry-policy-basic.xml. Apply it at OPERATION scope
+  on a GET /v1/models operation, on the SAME API (URL suffix "openai") that
+  already serves the chat traffic.
+
+  ===========================================================================
+  WHY YOU NEED IT
+  ===========================================================================
+  OpenAI compatible clients probe <base>/models to validate the connection
+  and populate the model picker BEFORE they ever send a chat request. If that
+  operation does not exist, APIM answers 404 and the client blames the model:
+
+      Model 'gpt-5.1' not found on provider at
+      https://<gateway-host>/openai/v1 (HTTP 404)
+
+  That reads like a missing deployment, but it is a routing problem. The chat
+  deployment is fine; DISCOVERY is what 404s. GitHub Copilot CLI and JetBrains
+  AI Assistant both probe it. VS Code Custom Endpoint does not, which is why
+  VS Code can work against a gateway where the CLI fails.
+
+  ===========================================================================
+  IT MUST BE THE SAME API, NOT A NEW ONE
+  ===========================================================================
+  The client builds the models URL from the one base URL you hand it, so an
+  API published on any other suffix can never be reached. Add the operation
+  to the API the chat traffic already uses.
+
+  ===========================================================================
+  APPLY AT OPERATION SCOPE, NOT API SCOPE
+  ===========================================================================
+  There is deliberately no <base /> in inbound or outbound here. The API level
+  policy parses the request body, and a GET carries none, so inheriting it
+  would break this call. Keep <base /> in backend and on-error.
+
+  ===========================================================================
+  BEFORE YOU APPLY IT
+  ===========================================================================
+  1. Replace REPLACE-WITH-YOUR-FOUNDRY-BACKEND-ID with the same backend id
+     you used in wizard-foundry-policy-basic.xml.
+  2. Authentication to Foundry must MATCH wizard-foundry-policy-basic.xml.
+     Both now ship with a managed-identity block. Replace
+     REPLACE-WITH-YOUR-FOUNDRY-MI-AUDIENCE with
+         https://cognitiveservices.azure.com   (Azure Commercial)
+         https://cognitiveservices.azure.us    (Azure Government)
+     and grant the APIM managed identity "Cognitive Services OpenAI User" on
+     the Foundry account. A freshly granted role takes a few minutes to
+     propagate and returns 401 until it does.
+     If your backend is a wizard-created "Azure AI Foundry" backend it
+     authenticates itself, so delete that line in BOTH files. Getting this
+     wrong shows up as 401, not 404.
+  3. The rewrite-uri below is relative to the backend Runtime URL, and it
+     ASSUMES that URL ends in /openai, exactly as
+     wizard-foundry-policy-basic.xml requires. If yours is instead the bare
+     account root, put the /openai back on the template:
+     "/openai/deployments?api-version=2023-03-15-preview". Both files must
+     make the SAME assumption about the backend, or one of them 404s.
+
+  ===========================================================================
+  WHY IT LISTS DEPLOYMENTS INSTEAD OF CALLING /openai/v1/models
+  ===========================================================================
+  The account root /openai/v1/models returns the base MODEL CATALOG, not your
+  deployments: the ids do not match the names callers actually have to send,
+  and the payload carries fields that trip strict client parsers. The data
+  plane deployments list is the correct surface, and 2023-03-15-preview is
+  the api-version that still serves it. The outbound section reshapes that
+  response into the OpenAI /v1/models shape clients expect.
+  ===========================================================================
+-->
+<policies>
+  <inbound>
+    <set-header name="api-key" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+    <set-backend-service backend-id="REPLACE-WITH-YOUR-FOUNDRY-BACKEND-ID" />
+    <!-- Delete this line if the backend already carries its own credentials. Must match the API policy. -->
+    <authentication-managed-identity resource="REPLACE-WITH-YOUR-FOUNDRY-MI-AUDIENCE" />
+    <!-- Relative to the backend URL, which is assumed to end in /openai. Re-add /openai here if it does not. -->
+    <rewrite-uri template="/deployments?api-version=2023-03-15-preview" copy-unmatched-params="false" />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <choose>
+      <when condition="@(context.Response.StatusCode == 200)">
+        <set-body><![CDATA[@{
+          var outData = new JArray();
+          try {
+            var src = context.Response.Body.As<JObject>(preserveContent: true);
+            var arr = src["data"] as JArray;
+            if (arr != null) {
+              foreach (var d in arr) {
+                var id = (string)d["id"];
+                var status = (string)d["status"];
+                // A deployment still provisioning would be advertised but not yet usable.
+                if (!string.IsNullOrEmpty(id) && (status == null || status == "succeeded")) {
+                  outData.Add(new JObject(new JProperty("id", id), new JProperty("object", "model"), new JProperty("created", 0), new JProperty("owned_by", "azure")));
+                }
+              }
+            }
+          } catch (Exception) { }
+          return new JObject(new JProperty("object", "list"), new JProperty("data", outData)).ToString(Newtonsoft.Json.Formatting.None);
+        }]]></set-body>
+        <set-header name="Content-Type" exists-action="override">
+          <value>application/json</value>
+        </set-header>
+      </when>
+    </choose>
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

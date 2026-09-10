@@ -1,0 +1,17 @@
+{
+  "_comment": "byok-coding: tightened harm filters (Low) + Jailbreak in ANNOTATE-ONLY mode (still detected and reported in response metadata, but the call is not blocked). Use this variant on deployments that serve agentic IDE assistants (VS Code Copilot, Copilot CLI) whose system prompts reliably trip prompt-shield jailbreak detection on standard chats. Tightening the harm categories below Medium is always allowed. Putting Jailbreak in annotate-only (blocking:false, enabled:true) does NOT require an approved modified-content-filter application; only DISABLING jailbreak (enabled:false) or raising harm thresholds above Microsoft defaults does. Apply with scripts/configure-content-filter.ps1 -Apply -PolicyName byok-coding -ConfigPath scripts/content-filter.byok-coding.json -AttachToDeployment <name>.",
+  "basePolicyName": "Microsoft.DefaultV2",
+  "mode": "Default",
+  "contentFilters": [
+    { "name": "Hate",     "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Prompt" },
+    { "name": "Hate",     "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Completion" },
+    { "name": "Sexual",   "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Prompt" },
+    { "name": "Sexual",   "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Completion" },
+    { "name": "Violence", "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Prompt" },
+    { "name": "Violence", "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Completion" },
+    { "name": "Selfharm", "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Prompt" },
+    { "name": "Selfharm", "blocking": true, "enabled": true, "severityThreshold": "Low", "source": "Completion" },
+    { "name": "Jailbreak", "blocking": false, "enabled": true, "source": "Prompt" },
+    { "name": "Protected Material Text", "blocking": true, "enabled": true, "source": "Completion" }
+  ]
+}

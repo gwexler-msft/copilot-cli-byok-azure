@@ -1,0 +1,28 @@
+// BASIC profile: is anything arriving at all? Run this first.
+//
+// WORKSPACE SCHEMA. A workspace-based Application Insights does NOT expose the
+// classic tables when queried from the Log Analytics workspace: use AppMetrics,
+// not customMetrics. The columns rename too, so a table-name-only swap still
+// fails:
+//     customMetrics    -> AppMetrics
+//     timestamp        -> TimeGenerated
+//     customDimensions -> Properties
+//     value            -> Sum
+//     valueCount       -> ItemCount
+// customMetrics has NO `itemCount` column (that's a traces/requests/exceptions
+// thing) - using it fails with SEM0100 'Failed to resolve scalar expression'.
+// The classic names DO work from the Application Insights blade, which is why
+// the other files in this folder read differently.
+//
+// EXPECTED for the BASIC policy pair:
+//   copilot_byok_request                         (our emit-metric, one per call)
+//   Prompt Tokens / Completion Tokens / Total Tokens   (llm-emit-token-metric)
+//
+// IF THIS RETURNS NOTHING but AppRequests shows traffic in the same window, the
+// APIM 'applicationinsights' diagnostic is missing properties.metrics: true and
+// emit-metric is being dropped silently. That is issue #16; see
+// custom-metrics-smoke.kql for the gateway-trace confirmation.
+AppMetrics
+| where TimeGenerated > ago(1h)
+| summarize Points = count(), Last = max(TimeGenerated) by Name
+| order by Name asc

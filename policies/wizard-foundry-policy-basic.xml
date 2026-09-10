@@ -1,0 +1,315 @@
+<!--
+  ===========================================================================
+  APIM policy  |  Azure AI Foundry  |  BASIC profile
+  ===========================================================================
+  A cut-down sibling of wizard-foundry-policy-fixed.xml, for handing to a
+  team that just wants a working OpenAI-compatible gateway in front of ONE
+  Foundry account. Reference artifact: apply it by hand in the APIM portal.
+  It is not wired into Bicep (the deployed policies are byok-foundry-*.xml).
+
+  ===========================================================================
+  WHAT THIS COVERS
+  ===========================================================================
+  Three request shapes, whichever your client sends:
+
+      POST  /deployments/{deployment}/chat/completions   (Copilot CLI, and the
+                                                          wizard import shape)
+      POST  /v1/chat/completions                         (VS Code, most other
+                                                          OpenAI clients)
+      POST  /v1/responses                                (Responses API)
+
+  Create the operations you need, then apply this policy at the API level so
+  each one inherits it. The Foundry wizard import usually creates only the
+  /deployments/... form, so the /v1/... forms have to be added by hand.
+
+  The model name is read from the URL when it is there and from the request
+  body "model" field when it is not, so all three shapes behave the same.
+
+  YOU ALSO NEED  GET /v1/models  ON THIS SAME API.
+  Copilot CLI and JetBrains AI Assistant probe it to validate the connection
+  and fill the model picker BEFORE sending any chat, so a missing operation
+  surfaces as "Model '<name>' not found on provider ... (HTTP 404)" even
+  though the deployment is perfectly healthy. VS Code Custom Endpoint does
+  not probe it, which is why VS Code can work where the CLI fails. It needs
+  its OWN operation scoped policy, because the API level policy below parses
+  a request body that a GET does not have. See the companion file
+  wizard-foundry-policy-basic-models.xml.
+
+  ===========================================================================
+  POINTING GITHUB COPILOT CLI AT IT
+  ===========================================================================
+      COPILOT_PROVIDER_TYPE=azure
+      COPILOT_PROVIDER_BASE_URL=https://<apim-gateway-host>/openai
+      COPILOT_PROVIDER_API_KEY=<APIM subscription key>
+
+  Host suffix is .azure-api.net on Commercial, .azure-api.us on Government.
+  Leave COPILOT_PROVIDER_WIRE_API and COPILOT_PROVIDER_BEARER_TOKEN UNSET; a
+  stale bearer token takes precedence over the API key and yields a 401.
+
+  CREATE ALL FOUR OF THESE OPERATIONS, or the CLI 404s:
+
+      POST  /v1/responses
+      POST  /v1/chat/completions
+      POST  /deployments/{deployment}/chat/completions
+      GET   /v1/models
+
+  /v1/responses is NOT optional in practice. CLI 1.0.81 was observed (wire
+  log, 2026-08-31) sending the RESPONSES shape against a gpt-5.1 model: the
+  body carried "instructions" and "input" plus "reasoning" / "store" /
+  "include", NOT "messages". So do not assume the client uses chat/completions
+  just because you left COPILOT_PROVIDER_WIRE_API alone. Create all four and
+  the client works whichever surface it picks.
+
+  Why all three. The azure provider DISCARDS any path on the base URL: it
+  keeps only the origin and its SDK builds the rest, so the API suffix MUST
+  be "openai" and a route on any other path is unreachable from the CLI.
+  WHICH chat path the SDK builds depends on COPILOT_PROVIDER_AZURE_API_VERSION:
+  the default versionless v1 produces /openai/v1/chat/completions, while a
+  dated api-version produces the deployment scoped
+  /openai/deployments/{model}/chat/completions?api-version=...
+  Creating both covers either mode, and costs nothing when one is unused.
+  Separately, the CLI probes GET /v1/models BEFORE it sends any chat, so a
+  missing models operation reports as
+  "Model '<name>' not found on provider ... (HTTP 404)".
+
+  The credential rides in the "api-key" header. APIM's DEFAULT subscription
+  key header is "Ocp-Apim-Subscription-Key", which the CLI cannot send, so the
+  API must be configured with subscriptionKeyParameterNames header AND query
+  set to "api-key". The Foundry import wizard does this for you; a hand-built
+  API does not, and the symptom is a 401 no policy can fix, because APIM
+  validates the subscription key before inbound policy runs.
+  scripts/deploy-basic-foundry-gateway.ps1 sets it explicitly.
+
+  COPILOT_PROVIDER_WIRE_API selects the chat surface: "completions" (the
+  documented default) produces /openai/v1/chat/completions, "responses"
+  produces /openai/v1/responses. Either way the credential stays in
+  "api-key", so a plain subscription key keeps working.
+
+  BUT do not rely on the default: on CLI 1.0.81 a gpt-5.1 model produced the
+  Responses shape with the variable unset. Serve both surfaces and the
+  question stops mattering.
+
+  Do NOT reach for COPILOT_PROVIDER_TYPE=openai to get the Responses API.
+  That provider sends "Authorization: Bearer <value>", NOT "api-key", so an
+  APIM subscription key will 401: APIM compares the WHOLE header value
+  against the key and the "Bearer " prefix never matches. Renaming the
+  subscription key header does not rescue it, and neither can a policy,
+  because APIM validates the subscription key BEFORE inbound policy runs. It
+  is only usable with subscriptionRequired turned OFF plus a validate-jwt
+  policy checking a real Entra token.
+
+  ===========================================================================
+  WHAT IT DELIBERATELY LEAVES OUT
+  ===========================================================================
+    * Anthropic / Claude request and response translation
+    * Cross cloud "commercial model" routing to a second backend
+  Both need extra backends and named values, and both add a lot of policy
+  expression code. Nothing here depends on them. If you need either, start
+  from wizard-foundry-policy-fixed.xml instead.
+
+  ===========================================================================
+  BEFORE YOU APPLY IT
+  ===========================================================================
+  1. Replace REPLACE-WITH-YOUR-FOUNDRY-BACKEND-ID below with the backend the
+     wizard created (APIM  >  Backends; the name usually ends in
+     "-ai-endpoint").
+  2. Confirm that backend's Runtime URL ENDS IN /openai, e.g.
+         https://<account>.cognitiveservices.azure.com/openai
+     This policy does NO path rewriting on purpose. APIM strips the API URL
+     suffix and appends the operation template to the backend URL, so with
+     the /openai on the end BOTH of these land on real Foundry paths:
+         <backend>/openai  +  /v1/chat/completions
+         <backend>/openai  +  /deployments/{deployment}/chat/completions
+     If the Runtime URL is the bare account root, every call 404s FROM
+     FOUNDRY even though APIM matched the operation correctly. That 404 is
+     easy to mistake for a missing operation; the APIM trace tells them
+     apart by showing the resolved backend URL.
+  3. Decide how the gateway authenticates to Foundry. The policy below now
+     SHIPS with a managed-identity block: it strips the caller's credentials
+     and mints an APIM managed-identity token. Replace
+     REPLACE-WITH-YOUR-FOUNDRY-MI-AUDIENCE with
+         https://cognitiveservices.azure.com   (Azure Commercial)
+         https://cognitiveservices.azure.us    (Azure Government)
+     and grant the APIM managed identity "Cognitive Services OpenAI User" on
+     the Foundry account. A freshly granted role takes a few minutes to
+     propagate and returns 401 until it does.
+
+     If your backend is a wizard-created "Azure AI Foundry" backend it already
+     authenticates itself, so delete the authentication-managed-identity line.
+     KEEP the two set-header deletes either way: without them APIM forwards
+     the CALLER's api-key (your APIM subscription key) upstream, and Foundry
+     prefers an api-key header over a Bearer token, so it rejects the call on
+     that key even when a valid managed-identity token sits beside it. The
+     symptom is a 401 that survives every RBAC fix you try.
+  4. Sanity check the tokens-per-minute ceiling for your deployment size.
+
+  ===========================================================================
+  WHAT YOU GET IN APPLICATION INSIGHTS
+  ===========================================================================
+  * copilot_byok_request  (custom metric, namespace copilot.byok)
+      One count per call, ALWAYS: streaming or not, success or failure.
+      This is the metric to use for "requests per developer".
+
+  * GenAI Tokens  (the wizard's built in token metric)
+      Per call prompt / completion / total counts. Populated for
+      non streaming chat/completions and for /responses. For STREAMING
+      chat/completions it stays empty unless you flip the switch below,
+      because a streamed reply carries no usage object by default.
+
+    Both metric families carry Subscription ID, User ID, Operation ID and
+    Model, so usage can be grouped by developer and model. Model is the
+    requested Foundry deployment ID from the URL or request body; it is not a
+    backend-returned model version. Model replaces the redundant API ID
+    dimension, so the request metric remains at APIM's five-dimension limit.
+
+  ===========================================================================
+  OPTIONAL: TOKEN COUNTS FOR STREAMING CHAT COMPLETIONS
+  ===========================================================================
+  A streamed reply can include a final usage chunk, but only if the caller
+  sends stream_options.include_usage. Most clients do not, so this policy
+  can add it. It is OFF by default because a backend on an older REST
+  contract rejects the field with:
+      400 Unknown parameter: 'stream_options.include_usage'
+
+  That is a REST contract version issue, not a problem with your model. The
+  field arrived in 2024-09-01-preview and exists in every later version,
+  including GA 2024-10-21 and the versionless v1 surface.
+
+  TO TURN IT ON: change value="off" to value="on" on the
+  streamUsageInjection line. If you then see the 400 above, change it back.
+  Nothing else is affected either way.
+
+  ===========================================================================
+  TWO BEHAVIOUR NOTES (reasoning models)
+  ===========================================================================
+  GPT-5.6 and later cannot combine reasoning with function tools on the Chat
+  Completions API. VS Code agent requests carry function tools, and GPT-5.6
+  defaults to medium reasoning even when reasoning_effort is omitted, so add
+  those models to a VS Code provider with apiType "responses", a
+  /openai/v1/responses URL, and reasoningEffortFormat "responses".
+
+  Foundry's Chat Completions fallback is a TOP-LEVEL
+  reasoning_effort: "none" on every request containing tools. For VS Code,
+  "none" must be listed in supportsReasoningEffort for the Thinking Effort
+  picker to emit it, and the format must remain "chat-completions" or the
+  value does not reach Foundry in the required shape. That fallback disables
+  reasoning; Responses preserves it and is the recommended fix. No APIM
+  policy rewrite is needed.
+
+  gpt-5 / o1 / o3 / o4 are reasoning models and reject any non default
+  temperature, top_p, presence_penalty or frequency_penalty with
+  400 unsupported_value. VS Code Copilot sends temperature 0.1 for factual
+  and code tasks, so this bites on the first request against such a
+  deployment. The policy strips those four fields for matching model names,
+  always, because forwarding them can never succeed. Other deployments (for
+  example gpt-4.1-mini) are untouched and keep whatever the client sent.
+
+  The model name comes from the URL when the path contains
+  /deployments/<name>/, and otherwise from the body "model" field, which is
+  what the Copilot CLI shape and /responses both send.
+  ===========================================================================
+-->
+<policies>
+  <inbound>
+    <base />
+    <set-backend-service backend-id="REPLACE-WITH-YOUR-FOUNDRY-BACKEND-ID" />
+
+    <!-- Foundry prefers an api-key header over a Bearer token, so the caller's APIM
+         subscription key must not reach it. Keep these two even if you drop the line below. -->
+    <set-header name="api-key" exists-action="delete" />
+    <set-header name="Authorization" exists-action="delete" />
+    <!-- Delete this line if the backend already carries its own credentials. See header note 3. -->
+    <authentication-managed-identity resource="REPLACE-WITH-YOUR-FOUNDRY-MI-AUDIENCE" />
+
+    <!-- Change to "on" to get token counts for streaming calls. See header. -->
+    <set-variable name="streamUsageInjection" value="off" />
+
+    <!-- Model is in the URL for deployment-scoped chat and in the body for /v1 routes. -->
+    <set-variable name="deploymentName" value="@{
+      var path = context.Request.OriginalUrl.Path.ToLowerInvariant();
+      var match = System.Text.RegularExpressions.Regex.Match(path, &quot;/deployments/([^/]+)/&quot;);
+      if (match.Success) { return match.Groups[1].Value; }
+      try {
+        var body = context.Request.Body?.As&lt;JObject&gt;(preserveContent: true);
+        if (body == null) { return &quot;unknown&quot;; }
+        var model = (string)(body[&quot;model&quot;] ?? &quot;&quot;);
+        return string.IsNullOrWhiteSpace(model) ? &quot;unknown&quot; : model.Trim().ToLowerInvariant();
+      } catch {
+        return &quot;unknown&quot;;
+      }
+    }" />
+
+    <set-body><![CDATA[@{
+        try {
+            var body = context.Request.Body?.As<JObject>(preserveContent: true);
+            if (body == null) { return context.Request.Body?.As<string>(preserveContent: true); }
+            var path = context.Request.OriginalUrl.Path.ToLowerInvariant();
+        var model = (string)context.Variables["deploymentName"];
+
+            if (model.StartsWith("gpt-5") || model.StartsWith("o1") || model.StartsWith("o3") || model.StartsWith("o4")) {
+                body.Remove("temperature");
+                body.Remove("top_p");
+                body.Remove("presence_penalty");
+                body.Remove("frequency_penalty");
+            }
+
+            // /responses reports usage natively, so it never needs the injection.
+            if (((string)context.Variables["streamUsageInjection"]) == "on" && !path.EndsWith("/responses")) {
+                var stream = body["stream"];
+                if (stream != null && stream.Type == JTokenType.Boolean && (bool)stream) {
+                    var opts = body["stream_options"] as JObject;
+                    if (opts == null) { opts = new JObject(); body["stream_options"] = opts; }
+                    opts["include_usage"] = true;
+                }
+            }
+
+            return body.ToString();
+        } catch {
+            // Not JSON we can parse: forward it untouched.
+            return context.Request.Body?.As<string>(preserveContent: true);
+        }
+    }]]></set-body>
+
+        <!-- Fires once per call regardless of streaming or outcome. User ID and Model match
+          the token metric below so both can be sliced by developer and deployment. -->
+    <emit-metric name="copilot_byok_request" value="1" namespace="copilot.byok">
+           <dimension name="Model" value="@((string)context.Variables[&quot;deploymentName&quot;])" />
+      <dimension name="Subscription ID" />
+      <dimension name="Product ID" />
+      <dimension name="Operation ID" />
+      <dimension name="User ID" />
+    </emit-metric>
+
+    <llm-emit-token-metric>
+      <dimension name="Model" value="@((string)context.Variables[&quot;deploymentName&quot;])" />
+      <dimension name="Client IP address" value="@(context.Request.IpAddress)" />
+      <dimension name="Gateway ID" />
+      <dimension name="Location" />
+      <dimension name="Operation ID" />
+      <dimension name="Product ID" />
+      <dimension name="Subscription ID" />
+      <dimension name="User ID" />
+    </llm-emit-token-metric>
+
+    <!-- 200k tpm, not the wizard's 10k: one Copilot request is routinely
+         5k to 15k tokens on its own, so 10k throttles the first call. -->
+    <llm-token-limit
+        tokens-per-minute="200000"
+        token-quota="3000000"
+        token-quota-period="Monthly"
+        counter-key="@(context.Subscription.Id)"
+        estimate-prompt-tokens="true"
+        remaining-tokens-header-name="x-remaining-tpm-tokens"
+        remaining-quota-tokens-header-name="x-remaining-monthly-tokens"
+        tokens-consumed-header-name="x-consumed-tokens" />
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <base />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>
