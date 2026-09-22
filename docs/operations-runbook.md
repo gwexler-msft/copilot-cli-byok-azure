@@ -96,18 +96,23 @@ az apim subscription delete  -g $rg --service-name $apim --sid jdoe --yes
 
 ### `jwt` mode (per-user Entra identity)
 
-There is **no key to issue**. Access = membership/app-role on the Entra app
-`copilot-byok-gateway` + the `cli.invoke` scope.
+There is **no key to issue**. Configure Entra app access and consent so authorized users
+can obtain a gateway-audience access token with `cli.invoke`. The current policy validates
+issuer/signature, audience and scope; app-role/group enforcement must not be assumed from
+the existence of an assignment alone.
 
 ```pwsh
 # Onboard: ensure the user can get a token for the API (app-role / pre-authorized).
 #   Managed centrally in Entra; see scripts/setup-entra.ps1 for the registration.
-# Offboard: remove the user's app-role assignment (instant revoke):
+# Offboard: remove the user's access assignment; issued JWTs may remain valid until expiry:
 #   Entra portal -> Enterprise apps -> copilot-byok-gateway -> Users and groups -> remove.
 ```
 
-> Remember the **~1h token expiry**: jwt-mode users need the wrapper script to re-mint
-> ([feature-request-byok-credential-refresh.md](feature-request-byok-credential-refresh.md)).
+> The wrapper mints on invocation. CLI 1.0.85 documents a credential-command hook, but
+> expiry tests are pending; VS Code Custom Endpoint still needs a renewal integration.
+> See [the capability record](feature-request-byok-credential-refresh.md).
+> Direct Okta validation and same-endpoint key OR JWT are [planned](authentication.md),
+> not enabled by pasting an Okta token into a current key-only client configuration.
 
 ---
 
@@ -184,7 +189,7 @@ secret.
      **Metadata: Read**. (Org-level runners instead: **Self-hosted runners: Read & write** +
      Actions Read + Metadata Read.)
    - **Uncheck Webhook → Active** (the runner doesn't use webhooks).
-2. **Install** it on `gwexler_microsoft/copilot-cli-byok-azure`. Capture the **App ID** (App
+2. **Install** it on `<OWNER>/<REPO>`. Capture the **App ID** (App
    settings page) and **Installation ID** (`gh api /repos/<owner>/<repo>/installation --jq .id`, or
    the `.../installations/<id>` settings URL).
 3. **Generate a private key** (App settings → Private keys → Generate private key) → downloads a
@@ -369,14 +374,21 @@ Resolve-DnsName "$apim.azure-api.us"     # .azure-api.net for Commercial
 
 ## 6. Switch / verify auth mode
 
-```pwsh
-# What mode is live? (products exist => subscriptionKey; absent => jwt)
-az apim product list -g $rg --service-name $apim --query "[].name" -o tsv
-```
+Inspect the live API's subscription requirement and API/operation policies, including
+discovery and Responses follow-ups. Do not infer mode from product existence: incremental
+deployments can leave old products behind. Compare against the CI parameters; current
+configurations select `subscriptionKey`.
 
 Switching modes is a **redeploy** (`authMode=subscriptionKey|jwt` param), not a live toggle —
 the API policies differ. Do it in a maintenance window; existing keys/tokens stop working at
 the cutover. See [deployment-guide.md](deployment-guide.md) Option A/B/C.
+
+**Planned coexistence:** [authentication.md](authentication.md) specifies one credential per
+request, key OR Entra JWT OR Okta JWT, preserving client URLs and backend authentication.
+Do not disable subscription requirements as a shortcut: prove key validity/scope/suspension,
+product quotas and rejection of unauthenticated requests before enabling the design.
+Offboarding must address keys separately from IdP access. JWT revocation is not immediate
+with local signature/expiry checks; issuer-qualified telemetry must not include raw tokens.
 
 ---
 
@@ -445,7 +457,7 @@ reference the specific behavior above so it isn't mistaken for a config error.
 > API-Key field and can ONLY send the key as a Bearer token, which Internal-mode APIM ignores.
 > Design rationale + ruled-out alternatives: [architecture.md → Subkey proxy](architecture.md).
 > Module: [apim-subkey-proxy-aci.bicep](../infra/modules/apim-subkey-proxy-aci.bicep). Tracked in
-> [`#108`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/108).
+> `#108`.
 
 **Client base URL** (developer-facing, stable, never changes across reprovisions):
 
@@ -554,7 +566,7 @@ az containerapp job start -g $rg -n $job
 > `az monitor log-analytics query` fails (bare `ERROR:` / 401). Validate via **execution status**
 > (`Succeeded`/`Failed`) plus the **observable effect** — the A record value changing — instead of
 > console logs. Drift test: point the record at a bogus IP
-> (`az network private-dns record-set a add-record ... --ipv4-address 10.60.9.99` + remove the real
+> (`az network private-dns record-set a add-record ... --ipv4-address <PRIVATE_IP>` + remove the real
 > one), `az containerapp job start`, then confirm the record returns to the ACI IP.
 
 ### Validate end to end
@@ -617,7 +629,7 @@ Restart (picks up nothing new by itself — it's stateless; use only to clear a 
 |---|---|
 | Issue a developer key | §2 `az apim subscription create` + `show --query primaryKey` |
 | Give a Bearer-only IDE (JetBrains) access | §10 subkey proxy (`http://proxy.byok.internal:8080/openai/v1`) |
-| Revoke access now | §2/§3 `subscription update --state suspended` (key) or remove app-role (jwt) |
+| Revoke access | Suspend the APIM subscription for key callers; remove IdP access for JWT callers, accounting for issued tokens remaining valid until expiry (§2/§3) |
 | Rotate a leaked key | §3 `subscription regenerate-key` |
 | Stop "first request 429s" | §4 raise tier/`jwt-tokens-per-minute` TPM |
 | Fix 404 on a new model | §4 bump `aoai-default-api-version`; keep `COPILOT_PROVIDER_AZURE_API_VERSION` |

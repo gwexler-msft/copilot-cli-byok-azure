@@ -16,6 +16,14 @@ param existingBackendName string
 @secure()
 param foundryApiKey string = ''
 
+@description('Authentication used by APIM, not the proxy, for the existing Foundry backend. Managed identity requires pre-existing APIM identity and Foundry RBAC.')
+@allowed(['apiKey', 'managedIdentity'])
+param foundryAuthMode string = 'apiKey'
+
+@description('Managed-identity token audience for the target cloud.')
+@allowed(['https://cognitiveservices.azure.com', 'https://cognitiveservices.azure.us'])
+param foundryManagedIdentityAudience string = environment().name == 'AzureUSGovernment' ? 'https://cognitiveservices.azure.us' : 'https://cognitiveservices.azure.com'
+
 @description('api-version pinned on deployment-scoped Foundry calls.')
 param apiVersion string = '2025-04-01-preview'
 
@@ -56,7 +64,7 @@ resource apim 'Microsoft.ApiManagement/service@2024-05-01' existing = {
 // ---- Named values the policies read via {{...}} ------------------------------------------------
 var namedValues = [
   { name: 'intellij-foundry-backend-id', value: existingBackendName, secret: false }
-  { name: 'intellij-foundry-api-key', value: empty(foundryApiKey) ? ' ' : foundryApiKey, secret: true }
+  { name: 'intellij-foundry-api-key', value: foundryAuthMode == 'managedIdentity' || empty(foundryApiKey) ? ' ' : foundryApiKey, secret: true }
   { name: 'intellij-api-version', value: apiVersion, secret: false }
   // APIM rejects empty named values (1-4096 chars). When auto-route is disabled these are empty, so
   // substitute a single space — both policies treat the sentinel as disabled via IsNullOrWhiteSpace,
@@ -128,6 +136,11 @@ resource opModels 'Microsoft.ApiManagement/service/apis/operations@2024-05-01' =
 }
 
 // ---- Policies ----------------------------------------------------------------------------------
+var keyAuthVariable = '<set-variable name="fdKey" value="{{intellij-foundry-api-key}}" />'
+var backendAuth = foundryAuthMode == 'managedIdentity'
+  ? '<authentication-managed-identity resource="${foundryManagedIdentityAudience}" /><set-variable name="fdKey" value=" " />'
+  : keyAuthVariable
+
 // Operation-scoped models policy (omits <base />, so the API inference policy's body-parse guard
 // does not run on the body-less GET).
 resource opModelsPolicy 'Microsoft.ApiManagement/service/apis/operations/policies@2024-05-01' = {
@@ -135,7 +148,7 @@ resource opModelsPolicy 'Microsoft.ApiManagement/service/apis/operations/policie
   name: 'policy'
   properties: {
     format: 'rawxml'
-    value: loadTextContent('../policies/intellij-models.xml')
+    value: replace(loadTextContent('../policies/intellij-models.xml'), keyAuthVariable, backendAuth)
   }
   dependsOn: [ nvs ]
 }
@@ -146,7 +159,7 @@ resource apiPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = 
   name: 'policy'
   properties: {
     format: 'rawxml'
-    value: loadTextContent('../policies/intellij-inference.xml')
+    value: replace(loadTextContent('../policies/intellij-inference.xml'), keyAuthVariable, backendAuth)
   }
   dependsOn: [ nvs, opChat, opComp, opEmbed, opResponses, opModels ]
 }

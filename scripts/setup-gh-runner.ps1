@@ -63,7 +63,7 @@
 
 .PARAMETER Repository
     GitHub repo in `<owner>/<repo>` form. Defaults to
-    `gwexler_microsoft/copilot-cli-byok-azure`.
+    `<OWNER>/<REPO>`.
 
 .PARAMETER Labels
     Comma-separated runner labels to filter on for -Action Status. Defaults to
@@ -142,7 +142,7 @@ param(
 
     [string]$JobName,
 
-    [string]$Repository = 'gwexler_microsoft/copilot-cli-byok-azure',
+    [string]$Repository = '<OWNER>/<REPO>',
 
     [string]$Labels,
 

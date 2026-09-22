@@ -1,5 +1,40 @@
 # IntelliJ BYOK bolt-on (standalone) — design & implementation plan
 
+> **Managed-hosting alternative:** [Container Apps proof of concept](CONTAINER-APPS.md) adds a
+> VM-free entry point using an existing private ACA environment (internal or external with public
+> access disabled and an approved Private Endpoint). Basic Government pilot runtime
+> tests passed on 2026-09-17; extended acceptance is still pending. The VM remains an opt-in
+> alternative and demo fallback.
+
+## Hosting Choice
+
+Both hosting options are opt-in: `main.bicep` deploys the VM, while `containerapp.bicep` deploys
+Container Apps. Neither is enabled automatically in the main gateway stack. Container Apps is
+the intended final hosting choice after runtime acceptance; the VM remains available for demos
+and fallback. For side-by-side Bicep deployment, let the VM entry point own the shared `/intellij`
+API and set `configureApim=false` for Container Apps. Never assign both deployments ownership of
+the same API or replace a Terraform-owned API without an explicit migration.
+
+Both proxies call APIM, never Foundry directly. APIM validates each developer's subscription key
+and records usage under that subscription. Use distinct subscription keys per developer for
+individual attribution. In Bicep, `foundryAuthMode=managedIdentity` opts into **APIM-to-Foundry**
+managed identity; the default remains `apiKey`. The APIM identity and its Foundry data-plane RBAC
+must already exist. This option creates no proxy identity and does not enable Foundry key auth.
+The Terraform entry point currently supports backend key authentication only.
+
+## Caller Authentication Roadmap
+
+Current standalone inference and discovery require APIM subscription keys. **Same-endpoint
+key OR Entra JWT OR Okta JWT is planned, not implemented**; one credential per request,
+not both. See [the shared authentication design](../../../docs/authentication.md).
+
+Both standalone policies must gain explicit validation, including discovery which skips
+API inbound. Changes must cover Bicep and Terraform packaging and both VM and Container
+Apps proxy paths. The current Bearer-to-`api-key` proxy does not validate or renew tokens.
+JWT clients need a verified header/renewal mechanism; existing key clients must be unchanged.
+Direct Okta requires custom-authorization-server trust and issuer-qualified user identity.
+APIM-to-Foundry backend key/managed-identity selection remains independent and unchanged.
+
 > **Status: BUILT — end-to-end validated against a pilot (2026-07-08).** Agreed design (**Option A**).
 > The APIM pack + Foundry path is proven (`/v1/models` and `/v1/chat/completions` return `200` through
 > the deployed policy). The nginx hop needs subnet egress to install (see §8 / Phase 6 for air-gapped subnets).

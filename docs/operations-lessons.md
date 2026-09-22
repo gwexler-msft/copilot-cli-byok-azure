@@ -18,6 +18,161 @@ Resource-name patterns used below (`<env>` = role, `<suffix>` = deterministic az
 
 ---
 
+## Authentication admission warning (2026-09-18)
+
+An isolated no-backend probe in both Government and Commercial found that setting
+`subscriptionRequired=false` can populate `context.Subscription` for an active key
+scoped to another API or an unlinked product. A policy accepting any non-null subscription
+therefore authorizes out-of-scope callers. Valid product keys still retained product
+context and enforced a test rate limit; those successes do not establish scope safety.
+Mandatory admission rejected the out-of-scope keys but also rejected JWT-only callers.
+Do not merge key/JWT policies using only a non-null subscription check. See
+[authentication evidence](authentication.md#native-admission-experiment-blocked-2026-09-18).
+
+APIM also requires unique API/product display names, not just resource IDs. Give disposable
+probe resources unique names on each run. VM Run Command output is bounded; keep evidence
+compact and assert the complete expected result set rather than accepting a partial log.
+
+For API policy ownership reads on Windows, explicitly request JSON with
+`az rest --headers 'Accept=application/json'`. The default request can return policy XML whose
+BOM triggers `UnicodeEncodeError` in the CLI's text output; `-o json` alone does not negotiate
+the HTTP response format. Verified on 2026-09-21: the same Government policy read failed with
+default headers and succeeded with explicit JSON, exposing the policy in `properties.value`.
+This rendering failure is not an RBAC denial. Preserve ownership checks and capture safe CLI
+exit/error categories instead of requesting new permissions or printing raw policy errors.
+
+Preserve the policy representation when writing it back. A JSON policy response with
+`properties.format=xml` contains XML-escaped expressions; submitting it as `rawxml` can fail
+compilation even when the authentication expressions were unchanged. APIM also reformats XML
+on readback. For an `xml` envelope, compare securely parsed policy content rather than exact
+formatting before deleting an owned fixture; still reject changed attributes or expression text.
+This does not make the repository's `rawxml` policy sources suitable for a strict XML parser.
+When generating a synthetic response, preserve early authentication rejections and replace only
+the uniquely marked successful response. Both synthetic CLI wire policies passed Government
+create/readback/delete validation on 2026-09-21; interactive CLI execution remains a separate gate.
+
+ARM readback is not proof that a freshly created API is ready on the gateway. The first
+interactive CLI fixture check returned 404 before the CLI started, while the retained auth-only
+probe still passed. A subsequent token-free VM check reached both fixture routes and received
+401 with their operation-specific markers. Treat propagation delay as the likely cause, not a
+proven captured transition. Before sending CLI credentials, use bounded missing-credential
+readiness checks and require the expected operation marker, not just the API's default 401.
+Revalidate fixture ownership between attempts; unexpected acceptance, a wrong marker, transport
+errors, or an exhausted readiness budget must stop the test and run normal cleanup.
+
+An in-VNet Windows request can also time out before authentication when certificate-revocation
+HTTP egress is blocked. Verified on 2026-09-21: an ordinary web request returned 401, while
+strict-revocation TLS failed with `OfflineRevocation` / `RevocationStatusUnknown` and DigiCert
+CRL retrieval timed out. Keep certificate validation enabled. For an explicitly approved test,
+use a temporary VM-source `/32` outbound TCP-80 allowance, verify write/delete permission and
+rule ownership, and remove only that rule in `finally` with readback. A cleanup failure must fail
+the overall test. This diagnostic window is not a permanent certificate-revocation egress design.
+
+The follow-up product-context guard blocked wrong-scope keys in both clouds but also rejected
+legitimate API-scoped and all-APIs subscriptions. Product context is not a general replacement
+for native scope authorization. Reject conflicting credential sources explicitly, but do not
+mistake that fix for complete key/JWT coexistence.
+
+Large CMS ciphertext passed as Windows Run Command parameters returned no structured test
+results. Moving ciphertext into temporary script parameter defaults restored both Commercial
+expiry replay and the admission matrix; a command-line size limit is suspected, not independently
+confirmed. Keep only encrypted payloads in that script, delete the local temporary file, and
+remove the VM's non-exportable certificate/private key after testing. Never expose remote error
+bodies that might echo arguments. Expired signed tokens returned 401 with fresh-token 200 controls
+in both clouds; this does not establish client token renewal.
+
+The required-subscription API plus explicitly JWT-guarded open-product candidate subsequently
+passed 78-case isolated probes in both clouds. Operations omitting inbound base must invoke
+authentication explicitly; attaching an open product to current key-only operation policies
+without doing that would create an authentication bypass. Keep production unchanged until
+surface coverage and remaining acceptance gates pass; see the authentication evidence.
+
+A subsequent Government mock-backend probe found that two separate identical Authorization
+Bearer header lines become one policy-visible value and are accepted when the token is valid.
+Different duplicate Bearer values returned 400 with no backend receipt; duplicate api-key lines
+returned 401. Checking `Headers["Authorization"].Length` cannot reject multiplicity already
+lost before policy evaluation. A source-verified validate-parameters test also accepted identical
+duplicates. The owner subsequently approved an explicit known-issue exception: the exact same
+Bearer token repeated in Authorization may normalize to one effective credential, which must
+still validate. Different values, mixed credential sources, comma-combined values and duplicate
+keys/query credentials remain rejected. This supersedes the strict-header blocker, not the
+historical test results. #140 remains open for the remaining acceptance work; support is now
+nonblocking. Do not infer Commercial/HTTP2 behavior or full sign-off from the Government tests.
+Select Windows test VMs by OS, not list position: the environment also has a Linux VM, and
+RunPowerShellScript against it reports an OS-type Conflict, not an execution-in-progress lock.
+
+Commercial raw SslStream probes failed certificate revocation validation with
+`RevocationStatusUnknown,OfflineRevocation` while ordinary WebRequest returned the expected 401.
+Status 0 is not an authentication rejection. Keep revocation checks enabled and record only
+sanitized certificate error enums. The separate 50-case Commercial association gate passed,
+but does not prove raw-header, HTTP/2, backend or complete accounting behavior.
+
+Long-running ARM probe sequences must refresh their management token before expiry, including
+cleanup calls. Government association testing passed 40 cases before an expired token prevented
+the final stage and automatic rollback. Fresh-token, ownership-checked recovery restored the
+disposable association state. The harness now renews ARM tokens and each stage's user token;
+never count successful manual cleanup as a passing interrupted acceptance matrix.
+The later complete Government rerun passed all 50 association cases with rollback readback,
+followed by 202/202 Foundry and 114/114 Anthropic admission cases with final receipt audits and
+listener/firewall/certificate cleanup. Keep these distinct from the earlier partial results.
+
+Government's later two-real-user runs on 2026-09-19 passed 242/242 Foundry and 154/154 Anthropic,
+including 40/40 isolation checks in each variant. Test independent users against a counter shared
+by operation aliases; including the operation ID would hide an alias-based quota reset. These
+small isolated rate/quota controls do not prove the full production accounting pipeline.
+Commercial's later diagnostic runs passed 240/246 Foundry and 152/158 Anthropic, including
+40/40 two-user checks each, but failed full acceptance: duplicate Authorization lines returned
+401 instead of the Government expectations. Single raw-header controls passed and rejected
+duplicates had no backend receipt. A blank error/context header does not prove rejection before
+the policy: a guard's `return-response` can omit the normal outbound and on-error diagnostics.
+Instrument that branch with fixed markers and counts before assigning blame to the parser.
+The marked Commercial run confirmed the guard executed with two policy-visible Authorization
+values for both identical and different duplicates; it returned 401 with no backend receipt.
+Government exposes one value for identical duplicates. `GetValueOrDefault` comma-joins an array,
+so a combined-value flag alone does not prove the client sent one comma-combined wire header.
+Both services report Developer/`stv2`/Internal; those resource properties are not runtime-build
+identifiers. No policy-only normalization or platform migration was approved.
+The owner requires identical behavior across clouds; do not silently change expected statuses.
+Check both token lifetimes before fixture creation. A cached token can pass preflight and become
+too short-lived during setup; a stopped freshness gate is not a failed authentication matrix.
+Requesting an explicit scope alone did not force renewal. The installed CLI's MSAL credential
+accepted `force_refresh=True`; direct use of its `Identity` constructor on Windows required
+`encrypt=True` to read the existing encrypted cache. Keep users/clouds in separate caches and
+never print the returned credentials. APIM still validates the tokens; local decoded claims
+are only fixture preflight. Reuse the ownership-checked auth-only baseline rather than creating
+another API with the same display name, while keeping admission/counter fixtures fresh.
+
+Both services had HTTP/2 explicitly disabled. A capable client alone does not establish HTTP/2
+coverage: assert the negotiated protocol and obtain approval for the service-wide setting change.
+The Commercial test VM's outbound Internet deny also blocks HTTP certificate CRLs. An approved
+temporary VM-source-only TCP 80 allowance restored strict TLS without disabling revocation.
+Restore every temporary egress rule, HTTP/2 setting and original VM power state after the window.
+
+Do not wrap a forty-minute `az apim wait` in a ten-minute process timeout. The first HTTP/2
+window hit that local timeout before testing. Cleanup readback showed HTTP/2 `False`, no temporary
+rules and the VM deallocated, but provisioning was still `Updating`; that is not completed
+restoration. Wait for the service operation and verify `Succeeded` before another setting change.
+In this window, completed readback reverted to HTTP/2 `True`; the activity log showed the first
+rollback failed with `Conflict` during enablement. A fresh recovery write was accepted after
+enablement settled and completed on 2026-09-19 with HTTP/2 `False` and provisioning `Succeeded`.
+Final cleanup also confirmed zero temporary rules and the VM deallocated. Never interpret a
+transient custom-property value as successful rollback; successful recovery does not turn the
+aborted HTTP/2 matrix into an acceptance pass.
+
+Validate portable-client capabilities locally before opening a service-wide test window.
+The official curl 8.22.0_1 Windows package includes LibreSSL and HTTP2, but not Schannel.
+`CURL_SSL_BACKEND` selects a compiled backend; it cannot add one. Keep the capability check
+fail-closed instead of dropping revocation requirements. A client-directory cleanup failure must
+be reported without skipping the mock listener, firewall and transport-certificate cleanup.
+
+In a Government negative control, adding a wrong `<issuers>` entry alongside `openid-config`
+did not exclude the metadata issuer: the real token still returned 200. An exact incompatible
+`iss` requirement in `required-claims` returned 401. Do not assume issuer-list override semantics;
+test exact issuer/audience pairing. APIM also requires `audiences` before `issuers` in validator
+XML. This control does not establish real alternate-issuer or Okta acceptance.
+
+---
+
 ## 1. Cloud & session discipline
 
 - **One cloud per `az`/terminal session, forever.** Pin each shell to a cloud with its own
@@ -339,8 +494,17 @@ pilot provides the Foundry).
   failure (the "GitHub is experiencing a disruption" note is a generic red herring — BYOK traffic
   never touches GitHub). The request body model must exactly match a **deployment name** on the
   target backend account.
-- **Neither client refreshes a short-lived credential** — for `authMode=jwt` the Entra token
-  (~1h) isn't auto-refreshed, so an unattended fleet should prefer `subscriptionKey`.
+- **Credential refresh evidence (2026-09-17):** CLI 1.0.85 documents a per-request
+  `COPILOT_PROVIDER_API_KEY_COMMAND`; the wrapper still mints on invocation and real expiry
+  tests are pending. VS Code Custom Endpoint still needs a renewal integration. Direct
+  Okta JWT and same-URL key OR JWT support are [planned](authentication.md), not deployed.
+- **Header placement is not renewal or validation.** Foundry/AOAI JWT policies currently
+  require `api-key`, including discovery and Responses follow-ups. The IntelliJ proxy
+  rewrites Bearer to `api-key` but does not renew tokens. Never infer live auth mode from
+  leftover products, or assume disabling subscription requirements preserves key validation.
+- **IdP offboarding is not key revocation.** Revoke APIM subscriptions separately; locally
+  validated JWTs may remain usable until expiry. Future Entra/Okta metrics must namespace
+  stable user identities by issuer and must not collapse missing identity into `unknown`.
 - **`GET /v1/models`** is served on the Foundry route for OpenAI-compatible clients (e.g. JetBrains
   AI Assistant) that probe it to connect. It's an operation-scoped policy that skips the inference
   body-parse. The AOAI and Commercial routes don't serve `/models` yet.

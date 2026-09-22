@@ -1,6 +1,6 @@
 # Register app runbook — self-serve BYOK developer onboarding
 
-> **What this is.** The self-serve **register app** (issue [#64](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/64))
+> **What this is.** The self-serve **register app** (issue #64)
 > is an Entra-authenticated web app that lets a developer provision their **own** per-developer
 > APIM subscription (a BYOK key scoped to a product tier), download a ready-to-paste VS Code
 > config, and run a one-shot installer — without an operator manually creating subscriptions.
@@ -20,6 +20,11 @@
 ---
 
 ## 1. Developer quickstart
+
+> **Authentication scope:** This portal remains Entra-based and issues APIM subscription
+> keys. Planned [key OR Entra JWT OR Okta JWT gateway support](authentication.md) does not
+> add Okta portal login, group synchronization or automatic key revocation on IdP offboarding.
+> Existing key onboarding remains unchanged; JWT token acquisition/renewal is separate.
 
 > You need: a workstation that can resolve the **APIM gateway** host to its private IP
 > (in-VNet, or off-VNet over the P2S VPN), a tenant account that is a member of the BYOK

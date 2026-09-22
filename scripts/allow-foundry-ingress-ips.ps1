@@ -28,7 +28,7 @@
 .PARAMETER FoundryAccountName
   Foundry (kind=AIServices) account name. Falls back to azd output $env:foundryAccountName. Empty => skip.
 .EXAMPLE
-  FOUNDRY_PUBLIC_INGRESS_IPS="20.159.140.229 20.141.70.93" ./allow-foundry-ingress-ips.ps1
+  FOUNDRY_PUBLIC_INGRESS_IPS="<NAT_EGRESS_IP_2> <NAT_EGRESS_IP_1>" ./allow-foundry-ingress-ips.ps1
 #>
 [CmdletBinding()]
 param(

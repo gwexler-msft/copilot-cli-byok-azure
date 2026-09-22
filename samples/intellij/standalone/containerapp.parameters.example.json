@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": { "value": "<region>" },
+    "proxyResourceGroup": { "value": "<existing-proxy-resource-group>" },
+    "proxyAppName": { "value": "ca-byok-intellij-proxy" },
+    "proxyImage": { "value": "<approved-nginx-image>@sha256:<digest>" },
+    "environmentName": { "value": "<private-container-apps-environment>" },
+    "environmentIngressMode": { "value": "internal" },
+    "environmentResourceGroup": { "value": "<environment-resource-group>" },
+    "apimResourceGroup": { "value": "<apim-resource-group>" },
+    "apimName": { "value": "<apim-name>" },
+    "apimPrivateIp": { "value": "<apim-private-ip>" },
+    "apimGatewayHost": { "value": "<apim-gateway-host>" },
+    "intellijApiPath": { "value": "intellij" },
+    "configureApim": { "value": false },
+    "configurePrivateDns": { "value": false },
+    "maxReplicas": { "value": 3 }
+  }
+}

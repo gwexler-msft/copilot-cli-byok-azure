@@ -20,7 +20,7 @@ ACTION="${1:-set-secret}"
 shift || true
 
 ENV_NAME="${AZURE_ENV_NAME:-comm-pilot}"
-REPOSITORY="gwexler_microsoft/copilot-cli-byok-azure"
+REPOSITORY="<OWNER>/<REPO>"
 RESOURCE_GROUP=""
 JOB_NAME=""
 LABELS=""

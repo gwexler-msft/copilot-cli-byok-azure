@@ -96,7 +96,7 @@ flowchart LR
 ```
 
 For each `(cloud, environment)` pair we create one federated credential on the deploy app
-with subject `repo:gwexler_microsoft/copilot-cli-byok-azure:environment:<env>`. The Entra
+with subject `repo:<OWNER>/<REPO>:environment:<env>`. The Entra
 app exists **in the workload tenant**, so the gov pilot uses the gov tenant's app and the
 commercial pilot uses the commercial tenant's app. Both apps look identical except for
 their RBAC scope.
@@ -111,7 +111,7 @@ being federated to) change.
 |---|---|
 | Issuer | `https://token.actions.githubusercontent.com` |
 | Audience | `api://AzureADTokenExchange` |
-| Subject | `repo:gwexler_microsoft/copilot-cli-byok-azure:environment:<env>` |
+| Subject | `repo:<OWNER>/<REPO>:environment:<env>` |
 | `<env>` values | `comm-pilot` \| `comm-dev` \| `gov-pilot` \| `gov-dev` |
 | FIC display name | `fic-env-<env>` |
 
@@ -234,7 +234,7 @@ flowchart LR
     GH -.->|KEDA scaler polls<br/>runner-registration API| ACAEnv[ACA Environment<br/>cae-byok-runner-&lt;env&gt;]
     ACAEnv --> Job[ACA Job replica<br/>self-hosted runner<br/>ephemeral, 1 job = 1 replica]
     Job -->|VNet-injected| VNET[vnet-copilot-byok-&lt;env&gt;<br/>snet-runner /28]
-    VNET --> APIM[APIM Internal<br/>10.10.0.0/24]
+    VNET --> APIM[APIM Internal<br/><CIDR>]
     VNET --> FND[Foundry PE]
     VNET --> LA[Log Analytics<br/>via private endpoint]
     Job -->|OIDC federated token<br/>subject=:environment:&lt;env&gt;| AAD[Entra ID]
@@ -273,7 +273,7 @@ The smoke-test job, once it's running inside the VNet, asserts:
    [architecture → Model discovery](../docs/architecture.md#model-discovery--the-v1models-operation-on-the-foundry-api-61).
 2. **Subscription-key auth works** — call `/openai/v1/chat/completions` with `dev1`'s and
    `dev2`'s keys; expect 200.
-3. **`emit-metric` actually emitted** (this is the [issue #16](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/16)
+3. **`emit-metric` actually emitted** (this is the issue #16
    regression gate) — KQL against AppInsights `customMetrics` for
    `copilot_byok_tokens_total` over the last 5 min; fail if zero rows.
 4. **Policy behaves** — call with a deliberately oversized prompt → expect 429 from
@@ -310,7 +310,7 @@ trigger manually at any time:
 ./scripts/seed-project-fields.ps1
 
 # From CI (uses PROJECT_TOKEN secret):
-gh workflow run refresh-project-votes.yml --repo gwexler_microsoft/copilot-cli-byok-azure
+gh workflow run refresh-project-votes.yml --repo <OWNER>/<REPO>
 ```
 
 ### Why it needs a PAT (not OIDC)
@@ -371,23 +371,23 @@ first provisioned:
 | Run a deploy (gov pilot) | Actions → `deploy` → `cloud=AzureUSGovernment, action=deploy` → approve |
 | Run a deploy (comm pilot) | Actions → `deploy` → `cloud=AzureCloud, action=deploy` → approve |
 | Push lands automatically to dev | (automatic) `deploy-dev.yml` fires on push to `main`, runs `comm-dev` + `gov-dev` matrix in parallel, then `smoke-test.yml` per env |
-| Re-run dev deploy manually | `gh workflow run deploy-dev.yml --repo gwexler_microsoft/copilot-cli-byok-azure -f envs=comm-dev,gov-dev -f smoke=true` |
-| Run dev teardown now (dry-run) | `gh workflow run teardown-dev.yml --repo gwexler_microsoft/copilot-cli-byok-azure -f envs=comm-dev,gov-dev -f dry_run=true` |
-| Run dev teardown now (real) | `gh workflow run teardown-dev.yml --repo gwexler_microsoft/copilot-cli-byok-azure -f envs=comm-dev,gov-dev` |
+| Re-run dev deploy manually | `gh workflow run deploy-dev.yml --repo <OWNER>/<REPO> -f envs=comm-dev,gov-dev -f smoke=true` |
+| Run dev teardown now (dry-run) | `gh workflow run teardown-dev.yml --repo <OWNER>/<REPO> -f envs=comm-dev,gov-dev -f dry_run=true` |
+| Run dev teardown now (real) | `gh workflow run teardown-dev.yml --repo <OWNER>/<REPO> -f envs=comm-dev,gov-dev` |
 | PR validation | (automatic on every PR) `validate.yml` runs Bicep build + wizard-vs-BYOK policy parity + JSON/YAML/PowerShell/bash syntax. No Azure cost. |
-| Force a votes refresh | `gh workflow run refresh-project-votes.yml --repo gwexler_microsoft/copilot-cli-byok-azure` |
-| Force a smoke test | `gh workflow run smoke-test.yml --repo gwexler_microsoft/copilot-cli-byok-azure -f env=comm-pilot` |
-| Watch the latest run | `gh run watch --repo gwexler_microsoft/copilot-cli-byok-azure` |
-| Rotate `PROJECT_TOKEN` | Generate new classic PAT (`repo`+`project`) → `gh secret set PROJECT_TOKEN --repo gwexler_microsoft/copilot-cli-byok-azure` |
+| Force a votes refresh | `gh workflow run refresh-project-votes.yml --repo <OWNER>/<REPO>` |
+| Force a smoke test | `gh workflow run smoke-test.yml --repo <OWNER>/<REPO> -f env=comm-pilot` |
+| Watch the latest run | `gh run watch --repo <OWNER>/<REPO>` |
+| Rotate `PROJECT_TOKEN` | Generate new classic PAT (`repo`+`project`) → `gh secret set PROJECT_TOKEN --repo <OWNER>/<REPO>` |
 | Bootstrap runner PAT (#58) | `$env:GH_RUNNER_PAT='ghp_xxx'; ./scripts/setup-gh-runner.ps1` (writes `gh-pat` secret on the ACA Job) — then re-deploy with `--parameters ghRunnerPat=$env:GH_RUNNER_PAT` so Bicep flips the Job from Manual placeholder to KEDA Event trigger. For dev envs, set `GH_RUNNER_PAT` as a repo Secret (not Variable) so `deploy-dev.yml` injects it into provision. |
 | Rotate runner PAT (#58) | `./scripts/setup-gh-runner.ps1 -Token <new-pat>` (hot-rotate, no Job re-create needed — `ACCESS_TOKEN` is `secretRef: gh-pat`) |
 | Validate runner pool (#58) | `./scripts/setup-gh-runner.ps1 -Action Status -EnvName comm-pilot` (lists GitHub-registered runners matching the env's labels) |
 | Smoke-trigger the runner (#58) | `./scripts/setup-gh-runner.ps1 -Action Test -EnvName comm-pilot` (dispatches `smoke-test.yml` and watches for a new ACA Job execution) |
 | Inspect runner pool | `az containerapp job execution list -g rg-copilot-byok-<env> -n caj-runner-<env>-<token>` |
-| Tear down a dev env on demand | `gh workflow run teardown-dev.yml --repo gwexler_microsoft/copilot-cli-byok-azure -f envs=comm-dev` (or `az group delete -n rg-copilot-byok-comm-dev --yes`) |
+| Tear down a dev env on demand | `gh workflow run teardown-dev.yml --repo <OWNER>/<REPO> -f envs=comm-dev` (or `az group delete -n rg-copilot-byok-comm-dev --yes`) |
 
 ## Roadmap
 
-Tracked at [`#52`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/52)
+Tracked at `#52`
 with phased child issues. Anything in this doc marked **(planned, `#52`)** lands as those
 children close. The Votes refresh and the manual deploy pipelines are already live.

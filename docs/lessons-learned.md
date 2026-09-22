@@ -61,19 +61,20 @@ instead.
 
 ## 3. Credential lifetime — pick the auth mode to match the fleet
 
-**Lesson:** neither the Copilot CLI nor VS Code BYOK refreshes a short-lived credential
-in-session — the credential is read **once at process start** and reused for the session.
+**Updated 2026-09-17:** distinguish token placement, renewal and gateway validation.
+CLI 1.0.85 documents a per-request credential command; the repo wrappers still mint on
+invocation, and actual expiry tests are pending. VS Code Custom Endpoint needs a renewal
+integration; its built-in Azure provider's Cognitive Services scope is not our gateway audience.
 
-- **`jwt` mode:** Entra access tokens live ~60 min. In a long session the token expires
-  mid-conversation and `validate-jwt` starts returning **401** hourly, with no in-CLI refresh.
-  Workable for interactive single users (relaunch re-mints), painful for unattended fleets.
+- **`jwt` mode:** an expiring Entra access token must be renewed. Direct Okta tokens would
+  have the same client lifecycle requirement; switching IdP does not solve renewal.
 - **`subscriptionKey` mode (recommended for fleets):** a long-lived APIM subscription key,
   validated natively by APIM. No hourly 401. This is the pragmatic default for a
   150–200-machine rollout.
-- The upstream gap is tracked in
-  [docs/feature-request-byok-credential-refresh.md](feature-request-byok-credential-refresh.md)
-  (a `credential_process`-style refresh hook). Until that ships, choose the mode deliberately —
-  don't default to `jwt` for an unattended fleet.
+- See [client capability evidence](feature-request-byok-credential-refresh.md) and the
+  [planned key OR Entra JWT OR Okta JWT design](authentication.md). Same-URL admission,
+  all operation policies, issuer-qualified metrics and quota isolation need tests before rollout.
+  Backend identity is independent of the caller's identity; no Foundry auth change is needed.
 
 ---
 
@@ -112,6 +113,9 @@ deployment-scoped requires one). Full detail:
 ---
 
 ## 5. Telemetry / KQL — what you actually get, and the Gov caveats
+
+For a customer-facing category inventory, existing identity attribution, and proposed
+request-level correlation, see the [APIM and Foundry logging catalog](logging-catalog.md).
 
 The gateway's value over "call Foundry directly" is **per-developer, per-model, attributable**
 telemetry — the backend account only ever sees one caller (the APIM MI or one key) and cannot

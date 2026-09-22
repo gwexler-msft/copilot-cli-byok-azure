@@ -35,7 +35,7 @@ different states across four environments, including one pilot vault with a publ
 
 ### Changed
 - **`registerVnetIntegrated` is now set on all four environments**
-  ([#137](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/137)) — the register
+  (#137) — the register
   Key Vault gets a private endpoint and the register Container Apps environment is VNet-integrated.
   It had never been set in any parameter file, so the pilots were **not reproducible from the
   committed template**: the working one had been built out-of-band with the flag on, and rebuilding
@@ -64,7 +64,7 @@ different states across four environments, including one pilot vault with a publ
   the browser clears the cookie directly, then visits Entra exactly once. Cookie clearing no longer
   depends on a redirect returning to us, which is what the scheme bug had silently broken.
 - **A pilot register Key Vault was reachable from the internet**, holding the Easy Auth client
-  secret ([#137](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/137)). RBAC
+  secret (#137). RBAC
   still gated it, but the network control its counterpart had was absent. One root cause produced
   three different symptoms: on Gov the template's request for a public vault was honoured; on
   Commercial a modify-effect policy rewrote it to `Disabled`, and with no private endpoint that left
@@ -105,11 +105,11 @@ classifier's spend was invisible. All three are fixed and proven on both pilots 
 runs. Nothing here is breaking; the pilots picked it up on the 2026-08-06 deploy.
 
 ### Added
-- **Responses API stateful sub-resources** ([#110](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/110))
+- **Responses API stateful sub-resources** (#110)
   — `GET`/`DELETE /v1/responses/{id}`, `POST .../cancel`, `GET .../input_items`, as four
   operation-scoped policy pairs that skip the API-level body-parse guard (they are body-less), so
   background and resumable Responses turns work.
-- **`copilot_byok_classifier_tokens`** ([#128](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/128))
+- **`copilot_byok_classifier_tokens`** (#128)
   — the auto-route classifier calls the model directly, so its tokens never traversed the pipeline
   and `llm-emit-token-metric` could not see them. They are now attributed per developer. Roughly
   ~300–1000 tokens per *ambiguous* request against a 13–15k main request.
@@ -124,10 +124,10 @@ runs. Nothing here is breaking; the pilots picked it up on the 2026-08-06 deploy
   indistinguishable from success), and fails explicitly when a `429` came from the model deployment
   rather than the `llm-token-limit` policy.
 - **`validate` runs on push to `main`**, not only on pull requests
-  ([#135](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/135)) — with the admin
+  (#135) — with the admin
   bypass in use, every static gate had been silently skipped since 2026-07-23.
 - **Sign-out and a session timeout on the register app**
-  ([#136](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/136)). The page had
+  (#136). The page had
   neither, while displaying a live APIM subscription key in plaintext — shown once, then resident in
   the DOM for as long as the tab stayed open, so an unattended machine leaked the credential as well
   as the session. Two layers, doing different jobs:
@@ -141,20 +141,20 @@ runs. Nothing here is breaking; the pilots picked it up on the 2026-08-06 deploy
   actively working, mid-flow. Idle measures inactivity, the cap measures total session age.
 
 ### Changed
-- **`byok-standard` 20,000 → 100,000 TPM** ([#130](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/130)).
+- **`byok-standard` 20,000 → 100,000 TPM** (#130).
   VS Code packs editor context into every request (13–15k tokens), so the old ceiling `429`d on the
   second turn within a minute and the default tier was unusable for interactive work. A tier TPM is
   bounded on both sides: it must also stay **under** the environment's `modelCapacity`, or APIM stops
   being the throttle and the model deployment becomes it. The dev environments therefore stay at
   20,000 against their deliberately tiny 25k backend.
 - **Auto-route defaults `500/200` → `2000/1500`, classifier on in all four environments**
-  ([#133](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/133)). Commercial ran
+  (#133). Commercial ran
   length-only routing, so `auto` was effectively "always full model" there. The bands and the
   classifier are **one decision**: with the classifier off, a wider ambiguous band just sends traffic
   to the full model. `autoRouteClassifierEnabled` still defaults to `false` because it costs an extra
   call and needs a mini deployment; the pilots opt in explicitly.
 - **The BYOK key step is now part of the main register flow**
-  ([#129](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/129)). The key is still
+  (#129). The key is still
   inlined into `chatLanguageModels.json`, but VS Code keeps a per-provider key in **secret storage**
   and sends **that** in preference to the file, so a key left from an earlier setup silently wins and
   APIM answers *"invalid subscription key"* against a config that looks perfectly correct. The
@@ -210,7 +210,7 @@ runs. Nothing here is breaking; the pilots picked it up on the 2026-08-06 deploy
 **One standard path; the gateway picks the backend under the wire.** The parallel
 `/openai-commercial` route and the Claude streaming sidecar are gone. Commercial models are reached
 on the **default `/openai` route** via the `commercial-models` sentinel
-([#118](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/118)), and
+(#118), and
 Anthropic-speaking clients get a **native `/anthropic` route** instead of a translation layer.
 
 > ⚠️ **Breaking.** Any client whose `COPILOT_PROVIDER_BASE_URL` ends in `/openai-commercial` must
@@ -233,7 +233,7 @@ Anthropic-speaking clients get a **native `/anthropic` route** instead of a tran
   `/anthropic` route). The symmetric guard on `/anthropic` refuses an OpenAI-shaped body the same
   way. The principle, now explicit: **the gateway validates and explains — it never silently
   reshapes a request.** This replaces the OpenAI→Anthropic translation shim
-  ([#116](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/116)).
+  (#116).
 
 ### Removed
 - **(BREAKING) The `/openai-commercial` route.** Its API module
@@ -244,16 +244,16 @@ Anthropic-speaking clients get a **native `/anthropic` route** instead of a tran
   reaches the same backend on the route the CLI *can* use, which also collapses a duplicated policy
   that had to be kept in lockstep (six route policies became four).
   **Migration:** use `https://<gateway>/openai` and list the models in `commercialModels`.
-- **The Claude streaming sidecar** ([#117](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/117))
+- **The Claude streaming sidecar** (#117)
   — the `anthropic-stream-proxy` ACI at `claude-proxy.byok.internal`, its ACI module and its image
   directory. It existed only to reshape a stream that the in-policy shim had to buffer; with the
   native `/anthropic` passthrough there is nothing to reshape, and **APIM relays SSE unbuffered**, so
   token-by-token Claude works with no extra hop, image bake or private-DNS dependency.
-- **Cross-surface translation** ([#123](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/123))
+- **Cross-surface translation** (#123)
   — the `byok-translate-inbound` / `byok-translate-outbound` policy fragments and the
   `translate-unsupported-surface` named value. Same reason: a reshaped request is a *different*
   request (different token accounting, different content-filter surface). Surface **validation**
-  ([#120](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/120)) stays — the typed
+  (#120) stays — the typed
   `400 UnsupportedApiTypeForModel` still names the surfaces a model does support.
 - **Parameters removed:** `foundryCommercialApiName`, `foundryCommercialApiPath`,
   `addCommercialToProductTiers`, `anthropicStreamProxyImageTag` (plus
@@ -279,7 +279,7 @@ Anthropic-speaking clients get a **native `/anthropic` route** instead of a tran
 ## [1.4.0] — 2026-07-25
 
 Streamed requests are now **metered**. Token metrics move from a hand-rolled policy pair to APIM's
-built-in `llm-emit-token-metric` ([#126](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/126)).
+built-in `llm-emit-token-metric` (#126).
 
 > ⚠️ **Dashboard-breaking.** The token metric **names change**. Anything querying
 > `copilot_byok_prompt_tokens` / `copilot_byok_completion_tokens` must move to `Prompt Tokens` /
@@ -330,8 +330,8 @@ built-in `llm-emit-token-metric` ([#126](https://github.com/gwexler_microsoft/co
 ## [1.3.0] — 2026-07-23
 
 Non-streaming **cross-surface translation** — Phase 3 of the adaptive multi-type routing epic
-([#119](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/119) /
-[#123](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/123)). Opt-in, default off.
+(#119 /
+#123). Opt-in, default off.
 
 ### Added
 - **On-the-fly surface translation in all six route policies** (`foundry` / `aoai` / `commercial` ×
@@ -353,9 +353,9 @@ Non-streaming **cross-surface translation** — Phase 3 of the adaptive multi-ty
 ### Notes / limits
 - **Streaming is not translated** — a streaming request to an unsupported surface still falls back to
   the Phase 2 typed 400; the streaming transcoder is Phase 4
-  ([#121](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/121)).
+  (#121).
 - **`chat` ⇄ `messages`** (Anthropic) stays with the existing commercial-route shim
-  ([#116](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/116)); this phase covers
+  (#116); this phase covers
   `chat/completions` ⇄ `responses`. _(Superseded in 2.0.0: the shim and this phase's translation were
   both removed in favour of the native `/anthropic` route and a typed `400 WireFormatMismatch`.)_
 
@@ -368,9 +368,9 @@ Non-streaming **cross-surface translation** — Phase 3 of the adaptive multi-ty
 ## [1.2.0] — 2026-07-23
 
 Model API-type **validation** — Phase 2 of the adaptive multi-type routing epic
-([#119](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/119) /
-[#120](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/120)), plus the automation
-that closes Phase 1 ([#122](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/122)).
+(#119 /
+#120), plus the automation
+that closes Phase 1 (#122).
 
 ### Added
 - **Surface validation in all six route policies** (`foundry` / `aoai` / `commercial` ×
@@ -405,14 +405,14 @@ that closes Phase 1 ([#122](https://github.com/gwexler_microsoft/copilot-cli-byo
 
 ### Notes
 - On-the-fly cross-surface translation remains Phase 3
-  ([#123](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/123)); the streaming
-  transcoder is Phase 4 ([#121](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/121)).
+  (#123); the streaming
+  transcoder is Phase 4 (#121).
 
 ## [1.1.0] — 2026-07-22
 
 Model API-type discovery — Phase 1 of the adaptive multi-type routing epic
-([#119](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/119) /
-[#122](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/122)).
+(#119 /
+#122).
 
 ### Added
 - **Per-route model→API-type capability map.** New APIM named values `foundry-model-types`
@@ -437,8 +437,8 @@ Model API-type discovery — Phase 1 of the adaptive multi-type routing epic
 ### Notes
 - Storage + discovery only. Policy enforcement (validate the requested surface against the map and
   return a typed error on mismatch) lands in Phase 2
-  ([#120](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/120)); on-the-fly
-  translation in Phase 3 ([#123](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/123)).
+  (#120); on-the-fly
+  translation in Phase 3 (#123).
 
 ## [1.0.0] — 2026-07-21 (retroactive baseline)
 
@@ -455,18 +455,18 @@ account fronted by an **internal-VNet Azure API Management AI gateway**, paramet
   (cross-cloud commercial Foundry) — _`/openai-commercial` retired in 2.0.0; the commercial backend
   is now selected on `/openai` by the `commercial-models` sentinel._ OpenAI-compatible `/v1/*` short
   paths **and** Azure-native deployment-scoped paths; `GET /v1/models` for client discovery
-  ([#97](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/97)).
+  (#97).
 - **Responses API** support (`/v1/responses` → account-root, versionless rewrite) alongside
   chat/completions/completions/embeddings.
 - **Auto-routing**: sentinel model (`auto`/`byok-auto`) tiers requests to a mini/full deployment
   with an optional classifier.
 - **Anthropic / Claude** on the commercial route
-  ([#116](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/116)): OpenAI↔Anthropic
+  (#116): OpenAI↔Anthropic
   shim + native `/v1/messages`, plus a streaming SSE transcoder sidecar
-  ([#117](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/117)).
+  (#117).
 - **`commercialModels`** cross-cloud routing via the default `/openai` policy so the Copilot CLI
   can reach commercial-only models
-  ([#118](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/118)).
+  (#118).
 
 ### Infrastructure
 - Subscription-scoped `main.bicep` creates the RG and full topology: VNet + subnets (child
@@ -485,6 +485,6 @@ account fronted by an **internal-VNet Azure API Management AI gateway**, paramet
 - Sanitized delivery playbooks: `docs/lessons-learned.md`, `docs/operations-lessons.md`,
   `docs/operations-runbook.md`.
 
-[Unreleased]: https://github.com/gwexler_microsoft/copilot-cli-byok-azure/compare/v1.1.0...HEAD
-[1.1.0]: https://github.com/gwexler_microsoft/copilot-cli-byok-azure/releases/tag/v1.1.0
-[1.0.0]: https://github.com/gwexler_microsoft/copilot-cli-byok-azure/releases/tag/v1.0.0
+[Unreleased]: https://github.com/<OWNER>/<REPO>/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/<OWNER>/<REPO>/releases/tag/v1.1.0
+[1.0.0]: https://github.com/<OWNER>/<REPO>/releases/tag/v1.0.0

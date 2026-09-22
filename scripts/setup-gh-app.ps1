@@ -42,7 +42,7 @@
          (those run per-cloud, so they stay a manual follow-up).
 
 .PARAMETER Owner
-    Repo owner / org. Default `gwexler_microsoft`.
+    Repo owner / org. Default `<OWNER>`.
 
 .PARAMETER Repo
     Repository name. Default `copilot-cli-byok-azure`.
@@ -80,7 +80,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Owner = 'gwexler_microsoft',
+    [string]$Owner = '<OWNER>',
     [string]$Repo = 'copilot-cli-byok-azure',
     [string]$AppName = 'copilot-byok-runner',
     [switch]$UserAccount,

@@ -3,7 +3,7 @@
 Forward-looking plan for the Copilot BYOK gateway. For **shipped** work see
 [RELEASES.md](RELEASES.md); for the interactive board see the **BYOK Gateway Roadmap** Project
 (filter `label:roadmap is:open`) and the umbrella issue
-[#17](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/17).
+#17.
 
 ## How this maps to GitHub
 
@@ -19,19 +19,48 @@ Forward-looking plan for the Copilot BYOK gateway. For **shipped** work see
 
 | Epic / issue | What | Theme |
 |---|---|---|
-| _Nothing in flight_ | Recently shipped: the multi-type routing epic ([#119](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/119), Phases 1–3 in 1.1.0 / 1.2.0 / 1.3.0) and streamed-request token metering ([#126](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/126), 1.4.0) — all validated live on both pilots. Pick the next theme from the umbrella below. | — |
+| _Nothing in flight_ | Recently shipped: the multi-type routing epic (#119, Phases 1–3 in 1.1.0 / 1.2.0 / 1.3.0) and streamed-request token metering (#126, 1.4.0) — all validated live on both pilots. Pick the next theme from the umbrella below. | — |
 
 ## Next
 
+### Authentication design pending implementation
+
+[Same-endpoint key OR Entra JWT OR Okta JWT](authentication.md) preserves existing client
+URLs and backend authentication while identifying JWT callers from validated claims.
+Implementation is tracked in epic #139,
+not shipped functionality. The epic and children carry the `roadmap` label; board horizons
+are managed separately.
+It covers inference, discovery, Responses follow-ups, optional AOAI/Anthropic routes and
+standalone IntelliJ (Bicep/Terraform; VM/Container Apps). First gate: prove native key
+validation/product quotas and JWT admission can coexist without anonymous access. Client
+renewal, identity/quota isolation and all-surface negative tests precede pilot rollout.
+
 | Issue | What | Theme |
 |---|---|---|
-| _Nothing queued_ | — | — |
+| #139 | [Same-endpoint key OR Entra JWT OR Okta JWT](authentication.md); implementation pending | Authentication |
+
+| Step | Tracking |
+|---|---|
+| 1. Admission proof and design decision | #140 |
+| 2. Entra/Okta trust configuration | #141 |
+| 3. Shared validation and stable identity | #142 |
+| 4. All policies and deployment packages | #143 |
+| 5. Quotas, telemetry and response authorization | #144 |
+| 6. Client credential acquisition and renewal | #145 |
+| 7. Entra acceptance, key regression and rollout | #147 |
+| Deferred customer Okta acceptance gate | #146 |
+
+Fully validate Entra in controlled environments and implement the Okta equivalent with
+local/fixture checks. Full Okta testing requires the customer environment: after engineering
+completion it remains **implemented, pending customer validation**, disabled by default.
+The customer gate does not block an accepted Entra release, but keeps the epic open unless
+its scope is explicitly revised. No runtime implementation is claimed complete today.
 
 ## Later
 
 | Issue | What | Theme |
 |---|---|---|
-| [#121](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/121) | Streaming chat⇄responses sidecar transcoder. **Demand-gated** — build only when a path-hardcoded client (e.g. Copilot CLI) must *stream* against a genuinely single-surface model. Any repointable client can use APIM's `/responses` route directly, which already streams natively. | multi-model |
+| #121 | Streaming chat⇄responses sidecar transcoder. **Demand-gated** — build only when a path-hardcoded client (e.g. Copilot CLI) must *stream* against a genuinely single-surface model. Any repointable client can use APIM's `/responses` route directly, which already streams natively. | multi-model |
 
 ## Themes on the horizon (umbrella #17)
 

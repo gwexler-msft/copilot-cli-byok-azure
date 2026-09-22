@@ -36,7 +36,7 @@
     its next reprovision). Envs not in the active `az` cloud are skipped with guidance.
 
 .PARAMETER Repository
-    GitHub repo in `<owner>/<repo>` form. Default `gwexler_microsoft/copilot-cli-byok-azure`.
+    GitHub repo in `<owner>/<repo>` form. Default `<OWNER>/<REPO>`.
 
 .PARAMETER RepoSecretName
     The GitHub Actions repo secret name to update. Default `GH_RUNNER_PAT`.
@@ -75,7 +75,7 @@
 param(
     [string]$Pat,
     [string[]]$Envs = @('comm-pilot', 'gov-pilot'),
-    [string]$Repository = 'gwexler_microsoft/copilot-cli-byok-azure',
+    [string]$Repository = '<OWNER>/<REPO>',
     [string]$RepoSecretName = 'GH_RUNNER_PAT',
     [switch]$SkipRepoSecret,
     [switch]$DryRun

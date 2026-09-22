@@ -2,7 +2,7 @@
 # Idempotent: re-running just refreshes Votes and re-applies labels (no duplicate side effects).
 [CmdletBinding()]
 param(
-    [string]$Owner       = 'gwexler_microsoft',
+    [string]$Owner       = '<OWNER>',
     [string]$Repo        = 'copilot-cli-byok-azure',
     [int]   $ProjectNumber = 1
 )

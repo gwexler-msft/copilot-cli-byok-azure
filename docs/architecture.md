@@ -11,11 +11,12 @@ Make the developer's Copilot dev surfaces — **`gh copilot` / `copilot` CLI** *
 **VS Code 1.122+ Copilot Chat** (via the stable Custom Endpoint provider) — hit a
 **customer-private** Azure OpenAI / Microsoft Foundry deployment instead of GHCP SaaS,
 without the laptop ever talking to a public model endpoint. Either client authenticates
-to the private APIM gateway with **one of two interchangeable credentials** — a
-per-developer **APIM subscription key** (the default, and what both clients use in practice)
-or a per-developer **Entra JWT** (technically usable from either client, but neither the CLI
-nor VS Code's Custom Endpoint auto-refreshes the ~1 h token yet, so it needs an external
-refresh wrapper) — and APIM is the only party that ever holds backend access.
+to the private APIM gateway with the credential selected by deployment `authMode`: a
+per-developer **APIM subscription key** (current CI default) or an **Entra access token**.
+CLI 1.0.85 documents a credential-command hook; integration and token-expiry tests remain
+pending. VS Code Custom Endpoint still needs a renewal solution. APIM holds backend access.
+**Same-endpoint key OR Entra JWT OR Okta JWT is planned, not implemented**; see the
+[authentication design](authentication.md) for the trust contract and rollout gates.
 
 ## Trust boundary
 
@@ -44,7 +45,7 @@ flowchart LR
         MCP["AI tooling — MCP servers (OPTION A: external)<br/>remote / hosted, e.g. api.githubcopilot.com/mcp<br/>separate plane: tools, not the model path — #74<br/>egress decision (allow or deny at the edge)"]
     end
 
-    subgraph VNet["Customer Azure VNet 10.60.0.0/16 (private)"]
+    subgraph VNet["Customer Azure VNet <CIDR> (private)"]
         APIM["AI Gateway<br/>(Azure API Management — internal VNet mode, classic Developer SKU)<br/>GenAI policies · authMode: subscriptionKey (default) | jwt<br/>validate creds, token-limit + token-metrics,<br/>strip creds, inject MI token, load-balance + route by model<br/>auto-select model in-policy when model=auto — FREE (#73)"]
         PROXY["Subkey proxy — nginx ACI in snet-aci (opt-in #108)<br/>deployFoundrySubkeyProxy=true · stable FQDN proxy.byok.internal (VNet private DNS)<br/>translates Authorization: Bearer &lt;APIM sub key&gt; → api-key header<br/>forwards to Internal APIM /openai; serves the dynamic /v1/models list"]
         subgraph Backends["Model backends (Private Endpoints, publicNetwork=Off)"]
@@ -77,7 +78,7 @@ flowchart LR
     end
 
     CLI -- "default: api-key header to private APIM" --> APIM
-    CLI -. "authMode=jwt: Entra JWT in api-key header (~1h TTL; CLI can't auto-refresh yet — gh/copilot-cli#3682)" .-> APIM
+    CLI -. "authMode=jwt: Entra JWT in api-key header; credential-command integration pending" .-> APIM
     CLI -. "config-only: unset COPILOT_PROVIDER_* (off by default)" .-> SAAS
     CLI -. "GitHub entitlement — best-effort phone-home, NOT required (deniable)" .-> ENT
 
@@ -157,7 +158,7 @@ flowchart LR
 > implemented" boxes.
 >
 > The **`Register app`** box (top-left) is the self-serve onboarding layer
-> tracked in [`#64`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/64). It
+> tracked in `#64`. It
 > is **logically inside the private VNet boundary** — drawn as a separate box only to keep the
 > diagram readable: it is an external ACA env with `registerPrivateNetworking=true` (the default)
 > setting the env `publicNetworkAccess=Disabled` and fronting it with a **Private Endpoint** in
@@ -168,8 +169,8 @@ flowchart LR
 > least-privilege managed identity, and writes the resulting client config to the laptop —
 > `COPILOT_PROVIDER_*`
 > for the **CLI** or `chatLanguageModels.json` for **VS Code**. The dotted **`Entra ID → Register
-> app`** edge is the **Entra Easy Auth** sign-in that fronts the app ([`#82`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/82),
-> [`#68`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/68)) — so `Entra ID`
+> app`** edge is the **Entra Easy Auth** sign-in that fronts the app (`#82`,
+> `#68`) — so `Entra ID`
 > plays **two** roles on this diagram: it signs the developer in to the Register app *and* it is
 > the issuer APIM's MI authenticates to (and, in `jwt` mode, the `validate-jwt` authority). See
 > [Self-serve developer onboarding](#self-serve-developer-onboarding-planned--64).
@@ -195,7 +196,7 @@ flowchart LR
 > a subscription key only from the `api-key` header/query, so it can't accept a subkey delivered as a
 > Bearer token. The proxy — a stock **nginx Azure Container Instance** injected into the VNet
 > ([apim-subkey-proxy-aci.bicep](../infra/modules/apim-subkey-proxy-aci.bicep),
-> [`#108`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/108)) — bridges the
+> `#108`) — bridges the
 > gap: it strips `Authorization: Bearer <APIM subscription key>`, re-injects it as the `api-key`
 > header, and forwards to the **private** Internal APIM `/openai` route (streaming SSE end to end).
 > It has a **private IP only** and is reachable strictly **in-VNet** (P2S VPN / test VM) — no public
@@ -210,8 +211,8 @@ flowchart LR
 > sentinel first so selecting it triggers the free in-policy tiered auto-routing. A loopback policy
 > was ruled out (Internal-mode APIM can't hairpin to its own gateway VIP → 500) and a Container App
 > won't work (the register env isn't VNet-injected); see
-> [`#108`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/108) /
-> [`#102`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/102).
+> `#108` /
+> `#102`.
 >
 > **How it's built (implementation insights).** The proxy is *entirely* one self-contained Bicep
 > module ([apim-subkey-proxy-aci.bicep](../infra/modules/apim-subkey-proxy-aci.bicep)) — there is
@@ -237,8 +238,8 @@ flowchart LR
 >
 > The **`CI/CD self-hosted runner`** group (bottom of the VNet) is the opt-in
 > ([`deployGhRunner=true`](../infra/main.bicep)) build plane tracked in
-> [`#57`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/57) /
-> [`#58`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/58). Hosted runners are
+> `#57` /
+> `#58`. Hosted runners are
 > disabled at the EMU enterprise level, so smoke/deploy workflows `runs-on:` a **VNet-injected,
 > KEDA-scaled, ephemeral** runner pool implemented as an Azure Container Apps **Job**
 > (`caj-runner-<env>`, [gh-runner.bicep](../infra/modules/gh-runner.bicep)). It is **outbound-only**
@@ -323,11 +324,11 @@ flowchart LR
 > The CLI reaches the gateway with **one of two interchangeable credentials** (both ride the
 > `api-key` header). The solid edge is the default **`subscriptionKey`** mode; the dotted edge
 > is opt-in **`authMode=jwt`**, which sends a short-lived **Entra JWT (~1 h TTL)**. The CLI
-> cannot auto-refresh/mint that token on the fly today — a known, tracked limitation
-> ([gh/copilot-cli#3682](https://github.com/github/copilot-cli/issues/3682)) — so `jwt` mode
-> currently needs an external refresh wrapper, which is why `subscriptionKey` (long-lived key)
-> is the recommended default. **VS Code's Custom Endpoint provider doesn't refresh bearer
-> tokens either**, so it pins to `subscriptionKey` mode (`api-key` header) in practice. See
+> now documents a per-request credential command in 1.0.85, but this repo's wrapper does not
+> yet configure it and gateway expiry tests are pending. `subscriptionKey` remains the fleet
+> default. **VS Code's Custom Endpoint provider still needs a renewal integration**, so it
+> uses `subscriptionKey` mode (`api-key` header) in practice. See the
+> [capability record](feature-request-byok-credential-refresh.md) and
 > [Authentication modes](#authentication-modes).
 
 Key points the diagram encodes:
@@ -526,12 +527,18 @@ The dev laptop has:
 
 ## Authentication modes
 
-The gateway accepts exactly one caller credential, chosen at deploy time by the
-`authMode` parameter. **Both modes deliver the same per-developer telemetry and
-rate-limiting; they differ in how the developer's identity is established and how the
-secret is managed.** The credential always rides in the `api-key` header, because the
-Copilot CLI cannot send custom headers (issue #3399) and that is the only header slot it
-exposes.
+The current gateway chooses its caller credential type at deploy time using `authMode`.
+Key mode attributes calls to APIM subscriptions and uses product tiers; JWT mode attributes
+calls to Entra `oid` and uses flat per-user limits. Foundry/AOAI JWT policies currently
+require `api-key`; Anthropic JWT accepts Bearer or `x-api-key`. CLI header capabilities have
+expanded, but that does not change the current policy contract.
+
+**Planned:** one credential per request, accepting key OR Entra JWT OR Okta JWT at the same
+client-facing URLs. This is not a requirement to supply both key and JWT. The
+[authentication design](authentication.md) covers admission before policy execution, separate
+issuer/audience validation, stable identity, discovery/Responses coverage and client renewal.
+Native subscription validation and product limits must be proven to survive the admission
+change; disabling subscription requirements alone is not the implementation.
 
 | `authMode` | Caller credential | How identity is established |
 |---|---|---|
@@ -548,10 +555,10 @@ static-credential model and any keys already in their tooling). It also sidestep
 per-invocation token mint and no token-refresh wrapper to run. Teams that want
 cryptographic per-user identity should evaluate `authMode=jwt` below.
 
-`authMode=jwt` is retained as an opt-in **stronger control** (true per-user identity,
-short-lived tokens, instant revocation). Switching modes is a single parameter flip plus
-redeploy — no structural change, because both policy variants and all named values are
-always present.
+`authMode=jwt` is retained as an opt-in control for validated per-user identity and
+short-lived tokens. Local JWT validation does not guarantee instant revocation: an issued
+token may remain valid until expiry. Switching modes requires a coordinated redeploy;
+only the selected policy variant is deployed to each operation.
 
 ### Self-serve developer onboarding (planned — `#64`)
 
@@ -566,7 +573,7 @@ The planned fix is a **self-serve "register" web app**: a developer signs in onc
 and, with one click, gets their own APIM subscription **and** a ready-to-use client config
 written to disk for whichever surface they use — `chatLanguageModels.json` for **VS Code** or
 `COPILOT_PROVIDER_*` env vars for the **CLI** — no admin ticket, no JSON hand-editing. Tracked in
-[`#64`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/64) (with sub-issues
+`#64` (with sub-issues
 `#65`–`#72`).
 
 > **Works on Commercial and Government, unchanged.** The app provisions via the public ARM
@@ -646,7 +653,7 @@ flowchart LR
 ```
 
 > **Key design properties** (full rationale in
-> [`#64`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/64)):
+> `#64`):
 >
 > - **Control-plane only → no VNet injection.** The app provisions via the **public ARM
 >   control plane** (`Microsoft.ApiManagement/service/subscriptions`); it never touches the
@@ -655,7 +662,7 @@ flowchart LR
 >   VNet-injected ACA. Only the *developer's* later chat traffic hits the private gateway.
 > - **Least privilege** — the app's managed identity gets a **custom role** limited to
 >   `subscriptions/*` + `listSecrets`, not the broad "API Management Service Contributor"
->   ([`#66`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/66)).
+>   (`#66`).
 > - **Easy Auth secret in Key Vault, never in IaC** — the app registration's client secret is
 >   minted by [setup-register-entra](../scripts/setup-register-entra.ps1) and stored in a
 >   dedicated **RBAC Key Vault** ([register-kv.bicep](../infra/modules/register-kv.bicep)); the
@@ -664,15 +671,15 @@ flowchart LR
 >   but is the natural home for any future platform secret (see the trust-boundary diagram note).
 > - **Idempotent / no key sprawl** — `sid = hash(oid)`, so re-registering returns or
 >   regenerates the *same* subscription rather than minting new keys
->   ([`#71`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/71)).
+>   (`#71`).
 > - **Tier governance preserved** — Entra group membership maps to the product scope
 >   (`byok-standard` / `byok-power`), inheriting that tier's rate-limit / token-limit / quota
->   ([`#67`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/67)).
+>   (`#67`).
 > - **Zero hand-editing, either client** — the installer renders the developer's host + key
 >   into whichever surface they use: the [`samples/vscode`](../samples/vscode) templates →
 >   `chatLanguageModels.json` for **VS Code**, or the `COPILOT_PROVIDER_*` env block (base URL +
 >   key) for the **CLI** — merging, not clobbering, any existing providers
->   ([`#70`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/70)).
+>   (`#70`).
 >   A developer who uses **both** surfaces gets **both** artifacts from the one registration
 >   (same subscription key, two configs); both are written to **user space** — the VS Code
 >   user-profile path and a per-user CLI env snippet — so no admin rights or machine-wide
@@ -684,9 +691,9 @@ flowchart LR
 > returned **HTTP 200** with a `gpt-5.1` completion when a Gov Entra JWT was supplied in the
 > `api-key` header, and **HTTP 401** ("invalid Entra token") for a bad token — confirming
 > `validate-jwt` enforcement and the full chain *CLI → APIM (validate-jwt) → strip creds →
-> APIM system-MI token for `cognitiveservices.azure.us` → private-endpoint Foundry*. The CLI's
-> lack of custom-header support (github/copilot-cli#3399) is **not** a blocker: the JWT rides
-> in the single `api-key` header slot and the policy re-injects it as `Authorization: Bearer`.
+> APIM system-MI token for `cognitiveservices.azure.us` → private-endpoint Foundry*. The JWT
+> rides in `api-key`, and the policy re-injects it as `Authorization: Bearer`. This remains
+> the policy contract even though current CLI versions support custom headers.
 > Tokens mint with `az account get-access-token --scope "<AppId>/.default"` (v2 `aud` = the
 > app client-ID GUID). Gov OIDC metadata resolves at `login.microsoftonline.us`. Note: `gpt-5.1`
 > requires `max_completion_tokens` (not `max_tokens`).
@@ -714,23 +721,33 @@ sequenceDiagram
     APIM-->>Dev: completion
 ```
 
-### Mode B — Entra JWT (opt-in stronger control)
+### Mode B — JWT: Entra ID or Okta (Okta planned)
+
+Entra JWT is implemented with deployment-wide `authMode=jwt`. The diagram shows the
+target caller-issuer choice; **direct Okta validation, issuer-qualified identity and
+same-endpoint key OR JWT admission are planned**, not deployed. Today's Foundry JWT
+path requires `api-key`; the future header contract and client renewal must pass the
+[authentication acceptance gates](authentication.md#rollout-and-acceptance-gates).
+The backend hop remains Entra managed identity regardless of the caller's issuer.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant Dev as Copilot CLI (laptop / test VM)
-    participant Entra as Entra ID
+  participant IdP as Caller IdP: Entra ID or Okta (planned)
     participant APIM as APIM (internal VNet)
+  participant Entra as Entra ID (backend identity)
     participant Model as AOAI / Foundry (Private Endpoint)
 
-    Dev->>Entra: az account get-access-token<br/>--resource api://copilot-byok-gateway
-    Entra-->>Dev: v2 JWT (aud = client-ID GUID, ~1h)
-    Note over Dev: api-key header = Entra JWT
-    Dev->>APIM: POST /openai/v1/chat/completions<br/>api-key: <JWT>
-    APIM->>APIM: validate-jwt vs Entra openid-config<br/>require scope cli.invoke (401 if invalid)
-    APIM->>APIM: developer identity = oid / preferred_username<br/>emit-metric + rate-limit-by-key
-    APIM->>APIM: strip api-key / Authorization
+  Note over Dev,APIM: Target JWT flow. Okta and key/JWT coexistence are not deployed
+  Dev->>IdP: Obtain gateway-scoped user access token<br/>using issuer-specific authentication
+  IdP-->>Dev: Signed access JWT for gateway audience
+  Note over Dev: One caller credential. Renewal handled by client/helper
+  Dev->>APIM: POST /openai/v1/chat/completions<br/>JWT in supported credential header
+  APIM->>APIM: Validate against exact trusted issuer<br/>signature, audience, expiry, scope and user/client claims
+  APIM->>APIM: Reject invalid tokens. No fallback to key auth
+  APIM->>APIM: Target identity: Entra tenant + oid or Okta issuer + sub<br/>emit metrics + enforce JWT limits
+  APIM->>APIM: Strip caller credentials before backend forwarding
     APIM->>Entra: authentication-managed-identity<br/>(APIM system MI)
     Entra-->>APIM: MI access token for cognitiveservices.azure.us
     APIM->>Model: Authorization: Bearer <MI token><br/>/openai/deployments/{model}/chat/completions
@@ -740,6 +757,9 @@ sequenceDiagram
 ```
 
 ### Side-by-side comparison
+
+This table describes the currently implemented deployment modes, not the planned Okta
+or same-endpoint coexistence flow above.
 
 | Dimension | `subscriptionKey` (default) | `jwt` |
 |---|---|---|
@@ -793,29 +813,21 @@ End-to-end the flow is:
 
 ### Upstream CLI dependencies & the token-refresh gap (`authMode=jwt`)
 
-Two distinct Copilot CLI limitations shape `jwt` mode. They are often conflated — they
-are not the same problem.
+As checked on 2026-09-16, CLI 1.0.85 provider help documents
+`COPILOT_PROVIDER_API_KEY_COMMAND` (per-request credential output),
+`COPILOT_PROVIDER_HEADERS` and `COPILOT_PROVIDER_BEARER_TOKEN`. The refresh request
+[#3682](https://github.com/github/copilot-cli/issues/3682) and header request
+[#3399](https://github.com/github/copilot-cli/issues/3399) were still open despite those
+capabilities. Header placement is not token renewal, and a help check is not an expiry test.
 
-| Limitation | Effect on this design | Upstream issue |
-|---|---|---|
-| **No custom headers** — the CLI exposes only the `api-key` slot | The JWT is *smuggled* in the `api-key` header and the policy re-injects it as `Authorization: Bearer` so `validate-jwt` can read it (steps 1–2 of [byok-foundry-policy.xml](../policies/byok-foundry-policy.xml)) | [github/copilot-cli#3399](https://github.com/github/copilot-cli/issues/3399) *(open, Feature)* |
-| **Static credential, read once at startup** — no refresh hook | The ~60–90 min Entra token expires mid-session → APIM returns **401** with no way for the CLI to re-mint. Requires an external refresh mechanism (a local token-refreshing sidecar proxy) | *No upstream issue exists yet* — see [docs/feature-request-byok-credential-refresh.md](feature-request-byok-credential-refresh.md) |
+The repo's wrappers still mint Entra tokens on invocation. No automatic Okta helper or
+JWT-refresh sidecar is supplied. The existing nginx subkey proxy only rewrites headers.
+The VS Code built-in Azure provider's Cognitive Services authentication is not a substitute
+for this gateway's custom audience; Custom Endpoint still needs a renewal integration.
 
-**If #3399 ships (custom headers):** the change is *cosmetic cleanup only*. The JWT moves
-into a real `Authorization: Bearer <jwt>` header (e.g. `COPILOT_EXTRA_HEADERS`), and the
-policy's api-key→Bearer re-injection (steps 1–2) can be deleted because `validate-jwt`
-reads `Authorization` natively. **The expiry cliff is unchanged** — custom headers are
-still read once at startup, so the sidecar is still required.
-
-**The transformational fix is the missing one** — a credential *refresh* capability (a
-per-request credential command, a file-backed credential the CLI re-reads, or native
-OAuth client-credential refresh). That would let us **delete the sidecar** and make `jwt`
-mode seamless. It is *not* #3399 and *not* #3448 (extra request params); it does not yet
-exist upstream, so we draft it in [feature-request-byok-credential-refresh.md](feature-request-byok-credential-refresh.md).
-
-Until then the decision matrix is unchanged: **`subscriptionKey` stays the default**
-(long-lived, no refresh machinery), and **`jwt` is the opt-in stronger control** that
-ships with a token-refreshing sidecar.
+Keep subscription keys as the fleet default until the [authentication acceptance gates](authentication.md#rollout-and-acceptance-gates)
+pass. See the [capability record](feature-request-byok-credential-refresh.md) for current
+client evidence and the original historical feature request.
 
 
 ## Wire format
@@ -839,7 +851,7 @@ gateway accepts both wire formats on the same hostname and routes them to the se
 
 APIM accepts this and:
 
-1. Reads the `api-key` header. (CLI cannot send custom headers — issue #3399.) In
+1. Reads the `api-key` header, the current Foundry/AOAI JWT policy contract. In
    `subscriptionKey` mode the API has `subscriptionRequired: true` with
    `subscriptionKeyParameterNames.header = api-key`, so APIM validates the key
    **natively** (401 on missing/invalid) before the policy runs; in `jwt` mode the
@@ -1018,18 +1030,18 @@ commercial (and Claude / commercial-only models are served on one route only). T
 writes the map into the committed CI param files (the **authoritative** source — a provision
 applies the named value; `az apim nv update` is only a non-authoritative dev refresh). An empty
 map defaults to the inert `{}` placeholder, so the gateway keeps its legacy path-only behaviour
-until discovery runs. Phase 2 policy ([#120](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/120))
+until discovery runs. Phase 2 policy (#120)
 branches on this map to validate the requested surface and, on mismatch, return a typed error
 naming the surface(s) the model actually supports. Tracked under epic
-[#119](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/119) /
-[#122](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/122).
+#119 /
+#122.
 
 ### Client surfaces that drive these routes
 
 | Client | apiType / path | Auth header it sends | Notes |
 |---|---|---|---|
-| **GitHub Copilot CLI** (BYOK `azure` provider) | `responses` (wrapper default) — `/openai/v1/responses`; `completions` fallback — `/openai/v1/chat/completions` | `api-key: <subscription-key>` (default) or `api-key: <JWT>` (jwt mode) — CLI cannot send custom headers (#3399). | The wrapper sets `COPILOT_PROVIDER_WIRE_API`; GPT-5.6 agent tool calls require `responses`. |
-| **VS Code 1.122+ Custom Endpoint** | Either or both — `chat-completions` and/or `responses` | Defaults to `Authorization: Bearer <apiKey>`; for this gateway append `?_vscodeauth=openai.azure` to each model `url` so VS Code sends the key as `api-key: <APIM_SUBSCRIPTION_KEY>` and APIM native subscription-key validation accepts it (see [issue #96](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/96)). Works without GitHub sign-in. | Set `reasoningEffortFormat` to match `apiType`. Ready-made model registration JSON in [`samples/vscode/`](../samples/vscode/). See [deployment-guide → Option C](deployment-guide.md#option-c--vs-code-via-custom-endpoint-byok-provider). |
+| **GitHub Copilot CLI** (BYOK `azure` provider) | `responses` (wrapper default) — `/openai/v1/responses`; `completions` fallback — `/openai/v1/chat/completions` | `api-key: <subscription-key>` (default) or `api-key: <JWT>` (jwt mode). CLI custom headers do not change the deployed policy contract. | The wrapper sets `COPILOT_PROVIDER_WIRE_API`; GPT-5.6 agent tool calls require `responses`. |
+| **VS Code 1.122+ Custom Endpoint** | Either or both — `chat-completions` and/or `responses` | Defaults to `Authorization: Bearer <apiKey>`; for this gateway append `?_vscodeauth=openai.azure` to each model `url` so VS Code sends the key as `api-key: <APIM_SUBSCRIPTION_KEY>` and APIM native subscription-key validation accepts it (see issue #96). Works without GitHub sign-in. | Set `reasoningEffortFormat` to match `apiType`. Ready-made model registration JSON in [`samples/vscode/`](../samples/vscode/). See [deployment-guide → Option C](deployment-guide.md#option-c--vs-code-via-custom-endpoint-byok-provider). |
 | **Anthropic-speaking clients** (`COPILOT_PROVIDER_TYPE=anthropic`, VS Code `apiType: "messages"`, Anthropic SDKs) | `messages` only — `/anthropic/v1/messages` | `x-api-key: <subscription-key>` — the native Anthropic credential header, which is why this route is a separate API (APIM validates the key from the header declared on the API, and only one can be declared). | Opt-in (`deployAnthropicRoute=true`). Not a second backend: the `commercial-models` sentinel still picks it. An OpenAI-shaped body sent here is refused with a typed `400 WireFormatMismatch` rather than reshaped. |
 
 > **Failure mode — model parsing.** The deployment name is derived solely from the
@@ -1455,8 +1467,8 @@ caching), so traffic is safe to spread across regions.
 
 > **Status: design + posture, mostly not built yet.** This section maps where **Model Context
 > Protocol (MCP)** servers fit a private BYOK gateway and what to do about each. The work is
-> tracked under [`#74`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/74)
-> (sub-issues [`#78`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/78)–[`#81`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/81)).
+> tracked under `#74`
+> (sub-issues `#78`–`#81`).
 
 **MCP is a *different plane* from the model path.** Everything else in this document is about
 the **model** request (`CLI / VS Code → APIM → Foundry/AOAI`). MCP is about **tools**: the
@@ -1500,10 +1512,10 @@ flowchart LR
 
 | # | Posture | Transport | Reaches the internet? | Governance | Issue |
 |---|---|---|---|---|---|
-| **1** | **Client-side local** MCP server (stdio) | stdio, same machine | Only if the tool itself calls out | OS / client trust; nothing gateway-side | [`#78`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/78) |
-| **2** | **Remote / hosted** MCP (e.g. GitHub's `…/mcp/`) | Streamable HTTP | **Yes** — public endpoint | An **egress-allowlist** decision (allow or deny at the network edge) | [`#78`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/78) |
-| **3** | **Gateway-governed** MCP (APIM as broker) | Streamable HTTP via APIM | Only as far as the broker allows | Full — same **Entra/subscription-key** auth, **rate-limit/quota**, and **App Insights** telemetry as the model path | [`#79`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/79) |
-| **4** | **Private in-VNet** customer-hosted MCP | Streamable HTTP, PE-only | **No** — private endpoint only | Reached only through the gateway / Private Endpoint, mirroring the model backends | [`#80`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/80) |
+| **1** | **Client-side local** MCP server (stdio) | stdio, same machine | Only if the tool itself calls out | OS / client trust; nothing gateway-side | `#78` |
+| **2** | **Remote / hosted** MCP (e.g. GitHub's `…/mcp/`) | Streamable HTTP | **Yes** — public endpoint | An **egress-allowlist** decision (allow or deny at the network edge) | `#78` |
+| **3** | **Gateway-governed** MCP (APIM as broker) | Streamable HTTP via APIM | Only as far as the broker allows | Full — same **Entra/subscription-key** auth, **rate-limit/quota**, and **App Insights** telemetry as the model path | `#79` |
+| **4** | **Private in-VNet** customer-hosted MCP | Streamable HTTP, PE-only | **No** — private endpoint only | Reached only through the gateway / Private Endpoint, mirroring the model backends | `#80` |
 
 1. **Client-side local MCP (stdio).** The simplest case: a tool server runs as a child process of
    the host on the laptop or in-VNet VM and talks over stdio. There is nothing for the gateway to
@@ -1542,7 +1554,7 @@ flowchart LR
 servers (gateway-exposed and external) can be registered in **Azure API Center** to give
 developers a private, enterprise MCP registry
 ([register/discover](https://learn.microsoft.com/en-us/azure/api-center/register-discover-mcp-server)) —
-tracked in [`#81`](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/81).
+tracked in `#81`.
 
 > **Why this matters for BYOK governance.** Postures 1–2 are *client-side* — the gateway sees
 > nothing — so a deployment that wants tool-call metering, allow-listing, or audit must push tool
@@ -1630,25 +1642,25 @@ values differ per environment. The pattern is:
 |---|---|
 | Resource group | `rg-copilot-byok-<env>` |
 | VNet | `vnet-copilot-byok-<env>-<suffix>` |
-| APIM | `apim-copilot-byok-<env>-<suffix>` (private IP `10.60.1.4`) |
+| APIM | `apim-copilot-byok-<env>-<suffix>` (private IP `<PRIVATE_IP>`) |
 | APIM gateway URL | `https://apim-copilot-byok-<env>-<suffix>.azure-api.us` |
 | AOAI account | `aoaicopilotbyok<env><suffix>` (`https://<account>.openai.azure.us`) |
 | App Insights | `appi-copilot-byok-<env>-<suffix>` |
-| Test VM / Bastion | `vm-copilot-byok` (`10.60.5.4`) / `bas-copilot-byok-<env>-<suffix>` |
+| Test VM / Bastion | `vm-copilot-byok` (`<PRIVATE_IP>`) / `bas-copilot-byok-<env>-<suffix>` |
 | Entra app | client ID + appIdUri `api://copilot-byok-gateway-<tenant-short>` (from `setup-entra`) |
 | Resource suffix | `<suffix>` (e.g. the first 6 chars of `uniqueString(...)`) |
 
 
 ## Network
 
-- **VNet**: `10.60.0.0/16`
-- **snet-apim** `10.60.1.0/27` — APIM internal VNet integration, mandatory NSG rules.
-- **snet-pe** `10.60.2.0/24` — AOAI Private Endpoint (and any future PEs).
-- **snet-dns-in** `10.60.3.0/28` — reserved for future Azure Private DNS Resolver
+- **VNet**: `<CIDR>`
+- **snet-apim** `<CIDR>` — APIM internal VNet integration, mandatory NSG rules.
+- **snet-pe** `<CIDR>` — AOAI Private Endpoint (and any future PEs).
+- **snet-dns-in** `<CIDR>` — reserved for future Azure Private DNS Resolver
   inbound endpoint (so VPN/on-prem clients can resolve the private names via NRPT).
-- **GatewaySubnet** `10.60.255.0/27` — P2S VPN gateway (conditional, `deployVpnGateway`).
-- **snet-vm** `10.60.5.0/27` — optional Windows test VM NIC (conditional, `deployTestVm`).
-- **AzureBastionSubnet** `10.60.6.0/26` — optional Azure Bastion (conditional, `deployTestVm`).
+- **GatewaySubnet** `<CIDR>` — P2S VPN gateway (conditional, `deployVpnGateway`).
+- **snet-vm** `<CIDR>` — optional Windows test VM NIC (conditional, `deployTestVm`).
+- **AzureBastionSubnet** `<CIDR>` — optional Azure Bastion (conditional, `deployTestVm`).
 
 ### Network topology
 
@@ -1663,37 +1675,37 @@ flowchart TB
         GH["api.github.com<br/>(entitlement, allow-listed)"]
     end
 
-    subgraph VNet["VNet vnet-copilot-byok  10.60.0.0/16"]
+    subgraph VNet["VNet vnet-copilot-byok  <CIDR>"]
         direction TB
 
-        subgraph GwSub["GatewaySubnet 10.60.255.0/27 (optional)"]
-            VPNGW["P2S VPN gateway<br/>VpnGw1 — OpenVPN<br/>pool 172.16.200.0/24"]
+        subgraph GwSub["GatewaySubnet <CIDR> (optional)"]
+            VPNGW["P2S VPN gateway<br/>VpnGw1 — OpenVPN<br/>pool <CIDR>"]
         end
 
-        subgraph ApimSub["snet-apim 10.60.1.0/27"]
-            APIM["APIM (Internal VNet)<br/>private IP 10.60.1.4<br/>system-assigned MI"]
+        subgraph ApimSub["snet-apim <CIDR>"]
+            APIM["APIM (Internal VNet)<br/>private IP <PRIVATE_IP><br/>system-assigned MI"]
         end
 
-        subgraph PeSub["snet-pe 10.60.2.0/24"]
+        subgraph PeSub["snet-pe <CIDR>"]
             PEF["PE → Foundry<br/>(AIServices)"]
             PEA["PE → Azure OpenAI<br/>(OpenAI, optional)"]
         end
 
-        subgraph DnsSub["snet-dns-in 10.60.3.0/28 (reserved)"]
+        subgraph DnsSub["snet-dns-in <CIDR> (reserved)"]
             RESOLVER["Private DNS Resolver<br/>inbound endpoint (future)"]
         end
 
-        subgraph VmSub["snet-vm 10.60.5.0/27 (optional)"]
-            VM["Windows test VM<br/>10.60.5.4"]
+        subgraph VmSub["snet-vm <CIDR> (optional)"]
+            VM["Windows test VM<br/><PRIVATE_IP>"]
         end
 
-        subgraph BastSub["AzureBastionSubnet 10.60.6.0/26 (optional)"]
+        subgraph BastSub["AzureBastionSubnet <CIDR> (optional)"]
             BASTION["Azure Bastion"]
         end
     end
 
     subgraph DNS["VNet-linked Private DNS zones"]
-        ZAPIM["azure-api.us (apex)<br/>gateway host → 10.60.1.4"]
+        ZAPIM["azure-api.us (apex)<br/>gateway host → <PRIVATE_IP>"]
         ZOAI["privatelink.openai.azure.us<br/>privatelink.cognitiveservices.azure.us"]
     end
 
@@ -2574,24 +2586,22 @@ is a recommended default, not a fixed decision. The trade-off, stated plainly:
 
 - **Per-developer identity.** A subscription key identifies the developer by *convention*
   — one key issued per developer, surfaced in telemetry as the subscription Id/Name. A
-  JWT identifies the developer *cryptographically* by Entra `oid`, which cannot be shared
-  or spoofed. If keys get shared between developers, the subscription-key identity
-  guarantee weakens; the JWT one does not.
+  JWT binds validated claims to the issuing identity, but it is still a bearer credential:
+  a copied token can be replayed until expiry. Neither mode proves who is at the keyboard.
 - **Secret lifetime.** A subscription key lives in a CLI config file indefinitely and is
   rotated manually. A JWT is minted per-invocation by the wrapper script and expires in
   ~1h — but that same 1h expiry is the operational friction that pushed the customer
   toward keys in the first place.
 - **Revocation.** Revoking a subscription key (or disabling the subscription) locks out
-  that one developer; rotating a *shared* key affects everyone. Disabling a user in Entra
-  (or removing their app-role assignment) locks them out instantly in `jwt` mode.
-- **Header slot.** Copilot CLI can't send custom headers (#3399), so the credential —
-  key or JWT — always rides in the `api-key` header. Both modes fit the BYOK contract
-  identically.
+  that subscription's callers; rotating a *shared* key affects everyone. Disabling an IdP account
+  does not revoke its APIM key, and issued JWTs may remain valid until expiry.
+- **Header slot.** The Azure provider and current Foundry/AOAI JWT policies use `api-key`.
+  Custom-header support does not change gateway validation or implement renewal.
 
 **Recommendation:** ship the pilot on `subscriptionKey` to match what the customer
-already has, and offer `jwt` as the hardening upgrade when they want true per-user
-identity and instant revocation. The switch is one parameter (`authMode`) plus a
-redeploy — no structural change.
+already has. Entra JWT is a deployment-wide alternative with short-lived credentials and
+validated user claims, not instant revocation. Same-URL key OR Entra JWT OR Okta JWT remains
+[planned](authentication.md), subject to admission, policy-coverage and renewal tests.
 
 ## Why APIM Developer SKU for the pilot
 
@@ -2616,8 +2626,8 @@ Not from a developer laptop, by deliberate design:
   endpoints, so the data plane is only reachable **from inside the VNet** — a laptop cannot hit
   it directly.
 - They are deployed **`disableLocalAuth=true`** (API keys off), so a direct caller would need an
-  **Entra token for the Cognitive Services audience**. The CLI cannot mint or refresh that token
-  itself — supplying and rotating that credential is a core reason the gateway exists (see
+  **Entra token for the Cognitive Services audience**. CLI 1.0.85 documents an external
+  credential command, but it does not itself supply gateway governance or backend permissions (see
   [Two tokens, two issuers](#two-tokens-two-issuers-authmodejwt)).
 
 So "direct" is really "from a VNet-resident process holding a Cognitive Services token," not

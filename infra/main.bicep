@@ -404,7 +404,7 @@ param runnerFirewallAdditionalFqdns array = []
 param ghRunnerImage string = 'mcr.microsoft.com/azure-cli:latest'
 
 @description('GitHub repository (`<owner>/<repo>`) used to build OIDC federated-credential subjects for the runner UAMI. Both clouds share the same issuer URL; only the repo + env subject changes.')
-param ghRepository string = 'gwexler_microsoft/copilot-cli-byok-azure'
+param ghRepository string = '<OWNER>/<REPO>'
 
 @description('GitHub Environment names whose OIDC tokens may federate to THIS runner UAMI (subject `repo:<ghRepository>:environment:<name>`). Defaults to this env only; add sibling envs to share a runner pool. Empty array disables federation.')
 param ghRunnerFicEnvSubjects array = [envName]

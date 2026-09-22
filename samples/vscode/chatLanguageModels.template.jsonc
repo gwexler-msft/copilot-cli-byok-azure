@@ -56,7 +56,7 @@
     // decrypted key as the `api-key` header APIM validates. We trigger
     // that path via the `?_vscodeauth=openai.azure` query param on each
     // model url below - see repo issue #96
-    // (https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/96).
+    // (https://github.com/<OWNER>/<REPO>/issues/96).
     // This lets us keep a single apiKey and DROP the plaintext per-model
     // requestHeaders duplication that previously leaked the key to disk.
     // In jwt mode, set apiKey to a fresh Entra access token instead

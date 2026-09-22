@@ -8,7 +8,7 @@ commercial backend instead of the private Foundry. Everything else — caller cr
 tier, quotas, telemetry — is identical either way.
 
 > **The parallel `/openai-commercial` route is retired.** It is superseded by the sentinel
-> ([#118](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/118)), which is what
+> (#118), which is what
 > makes commercial-only models usable from the Copilot CLI at all: the CLI's `azure` provider
 > discards any path on `COPILOT_PROVIDER_BASE_URL`, so it can only ever reach `/openai`. See
 > [Retired](#retired) at the end for what existed and why it went.
@@ -643,7 +643,7 @@ by **base URL**.
 **Why it went.** The Copilot CLI's `azure` provider **discards any path** on
 `COPILOT_PROVIDER_BASE_URL` and always calls `/openai`, so the route was unreachable from the primary
 client it was built for. The `commercial-models` sentinel
-([#118](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/118)) selects the same
+(#118) selects the same
 backend per-request on the route the CLI *can* reach, which made the parallel API redundant — and
 deleting it removed a duplicated policy that had to be kept in lockstep with the original (six route
 policies became four). Removed with it: `infra/modules/apim-foundry-commercial-api.bicep`,
@@ -656,9 +656,9 @@ you were reaching commercially is listed in `commercialModels`.
 ### The Claude streaming sidecar
 
 An in-VNet `anthropic-stream-proxy` Azure Container Instance at `claude-proxy.byok.internal:8080`
-([#117](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/117)) that transcoded
+(#117) that transcoded
 OpenAI ⇄ Anthropic **while streaming**, to work around the fact that the in-policy translation shim
-([#116](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/116)) had to buffer the
+(#116) had to buffer the
 whole response in order to reshape it.
 
 **Why it went.** It only existed to reshape a stream, and reshaping is exactly what the gateway no

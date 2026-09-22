@@ -20,6 +20,10 @@ param existingBackendName string
 @secure()
 param foundryApiKey string = ''
 
+@description('APIM-to-Foundry authentication only; the VM always calls APIM using the developer subscription key.')
+@allowed(['apiKey', 'managedIdentity'])
+param foundryAuthMode string = 'apiKey'
+
 @description('api-version pinned on deployment-scoped Foundry calls.')
 param apiVersion string = '2025-04-01-preview'
 
@@ -100,6 +104,7 @@ module intellijApim 'modules/intellij-apim.bicep' = {
     apimName: apimName
     existingBackendName: existingBackendName
     foundryApiKey: foundryApiKey
+    foundryAuthMode: foundryAuthMode
     apiVersion: apiVersion
     intellijApiPath: intellijApiPath
     existingProductName: existingProductName

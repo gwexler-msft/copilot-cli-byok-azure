@@ -62,7 +62,7 @@ param tags object = {}
 // ------------------------------------------------------------------------------------
 
 @description('GitHub repository in `<owner>/<repo>` form. Used for the KEDA scaler `owner`/`repos` metadata and the runner REPO_URL.')
-param ghRepository string = 'gwexler_microsoft/copilot-cli-byok-azure'
+param ghRepository string = '<OWNER>/<REPO>'
 
 @description('Resource id of the runner user-assigned managed identity (runner-identity module output `uamiId`). Assigned to the ACA Job and used to resolve Key Vault secret references + ACR pulls.')
 param runnerUamiId string

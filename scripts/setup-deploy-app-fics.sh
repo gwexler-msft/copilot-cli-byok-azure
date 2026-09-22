@@ -18,7 +18,7 @@
 #
 set -euo pipefail
 
-REPO_DEFAULT='gwexler_microsoft/copilot-cli-byok-azure'
+REPO_DEFAULT='<OWNER>/<REPO>'
 ENVS_DEFAULT='comm-pilot,comm-dev,gov-pilot,gov-dev'
 
 usage() {

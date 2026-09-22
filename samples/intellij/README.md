@@ -45,8 +45,11 @@ Three ways to satisfy APIM:
    breaks if the client appends `/chat/completions` after the query string).
 
 If you deployed the gateway with `authMode=jwt`, there is no subscription key — put a fresh
-Entra access token in the client's API-key field so it rides as `Authorization: Bearer`
-(good for ~1 hour; these clients do not auto-refresh).
+Entra access token for the gateway audience in the client's credential field. Today's
+Foundry JWT inference and discovery policies require it in `api-key`, not Bearer. A
+Bearer-only client needs a verified header adapter; the existing nginx proxy rewrites
+Bearer to `api-key` but does not validate or renew the token. Token renewal remains a
+client/helper responsibility.
 
 ## What you need before configuring
 
@@ -76,7 +79,7 @@ The **base URL** is `https://<APIM_HOSTNAME>/openai/v1` for the Foundry route (o
 > [github/copilot-cli#4016](https://github.com/github/copilot-cli/issues/4016) — *BYOK
 > (`COPILOT_PROVIDER_*`) still rejected in `--acp` mode: `session/new` → `-32000 Authentication
 > required` (regressed on 1.0.61–1.0.68)*. Until it lands, **use Option 3 (terminal)** for login-free
-> BYOK. Repo tracking: [#107](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/107).
+> BYOK. Repo tracking: #107.
 
 > **The critical distinction.** JetBrains AI Assistant's built-in **"GitHub Copilot"** agent is
 > **not** the BYOK-capable `@github/copilot` CLI — it's the **`@github/copilot-language-server`**
@@ -137,7 +140,7 @@ egress-off** agent cannot proceed: the only ways to satisfy the gate today are a
 permission) or `copilot login` — **both need `github.com` reachable to validate**, defeating the
 air-gapped design.
 
-- **Tracking:** repo [#107](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/107);
+- **Tracking:** repo #107;
   upstream [#4016](https://github.com/github/copilot-cli/issues/4016) (primary) /
   [#3048](https://github.com/github/copilot-cli/issues/3048) /
   [#3161](https://github.com/github/copilot-cli/issues/3161) /
@@ -181,38 +184,26 @@ the connection validates and the dropdown populates. Reachable **only in-VNet** 
 in-VNet reachability as APIM). Opt-in (`deployFoundrySubkeyProxy=true`; enabled on both pilots). See
 [operations-runbook.md §10](../../docs/operations-runbook.md#10-subkey-proxy-for-bearer-only-ide-clients),
 [architecture.md](../../docs/architecture.md), and
-[#108](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/108).
+#108.
 
-### Alternative: the dedicated `/openai-bearer` route (Entra JWT)
+### Planned alternative: Entra or Okta JWT on the same endpoint
 
-Use this instead when you specifically want per-developer **Entra JWT identity** on the request
-rather than a shared subscription key — at the cost of an **hourly token you must paste manually**.
-Deploy the parallel **bearer route** (`deployFoundryBearer=true`, default path **`openai-bearer`** —
-see [`infra/modules/apim-foundry-bearer-api.bicep`](../../infra/modules/apim-foundry-bearer-api.bicep)).
-It sets `subscriptionRequired=false` so the request is **not** rejected pre-policy, then its inbound
-policy **validates the Bearer value as an Entra JWT** (`validate-jwt`) — preserving per-developer
-identity for metering plus all the shared value-adds (model rewrite, auto-route, token metrics). It
-routes to the **same Foundry backend** as `/openai`, and coexists with the subscriptionKey `/openai`
-route (existing CLI / VS Code users are untouched).
+The target is **subscription key OR Entra JWT OR Okta JWT**, one credential per request,
+with the same client-facing inference and discovery URLs. It is not implemented. The
+previously documented `deployFoundryBearer` switch and `/openai-bearer` module are not
+present in the current infrastructure; do not use those old deployment instructions.
 
-1. **URL / base**: `https://<APIM_HOSTNAME>/openai-bearer/v1`
-2. **API Key**: a fresh **Entra access token** for the gateway's API scope:
-   ```pwsh
-   az account get-access-token --resource <API_APP_ID_URI> --query accessToken -o tsv
-   ```
-   AI Assistant sends it as `Authorization: Bearer <token>`, which the bearer route's `validate-jwt`
-   accepts. The token is good for ~1 hour and these clients **do not auto-refresh** — paste a fresh
-   one when it expires. (The subkey proxy above avoids this churn entirely.)
-3. **Model**: pick `gpt-5.1` (or `gpt-4.1-mini`) — it rides in the request body.
+Existing key clients keep their configuration. JWT clients would put the access token in
+the API-key field, but the proxy/admission path must first support the agreed header
+contract. The current proxy translates Bearer to `api-key` and removes Authorization;
+it does not obtain, validate or refresh an Entra/Okta token. Test both inference and
+`GET /v1/models`, and provide a supported renewal mechanism before fleet rollout.
 
-The `/models` probe is served at `GET /openai-bearer/v1/models` (same base URL), so the connection
-validates and the model dropdown populates.
-
-> **Subscription-key gateways too.** The bearer route is independent of the gateway's global
-> `authMode`, so you can add it to an existing **subscriptionKey** deployment without converting the
-> whole gateway to `jwt` — `/openai` keeps using per-developer `api-key` subscriptions while
-> `/openai-bearer` accepts Entra JWTs for AI Assistant. Tracked in
-> [#102](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/102).
+Okta sign-in federated through Entra still produces an Entra API token. Direct Okta tokens
+require custom-authorization-server validation and issuer-qualified identity in the gateway.
+Neither option changes APIM-to-Foundry authentication. The standalone bolt-on requires
+its own inference/discovery policy updates in both Bicep and Terraform packaging.
+See [the full authentication design](../../docs/authentication.md).
 
 Because these clients use **chat-completions**, no Responses configuration is needed.
 
@@ -296,44 +287,24 @@ A `200` with a chat completion confirms IntelliJ will work. `Access denied due t
 subscription key` means the key isn't reaching APIM as `api-key` (fix the header/query per
 the auth note above).
 
-### Bearer route (`/openai-bearer`) — exactly what AI Assistant (Option 2) sends
+### JWT validation scope
 
-This reproduces AI Assistant's `Authorization: Bearer` requests against the dedicated bearer route.
-The credential is an **Entra access token**, not a subscription key:
-
-```pwsh
-$apim  = 'https://<APIM_HOSTNAME>'
-$token = az account get-access-token --resource <API_APP_ID_URI> --query accessToken -o tsv
-# Connection probe (what AI Assistant calls first):
-irm "$apim/openai-bearer/v1/models" -Headers @{ Authorization = "Bearer $token" }
-# Chat call:
-irm "$apim/openai-bearer/v1/chat/completions" -Method Post `
-  -Headers @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' } `
-  -Body (@{ model = 'gpt-5.1'; messages = @(@{ role = 'user'; content = 'say hello in exactly five words' }) } | ConvertTo-Json)
-```
-
-```bash
-TOKEN=$(az account get-access-token --resource <API_APP_ID_URI> --query accessToken -o tsv)
-curl -sk "https://<APIM_HOSTNAME>/openai-bearer/v1/models" -H "Authorization: Bearer $TOKEN"
-curl -sk "https://<APIM_HOSTNAME>/openai-bearer/v1/chat/completions" \
-  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"model":"gpt-5.1","messages":[{"role":"user","content":"say hello in exactly five words"}]}'
-```
-
-A `200` confirms Option 2 will work. `401 — Unauthorized: invalid Entra token` means the token is
-expired/for the wrong scope (re-mint with the gateway's `<API_APP_ID_URI>`); `404` means the bearer
-route isn't deployed (set `deployFoundryBearer=true`).
+Current JWT-mode tests target `/openai/v1/models` and `/openai/v1/chat/completions`, with a
+gateway-scoped Entra token in `api-key`. A Bearer-only client must use a verified adapter.
+These tests do not establish coexistence with keys, direct Okta support or automatic renewal.
+Use the [authentication acceptance gates](../../docs/authentication.md#rollout-and-acceptance-gates)
+for the planned migration; there is no separate bearer-route deployment switch today.
 
 ## Troubleshooting
 
 - **`Access denied due to missing subscription key`** — the client sent
   `Authorization: Bearer` instead of the `api-key` header. Add the `api-key` header, use
-  the `?api-key=` query fallback, or point the client at the `/openai-bearer` route (Option 2).
+   the documented subkey proxy for Bearer-only clients, or the existing key-only query fallback.
 - **`404 Not Found`** — wrong path. Confirm `/openai/v1/chat/completions` (Foundry),
-  `/openai-bearer/v1/chat/completions` (bearer route), or `/aoai/v1/chat/completions` (legacy
-  AOAI), and that the base URL ends at `/v1`. A `404` on `/openai-bearer` also means the route
-  isn't deployed (`deployFoundryBearer=true`).
+   or `/aoai/v1/chat/completions` (legacy AOAI), and that the base URL ends at `/v1`.
+   The previously documented `/openai-bearer` route is not part of current infrastructure.
 - **DNS fails off-VNet** — VPN isn't up or the private-link zone (`azure-api.us` /
   `azure-api.net`) wasn't pushed; `Resolve-DnsName apim-...` should return `10.x.x.x`.
-- **`401` with a JWT-mode gateway** — put a fresh Entra access token in the API-key field
-  (rides as `Authorization: Bearer`); do not use the `?api-key=` fallback in jwt mode.
+- **`401` with a JWT-mode gateway** — verify token audience, expiry and scope, and ensure
+   the current Foundry policy receives the token in `api-key` through a compatible provider
+   or verified adapter. Bearer alone is insufficient today. Never put JWTs in URL queries.

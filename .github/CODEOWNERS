@@ -11,4 +11,4 @@
 # Syntax: <path-pattern>  <owner> [<owner>...]   Owners are @user or @org/team.
 
 # Global owner — applies to every file unless a later, more specific rule overrides it.
-*       @gwexler_microsoft
+# * @<OWNER>

@@ -103,15 +103,36 @@ backend ignore the unknown param.
 
 This replaces an earlier workaround that duplicated the key into a per-model
 `requestHeaders: { "api-key": "<key>" }` block. That worked, but `requestHeaders` values
-are stored as **plaintext** config (never secret-backed), so they leaked the key to disk.
-See [issue #96](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/96) for
+with literal credentials are stored as **plaintext** config, so they leaked the key to disk.
+Current versions document `${apiKey}` secret interpolation as an alternative; see below.
+See issue #96 for
 the root cause (VS Code's `url.includes('openai.azure')` heuristic in the Custom Endpoint
 provider). Without the parameter, APIM returns `Access denied due to missing subscription key`.
 
-If you deployed the gateway with `authMode=jwt`, set the provider's `apiKey` to a fresh
-Entra access token instead (VS Code does not refresh JWTs — they're good for ~1 hour); the
-`?_vscodeauth=openai.azure` parameter is not needed in that mode since the JWT travels in
-the `Authorization: Bearer` header the gateway validates.
+If you deployed the gateway with `authMode=jwt`, set the provider's stored `apiKey` to a
+fresh Entra access token for the gateway audience. **Keep the URL marker** with today's
+Foundry/AOAI policies: they require the token in `api-key`, including model discovery and
+Responses follow-ups. Bearer-only requests are not accepted on those routes today.
+
+### Planned Entra and Okta JWT migration
+
+The target is the same URLs accepting **one credential: subscription key OR Entra JWT OR
+Okta JWT**, not both. This is not deployed; pasting an Okta token into today's key-only
+configuration will fail. Existing key users keep their settings. Migrated users replace
+the stored credential and use the gateway's validated header contract; model IDs and
+request bodies do not change. APIM-to-Foundry authentication is unchanged.
+
+Current [VS Code documentation](https://code.visualstudio.com/docs/agent-customization/language-models)
+supports a custom auth header using `requestHeaders: { "api-key": "${apiKey}" }`, drawing
+from the provider's secret-backed credential without copying it into plaintext. Validate
+support in the target VS Code version before replacing the existing URL marker. A Bearer
+header can similarly use `"Authorization": "Bearer ${apiKey}"` once the gateway supports it.
+
+Neither secret interpolation nor manually replacing a token implements renewal. Custom
+Endpoint still needs a supported refreshing provider/helper integration for long sessions.
+The built-in Azure provider's Cognitive Services scope does not match our gateway audience.
+See [authentication design and acceptance gates](../../docs/authentication.md) and the
+[client capability record](../../docs/feature-request-byok-credential-refresh.md).
 
 ## Why `supportsReasoningEffort` is an array
 

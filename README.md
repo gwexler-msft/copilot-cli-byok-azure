@@ -14,7 +14,7 @@ and the VS Code 1.122 Custom Endpoint provider.
 | Layer | Component |
 |---|---|
 | Identity | Entra app registration `copilot-byok-gateway` exposing scope `cli.invoke`; Azure CLI is pre-authorized so devs get a silent token. |
-| Network | VNet `10.60.0.0/16` with subnets for APIM, Private Endpoints, the VPN gateway, and a reserved DNS-inbound subnet. |
+| Network | VNet `<CIDR>` with subnets for APIM, Private Endpoints, the VPN gateway, and a reserved DNS-inbound subnet. |
 | Gateway | APIM Developer SKU in **internal VNet** mode, running as an **Azure API Management AI gateway** (GenAI policies) with a **system-assigned managed identity**. Policy validates the dev's credential, applies **token-rate limiting** + emits **per-developer token metrics**, strips inbound creds, **load-balances/routes** to the model backend, and reauthenticates to AOAI/Foundry with MI. |
 | Inference | Microsoft Foundry account, `publicNetworkAccess=Disabled`, `disableLocalAuth=true`, **Private Endpoint only**, with GPT-5.6 Sol (primary), Luna (auto cheap tier), and Terra (explicit) deployments on DataZoneStandard. |
 | Access | Point-to-Site VPN gateway (OpenVPN protocol) so pilot devs can hit the private APIM from their laptops. |
@@ -70,7 +70,7 @@ matrix and the Commercial-only `services.ai` private-DNS-zone caveat.
 
 > **What's shipped and what's planned?** [docs/RELEASES.md](docs/RELEASES.md) is the versioned
 > changelog (what's in each release); [docs/ROADMAP.md](docs/ROADMAP.md) is the forward-looking
-> plan (Now / Next / Later), mirroring the roadmap board (umbrella [#17](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/17)).
+> plan (Now / Next / Later), mirroring the roadmap board (umbrella #17).
 
 ## Repo layout
 
@@ -106,13 +106,18 @@ provisioning fails with `AADSTS90051: Invalid national Cloud ID (2)`. Raw
 
 ## Client surfaces
 
-The gateway is OpenAI-schema, so any client that can target an OpenAI-compatible endpoint
-plus a bearer credential works. Two are first-class:
+Clients must support the endpoint's wire format and credential header. Two are first-class:
+
+> **Authentication status (2026-09-17):** CI deployments select subscription keys. Entra JWT
+> is a separate implemented deployment mode, not an alternative accepted by today's key-only
+> API. Same-endpoint **key OR Entra JWT OR Okta JWT** is planned, with unchanged backend
+> authentication. See [docs/authentication.md](docs/authentication.md) for policy coverage,
+> client renewal requirements and rollout gates.
 
 | Client | Path it hits | Credential it sends | Notes |
 |---|---|---|---|
-| **GitHub Copilot CLI** (BYOK `azure` provider) | `POST /openai/v1/chat/completions` on the Foundry or AOAI API | Entra JWT via `Authorization: Bearer` (laptop) or APIM subscription key via `api-key` (CI / no-Entra) | The wrapper script in [`scripts/`](scripts/) handles JWT minting. See [docs/deployment-guide.md](docs/deployment-guide.md). |
-| **VS Code 1.122+** "Custom Endpoint" provider | `POST /openai/v1/chat/completions` and/or `POST /openai/v1/responses` on either API | APIM subscription key via the provider `apiKey` + a `?_vscodeauth=openai.azure` url param (makes VS Code send it as `api-key`; see [issue #96](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/96)); BYOK doesn't require GitHub sign-in | Set `apiType: chat-completions` or `apiType: responses` per model; `reasoningEffortFormat` follows the apiType. Ready-made model registration JSON in [`samples/vscode/`](samples/vscode/). See [docs/deployment-guide.md → Option C: VS Code Custom Endpoint](docs/deployment-guide.md#option-c--vs-code-via-custom-endpoint-byok-provider). |
+| **GitHub Copilot CLI** (BYOK `azure` provider) | `/openai/v1/responses` or `/openai/v1/chat/completions` | `api-key`: APIM subscription key by default, or Entra JWT only when deployed in JWT mode | The wrapper mints JWTs on invocation. CLI 1.0.85 documents a per-request credential command; gateway renewal validation is pending. See [docs/deployment-guide.md](docs/deployment-guide.md). |
+| **VS Code 1.122+** "Custom Endpoint" provider | `POST /openai/v1/chat/completions` and/or `POST /openai/v1/responses` on either API | APIM subscription key via the provider `apiKey` + a `?_vscodeauth=openai.azure` url param (makes VS Code send it as `api-key`; see issue #96); BYOK doesn't require GitHub sign-in | Set `apiType: chat-completions` or `apiType: responses` per model; `reasoningEffortFormat` follows the apiType. Ready-made model registration JSON in [`samples/vscode/`](samples/vscode/). See [docs/deployment-guide.md → Option C: VS Code Custom Endpoint](docs/deployment-guide.md#option-c--vs-code-via-custom-endpoint-byok-provider). |
 
 Both APIs expose both routes (the policy rewrites `/openai/v1/responses` to the
 account-root, versionless `/openai/v1/responses` data-plane path; chat-completions stays
@@ -151,5 +156,5 @@ well as non-streamed responses.
 ## Known shipping limitations of Copilot CLI BYOK
 
 - `COPILOT_PROVIDER_TYPE=azure` may hardcode an `api-version` ([copilot-cli#3208](https://github.com/github/copilot-cli/issues/3208)). The APIM policy *injects* `api-version` if missing and tolerates whatever the CLI sends.
-- CLI cannot send custom headers ([#3399](https://github.com/github/copilot-cli/issues/3399)) or extra params ([#3448](https://github.com/github/copilot-cli/issues/3448)). All policy enforcement lives in APIM.
-- Entra JWTs are ~1 hour. The wrapper script re-mints on each invocation; long sessions need a re-run. A future refresher daemon is out of scope for v1.
+- CLI now documents `COPILOT_PROVIDER_HEADERS` and, in 1.0.85, `COPILOT_PROVIDER_API_KEY_COMMAND`; open issue states alone do not establish shipping capability.
+- The wrapper still mints Entra JWTs only on invocation. The new command hook needs integration and expiry tests; VS Code Custom Endpoint still needs a renewal solution. See [the capability record](docs/feature-request-byok-credential-refresh.md).

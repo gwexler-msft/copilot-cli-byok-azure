@@ -54,6 +54,9 @@ __pycache__/
 samples/intellij/standalone/main.json
 samples/intellij/standalone/main.parameters.json
 samples/intellij/standalone/main.parameters.*-dryrun.json
+samples/intellij/standalone/containerapp.json
+samples/intellij/standalone/containerapp.parameters.json
+samples/intellij/standalone/containerapp.parameters.*-dryrun.json
 
 # Standalone bolt-on — Terraform route (state + secrets + provider cache; keep .example)
 samples/intellij/standalone/terraform/.terraform/

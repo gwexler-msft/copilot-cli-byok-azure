@@ -494,7 +494,7 @@ Both `azd provision` and `az deployment sub create` run ARM in **incremental** m
   computed-property `Modify` noise) as "nothing real will change."
 - **Skip expensive or privileged pieces with the conditional flags** instead of editing the
   template. Each of these is a `bool`/list param you can flip off:
-  
+
   | Param | Skips |
   |---|---|
   | `deployVpnGateway` | the P2S VPN gateway (slow, ~30–45 min) |
@@ -664,10 +664,10 @@ one; the **config** rows are what the wrapper sets for you in Step 6.
 | **`@github/copilot` CLI ≥ 1.0.54** | Yes | Pin a recent build for BYOK + auto-routing fixes. Any **≥ 1.0.20** speaks the versionless `/v1` route the gateway expects. `npm i -g @github/copilot@latest` or `winget install GitHub.Copilot`. |
 | **`COPILOT_PROVIDER_BASE_URL`** | Yes (config) | Must point at the gateway's **`/openai`** route (Foundry). Wrapper appends `/openai` if omitted. Host suffix differs by cloud: `.azure-api.us` (Gov) vs `.azure-api.net` (Commercial). |
 | **`COPILOT_PROVIDER_TYPE=azure`** | Yes (config) | Selects the Azure provider contract. Set by the wrapper. |
-| **`COPILOT_PROVIDER_API_KEY`** | Yes (config) | Carries the per-developer **APIM subscription key** (default `subscriptionKey` mode) **or** an Entra **JWT** (jwt mode). **Gotcha:** the key rides in the **`api-key` header**, not `Authorization` — designed around CLI bug #3399. Never write it to disk. |
+| **`COPILOT_PROVIDER_API_KEY`** | Yes (current wrapper config) | Carries the APIM subscription key (default) or an Entra JWT in deployment-wide JWT mode. The Azure provider sends `api-key`. CLI 1.0.85 also documents a per-request credential command, not yet integrated into this wrapper. Never write credentials to disk. |
 | **`COPILOT_MODEL`** | Yes (config) | Defaults to **`auto`** (gateway routes between full + mini tiers). A non-catalog name like `auto` triggers an informational *"not in built-in catalog"* warning → wrapper exports the token-limit vars below. |
 | **`COPILOT_PROVIDER_MAX_PROMPT_TOKENS` / `..._MAX_OUTPUT_TOKENS`** | Only for non-catalog models | Wrapper sets `1050000` / `128000` (the shared Sol/Luna limits) so `auto` gets the correct context window. A named catalog model (e.g. `gpt-5.6-sol`) leaves these unset. |
-| **Private DNS / hosts entry for APIM** | Yes (in-VNet) | APIM is Internal-VNet (private IP, e.g. `10.60.1.4`). The CLI can't do `curl --resolve`, so on the test VM add a `hosts` entry `<privateIp> <apim>.azure-api.us`, or pass `-ApimPrivateIp` to the wrapper (it uses `--resolve` for the smoke test). |
+| **Private DNS / hosts entry for APIM** | Yes (in-VNet) | APIM is Internal-VNet (private IP, e.g. `<PRIVATE_IP>`). The CLI can't do `curl --resolve`, so on the test VM add a `hosts` entry `<privateIp> <apim>.azure-api.us`, or pass `-ApimPrivateIp` to the wrapper (it uses `--resolve` for the smoke test). |
 | **Network path to APIM** | Yes | Reach the private gateway via **Bastion** (in-VNet test VM) or **P2S VPN** (laptop). No public APIM endpoint exists. |
 | **GitHub login / `github.com` egress** | **No (BYOK)** | Empirically verified unnecessary for the BYOK runtime — see the note at the end of this section. Only needed for non-BYOK (GHCP-hosted) models or install-time npm/node CDN reachability. |
 | **`*.openai.azure.*` egress from the client** | **No** | The laptop/VM never talks to AOAI/Foundry directly — only to APIM. Model traffic stays inside the VNet behind the gateway. |
@@ -786,6 +786,19 @@ copilot --version
 
 ## 6. First developer test
 
+> **Authentication migration (planned, 2026-09-17):** Same-endpoint subscription key OR
+> Entra JWT OR Okta JWT is not implemented. Current CI deployments are key-only; switching
+> `authMode=jwt` replaces key authentication rather than enabling both. See
+> [authentication.md](authentication.md) for all policy surfaces, Okta prerequisites,
+> native-subscription admission testing and rollout gates. No backend-auth change is needed.
+>
+> CLI 1.0.85 provider help documents `COPILOT_PROVIDER_API_KEY_COMMAND`. A configured helper
+> would print an access token per request (`api-key` for the Azure provider); use one
+> credential source, not a static key/token alongside the helper. Existing wrappers mint
+> only on invocation. Entra/Okta helper integration and real expiry tests are pending;
+> no Okta helper ships here. VS Code Custom Endpoint and IntelliJ need their own verified
+> renewal integration. See [current client evidence](feature-request-byok-credential-refresh.md).
+
 `COPILOT_PROVIDER_BASE_URL` must point at the gateway's `/openai` route — the wrapper
 **appends `/openai` automatically** if you leave it off, so `-ApimBaseUrl
 'https://apim-...azure-api.us'` and `...azure-api.us/openai` are equivalent. The wrapper
@@ -864,7 +877,7 @@ agent tool calls require. Commercial and Gov deploy Sol, Luna, and Terra nativel
 selects between Sol and Luna on the local Foundry backend.
 Use `-WireApi completions` only for a legacy chat-completions backend.
 
-Expect `http=200` with a response. (Add `-ApimPrivateIp 10.60.1.4` as a fallback if
+Expect `http=200` with a response. (Add `-ApimPrivateIp <PRIVATE_IP>` as a fallback if
 DNS hasn't propagated — it makes curl use `--resolve`.)
 
 ### Option B — developer laptop over P2S VPN
@@ -897,7 +910,7 @@ subscription-key mode, or the Entra `oid`/`upn` in jwt mode).
 > copilot "say hello in exactly five words"
 >
 > # One-shot smoke test (no shell change):
-> TEST=1 APIM_SUBSCRIPTION_KEY='<key>' [APIM_PRIVATE_IP=10.60.1.4] \
+> TEST=1 APIM_SUBSCRIPTION_KEY='<key>' [APIM_PRIVATE_IP=<PRIVATE_IP>] \
 >   ./scripts/copilot-cli-byok.sh 'https://apim-...azure-api.us/openai' auto
 > ```
 
@@ -940,7 +953,7 @@ model `url` contains the literal substring `openai.azure` — so we append a har
 parameter name is arbitrary (only the `openai.azure` token matters), and APIM and the
 backend ignore the unknown param. This replaces the older per-model `requestHeaders`
 workaround, which stored the key as plaintext on disk — see
-[issue #96](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/96).
+issue #96.
 Without the param, APIM responds `Access denied due to missing subscription key`.
 
 > **Bearer-only IDE clients (e.g. JetBrains AI Assistant)** can't do this `url`-substring
@@ -1022,7 +1035,7 @@ Field notes:
   `openai.azure` substring; otherwise it sends `Authorization: Bearer <apiKey>` and APIM
   responds `Access denied due to missing subscription key`. The param name is arbitrary
   and the backend ignores it. This replaces the older plaintext `requestHeaders` block —
-  see [issue #96](https://github.com/gwexler_microsoft/copilot-cli-byok-azure/issues/96).
+  see issue #96.
 - **`url`** is the full endpoint, including the route and the `?_vscodeauth=openai.azure`
   parameter. The Foundry API at path `openai` is shown above; substitute `/aoai/v1/...`
   for the legacy AOAI API.
@@ -1054,9 +1067,9 @@ Responses surface).
 
 - `401 Unauthorized` with `Unauthorized. Access token is missing, invalid, ...`: the
   gateway is in **jwt mode** but the model is using subscription-key. Deploy with
-  `authMode=subscriptionKey`, or switch the credential by putting the JWT bearer in
-  `apiKey` and removing the `?_vscodeauth=openai.azure` url param (so the key flows as
-  `Authorization: Bearer`).
+  `authMode=subscriptionKey`, or supply a gateway-scoped Entra JWT in the stored `apiKey`.
+  Keep the `?_vscodeauth=openai.azure` marker for today's Foundry/AOAI JWT policies:
+  they require `api-key`, including discovery and Responses follow-up operations.
 - `404 Not Found`: the `url` is wrong. Double-check the API path (`/openai/...` vs
   `/aoai/...`) and the operation (`/v1/chat/completions` vs `/v1/responses`).
 - DNS resolution fails off-VNet: VPN isn't connected, or the private-link zone for
@@ -1134,16 +1147,17 @@ API to any valid inference key (the smoke runner asserts it with the dev1 key).
 
 > **AI Assistant caveat:** its OpenAI-compatible provider is header-less and sends the key as
 > `Authorization: Bearer`, which APIM's subscription-key auth cannot read (→ `401 missing
-> subscription key`). **An APIM subscription key cannot be used with AI Assistant** — use the
-> **Continue** or **ProxyAI** plugins (they support the `api-key` header) for IntelliJ BYOK. See
+> subscription key`). Use the in-VNet subkey proxy, or the **Continue** or **ProxyAI** plugins
+> with an explicit `api-key` header. The proxy is not a JWT-renewal service. See
 > [`samples/intellij/README.md`](../samples/intellij/README.md) and #102.
 
 **The one gotcha is auth.** APIM validates the subscription key from the **`api-key`
 header** (or an `?api-key=` query param), *not* `Authorization: Bearer`. Most OpenAI clients
 send the key as a Bearer token, which APIM ignores (`Access denied due to missing
 subscription key`). Deliver the key via a custom `api-key` header where the client allows
-it, or fall back to the `?api-key=` query param. In `authMode=jwt` deployments, put a fresh
-Entra access token in the API-key field instead (rides as `Authorization: Bearer`).
+it, or use the subkey proxy for Bearer-only clients. In `authMode=jwt` deployments, a fresh
+Entra token must reach the current Foundry policy in `api-key`; Bearer alone is insufficient.
+Never put JWTs in query strings. Direct Okta and same-endpoint key/JWT support remain planned.
 
 Ready-to-edit config and per-client walkthroughs (Continue config file, ProxyAI/AI Assistant
 UI, plus a curl/PowerShell smoke test) live in

@@ -28,7 +28,7 @@ param suffix string
 param location string
 
 @description('GitHub repository in `<owner>/<repo>` form. Used to build the FIC subject `repo:<owner>/<repo>:environment:<env>`.')
-param ghRepository string = 'gwexler_microsoft/copilot-cli-byok-azure'
+param ghRepository string = '<OWNER>/<REPO>'
 
 @description('GitHub Environment names whose OIDC tokens may federate to this runner UAMI. Each entry creates one federated credential `fic-env-<name>`. Defaults to this env only; add sibling envs to share the runner pool. Empty array disables federation entirely.')
 param ghFicEnvSubjects array = [envName]

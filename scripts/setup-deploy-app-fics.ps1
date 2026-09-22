@@ -29,7 +29,7 @@
   AppId (client ID) of the existing Entra app registration. Either this OR -AppDisplayName.
 
 .PARAMETER Repository
-  GitHub repository in `<owner>/<repo>` form. Default: gwexler_microsoft/copilot-cli-byok-azure.
+  GitHub repository in `<owner>/<repo>` form. Default: <OWNER>/<REPO>.
 
 .PARAMETER EnvNames
   Array of GitHub Environment names to grant via OIDC. Defaults to the four planned envs
@@ -50,7 +50,7 @@
 param(
   [Parameter(Mandatory, ParameterSetName = 'ByName')] [string] $AppDisplayName,
   [Parameter(Mandatory, ParameterSetName = 'ById')]   [string] $AppId,
-  [string] $Repository = 'gwexler_microsoft/copilot-cli-byok-azure',
+  [string] $Repository = '<OWNER>/<REPO>',
   [string[]] $EnvNames = @('comm-pilot', 'comm-dev', 'gov-pilot', 'gov-dev'),
   [switch] $Remove
 )
