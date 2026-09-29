@@ -1,0 +1,46 @@
+<fragment>
+  <validate-jwt token-value="@((string)context.Variables[&quot;byokJwtToken&quot;])"
+                failed-validation-httpcode="401" failed-validation-error-message="Invalid caller access token."
+                require-expiration-time="true" require-signed-tokens="true" clock-skew="0"
+                output-token-variable-name="parsedJwt">
+    <openid-config url="{{caller-okta-openid-config-url}}" />
+    <audiences><audience>{{caller-okta-audience}}</audience></audiences>
+    <issuers><issuer>{{caller-okta-issuer}}</issuer></issuers>
+    <required-claims>
+      <claim name="scp" match="any"><value>{{caller-okta-required-scope}}</value></claim>
+    </required-claims>
+  </validate-jwt>
+  <set-variable name="byokJwtClaimsValid" value="@{
+    var token = (Jwt)context.Variables[&quot;parsedJwt&quot;];
+    if (token.Issuer != &quot;{{caller-okta-issuer}}&quot; || token.Audiences.Count() != 1
+        || token.Audiences.First() != &quot;{{caller-okta-audience}}&quot; || !token.ExpirationTime.HasValue
+        || token.ExpirationTime.Value &lt;= context.Timestamp
+        || (token.NotBefore.HasValue &amp;&amp; token.NotBefore.Value &gt; context.Timestamp)) { return false; }
+    var claims = token.Claims;
+    foreach (var name in new[] { &quot;sub&quot;, &quot;uid&quot;, &quot;cid&quot; }) {
+      if (!claims.ContainsKey(name) || claims[name] == null || claims[name].Length != 1
+          || string.IsNullOrWhiteSpace(claims[name][0])) { return false; }
+    }
+    if (claims[&quot;sub&quot;][0] != claims[&quot;uid&quot;][0] || token.Subject != claims[&quot;sub&quot;][0]
+      || claims[&quot;cid&quot;][0] == &quot;{{caller-okta-audience}}&quot;
+        || !claims.ContainsKey(&quot;scp&quot;) || claims[&quot;scp&quot;] == null
+        || !claims[&quot;scp&quot;].Contains(&quot;{{caller-okta-required-scope}}&quot;)) { return false; }
+    var clients = &quot;{{caller-okta-client-ids}}&quot;;
+    return clients != &quot;__none__&quot; &amp;&amp; clients.Split(',').Any(allowed =&gt; allowed.Trim() == claims[&quot;cid&quot;][0]);
+  }" />
+  <choose>
+    <when condition="@(!(bool)context.Variables[&quot;byokJwtClaimsValid&quot;])">
+      <return-response>
+        <set-status code="401" reason="Invalid caller identity" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":{"code":"InvalidCallerIdentity","message":"A permitted user access token with a stable identity is required."}}</set-body>
+      </return-response>
+    </when>
+  </choose>
+  <set-variable name="callerAuthMethod" value="oktaJwt" />
+  <set-variable name="callerIssuer" value="@(((Jwt)context.Variables[&quot;parsedJwt&quot;]).Issuer)" />
+  <set-variable name="callerSubject" value="@(((Jwt)context.Variables[&quot;parsedJwt&quot;]).Subject)" />
+  <set-variable name="developerOid" value="@((string)context.Variables[&quot;callerSubject&quot;])" />
+  <set-variable name="developerUpn" value="@((string)context.Variables[&quot;callerSubject&quot;])" />
+  <set-variable name="byokJwtValidated" value="@(true)" />
+</fragment>

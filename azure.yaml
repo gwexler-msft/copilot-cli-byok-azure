@@ -49,12 +49,12 @@ hooks:
   preprovision:
     posix:
       shell: sh
-      run: ./scripts/check-deploy-access.sh && ./scripts/check-runner-auth.sh && ./scripts/ensure-byok-groups.sh && ./scripts/check-provision-params.sh
+      run: ./scripts/check-deploy-access.sh && ./scripts/check-runner-auth.sh && ./scripts/ensure-byok-groups.sh && ./scripts/check-provision-params.sh && ./scripts/resolve-register-role-assignment.sh -Stage
       continueOnError: false
       interactive: false
     windows:
       shell: pwsh
-      run: ./scripts/check-deploy-access.ps1 && ./scripts/check-runner-auth.ps1 && ./scripts/ensure-byok-groups.ps1 && ./scripts/check-provision-params.ps1
+      run: ./scripts/check-deploy-access.ps1 && ./scripts/check-runner-auth.ps1 && ./scripts/ensure-byok-groups.ps1 && ./scripts/check-provision-params.ps1 && ./scripts/resolve-register-role-assignment.ps1 -Stage
       continueOnError: false
       interactive: false
   # Post-deployment RBAC: grant the APIM managed identity "Cognitive Services OpenAI User"

@@ -14,6 +14,102 @@ re-runs & recovery* under Step 3 for what is (and isn't) safe to re-run.
 > metrics, backend load-balancing, content safety) that work on all APIM tiers. See
 > [architecture.md → APIM as the AI gateway](architecture.md#apim-as-the-ai-gateway-and-why-the-classic-developer-sku).
 
+### Caller-authentication handover
+
+Clients must send exactly one supported credential. For an enabled JWT route, use one
+`Authorization: Bearer <ACCESS_TOKEN>` field, or the route's supported API-key-style field,
+never both. Acquire a gateway-audience delegated-user token and renew it before expiry.
+Confirm that the customer's SDK and any intermediary do not append another credential header.
+
+The owner accepted the [duplicate-Authorization compatibility exception](authentication.md#approved-compatibility-exception-2026-09-21):
+identical duplicates may be rejected or platform-normalized and fully validated; conflicting
+values must be rejected before backend access, with 400 or 401 permitted for those duplicate
+cases. Do not depend on the cloud-specific normalization behavior. Signature, issuer/audience,
+lifetime, scope, identity, quotas and credential stripping are not waived.
+
+This exception does not itself activate same-URL coexistence or app-only/Okta support.
+Foundry/AOAI shared consumers and the `legacy`/`shared`/`coexistence` rollout stages are committed.
+Both pilots completed approved native-key plus Entra JWT activation and control-plane readback
+on 2026-09-27. Okta remains disabled. New deployments still default to `legacy` and subscription
+keys; customer activation requires explicit trust settings and durable ownership secrets.
+Pilot rollout and dev provisioning evidence do not replace fresh customer or interactive-client
+acceptance. Historical failed matrices have not been relabeled as fresh acceptance passes.
+
+Initial new-auth scope is **Foundry/AOAI**. Anthropic new auth is explicitly deferred after
+classic-tier native-usage metering failed; its existing route/authentication is unchanged.
+Full stateful Responses is retained, with a stable secret owner key, reserved
+`metadata.byok_owner_v1` (15 remaining custom entries), bounded backend-owner lookup and
+continuation affinity. Unstamped legacy objects, conversation references and input item
+references are not automatically admitted. Review the
+[ownership contract](authentication.md#stateful-responses-ownership) before customer activation.
+
+Both clouds passed bounded mock governance and real Foundry ownership/rotation tests. Durable CI
+ownership secrets were provisioned for the pilots and their enabled coexistence settings persisted.
+Fresh customer/package acceptance and a deployed retained-object rollback rehearsal remain required.
+On 2026-09-23, both clouds also passed 30 admission-rollback controls and matched
+legacy/new throttle ingestion for two identities. Owner keys and all four utility protections were
+retained; that diagnostic check is not a deployed retained-object recovery test.
+**Detach and verify JWT-product links before restoring legacy policies.**
+Changing a parameter alone does not remove incremental ARM resources, including conditional
+AOAI Responses operations. Never rotate or wipe owner keys as an incidental redeployment.
+
+The existing workflows have optional [validated caller staging](authentication.md#ci-inputs-and-durable-keys):
+`BYOK_CALLER_AUTH_PREPARATION` and `BYOK_CALLER_AUTH_ROLLOUT` are environment variables;
+`BYOK_RESPONSE_OWNER_KEY` and `BYOK_RESPONSE_OWNER_PREVIOUS_KEY` are environment secrets.
+Active rollout requires a stable current key and either a previous key or explicit `__none__`.
+Absent settings preserve the current key-only profile. Staging stores only secret references
+and fails before rewriting the file when configuration is invalid. Both dev environments completed
+full provisioning and smoke on the pilot rollout source on 2026-09-27. For a new customer, create
+their own Entra registration and trust configuration, securely generate the ownership key once,
+and configure their deployment environment. Do not copy pilot identifiers, secrets or token caches.
+Local azd hooks validate parameters but do not automatically run Entra setup or caller-auth staging.
+Changing environment settings, dispatching CI or rotating keys still requires operational approval.
+
+The supported editor distinction is the credential path, not a Chat/Agent label. The configured
+native Copilot CLI uses renewable JWTs, including an IntelliJ custom CLI ACP agent once that IDE
+integration is accepted. Native VS Code Custom Endpoint and IntelliJ AI Assistant continue using
+per-user subscription keys. The pinned launcher passed real-CLI HTTPS ACP fixture tests; actual
+editor launch, same-session expiry, failure and recovery remain acceptance requirements. Do not
+assume VS Code's background/Agent Host bridge or IntelliJ's built-in Copilot entry is that launcher.
+
+### Wizard And Manual Upgrade
+
+The opt-in [upgrade helper](../scripts/update-caller-auth.ps1) and
+[Bash entry point](../scripts/update-caller-auth.sh) deploy shared caller policies onto an existing
+API; they do not change client URLs, create backend accounts or grant RBAC. This is locally tested
+engineering, not an accepted customer upgrade. Use PowerShell 7.4+, Azure CLI and Bicep 0.44.1+.
+
+Start with the shape in [caller-upgrade.parameters.example.json](../scripts/caller-upgrade.parameters.example.json)
+and keep the populated file outside version control. The example is disabled deliberately. Choose
+`foundry-basic`, `foundry-fixed` or `aoai-fixed`; the helper uses that repository baseline and the
+existing primary backend binding. It is not a general merge of arbitrary live policies. Preserve and
+review the current API/operation policy export, feature settings and product relationships before
+adoption. Unknown operations or inference policies that bypass API inbound block the upgrade.
+
+Set reviewed trust configuration, a unique resource prefix/JWT product, exact backend origin and
+backend path (account root or `/openai`). Shared mode requires stable secret environment inputs
+`BYOK_RESPONSE_OWNER_KEY` and `BYOK_RESPONSE_OWNER_PREVIOUS_KEY` (explicit `__none__` initially),
+plus `FOUNDRY_API_KEY` for backend key mode. The helper uses a current-user-only temporary directory
+for secure ARM parameters and removes it in `finally`; do not enable Azure CLI debug logging.
+
+```powershell
+./scripts/update-caller-auth.ps1 -ParametersFile ./scripts/caller-upgrade.parameters.json -Profile foundry-basic -ValidateOnly
+./scripts/update-caller-auth.ps1 -ParametersFile ./scripts/caller-upgrade.parameters.json -Profile foundry-basic
+```
+
+The first command is local validation; the second performs read-only Azure preflight and what-if.
+The Bash wrapper accepts the same PowerShell parameter names. An explicit `-Apply` performs the
+deployment only after change approval. Current helpers suppress raw deployment output to avoid
+credential disclosure; inspect the reviewed policy package and deployment diagnostics through the
+approved operator workflow. Neither validation nor command completion proves live acceptance.
+
+Backend lookup credentials are explicit, separate from the caller. Existing utility operation IDs
+are retained, including cancel/input-items. New JWT callers cannot opt into the deferred Anthropic
+path. Native budgets remain on their original subscription counter; JWT limits are independent.
+Rollback requires link detachment/readback first and explicit treatment of retained response
+objects, ownership keys and incremental ARM operations. Do not rerun the old BASIC installer over
+an active shared API; its new guard blocks that unsafe overwrite.
+
 ## Which cloud are you deploying to?
 
 The same template serves two distinct use cases. **Pick one now** — it determines the
@@ -664,7 +760,8 @@ one; the **config** rows are what the wrapper sets for you in Step 6.
 | **`@github/copilot` CLI ≥ 1.0.54** | Yes | Pin a recent build for BYOK + auto-routing fixes. Any **≥ 1.0.20** speaks the versionless `/v1` route the gateway expects. `npm i -g @github/copilot@latest` or `winget install GitHub.Copilot`. |
 | **`COPILOT_PROVIDER_BASE_URL`** | Yes (config) | Must point at the gateway's **`/openai`** route (Foundry). Wrapper appends `/openai` if omitted. Host suffix differs by cloud: `.azure-api.us` (Gov) vs `.azure-api.net` (Commercial). |
 | **`COPILOT_PROVIDER_TYPE=azure`** | Yes (config) | Selects the Azure provider contract. Set by the wrapper. |
-| **`COPILOT_PROVIDER_API_KEY`** | Yes (current wrapper config) | Carries the APIM subscription key (default) or an Entra JWT in deployment-wide JWT mode. The Azure provider sends `api-key`. CLI 1.0.85 also documents a per-request credential command, not yet integrated into this wrapper. Never write credentials to disk. |
+| **`COPILOT_PROVIDER_API_KEY`** | Static mode only | Carries the APIM subscription key (default) or a manually acquired JWT. The Azure provider sends `api-key`. Renewable mode clears this variable; never combine static and command credentials or write them to disk. |
+| **`COPILOT_PROVIDER_API_KEY_COMMAND`** | Renewable mode only | Set by `-AuthMode jwt -RefreshToken` to the cloud/user/cache-pinned helper. Requires credential-command support in `copilot help providers`, validated with CLI 1.0.85. The helper returns a usable token per invocation; Azure CLI may reuse or renew its cache. |
 | **`COPILOT_MODEL`** | Yes (config) | Defaults to **`auto`** (gateway routes between full + mini tiers). A non-catalog name like `auto` triggers an informational *"not in built-in catalog"* warning → wrapper exports the token-limit vars below. |
 | **`COPILOT_PROVIDER_MAX_PROMPT_TOKENS` / `..._MAX_OUTPUT_TOKENS`** | Only for non-catalog models | Wrapper sets `1050000` / `128000` (the shared Sol/Luna limits) so `auto` gets the correct context window. A named catalog model (e.g. `gpt-5.6-sol`) leaves these unset. |
 | **Private DNS / hosts entry for APIM** | Yes (in-VNet) | APIM is Internal-VNet (private IP, e.g. `<PRIVATE_IP>`). The CLI can't do `curl --resolve`, so on the test VM add a `hosts` entry `<privateIp> <apim>.azure-api.us`, or pass `-ApimPrivateIp` to the wrapper (it uses `--resolve` for the smoke test). |
@@ -728,12 +825,9 @@ Consequences worth internalising:
 > with **masked input** — the key (or JWT) is held only in the session and **never written to
 > disk**.
 
-> **Bake in your own defaults (optional).** Prefer a turn-key script? You can hardcode
-> `$ApimBaseUrl` (and even `$SubscriptionKey`) directly in the `param()` block of
-> `copilot-cli-byok.ps1` — a value set there wins over the saved config and the prompt. They
-> default to empty so the normal prompt/remember flow is unaffected when you leave them alone.
-> A baked-in key sits in the file as plaintext, so prefer `$env:APIM_SUBSCRIPTION_KEY` for
-> secrets.
+> **Configure nonsecret defaults only.** The wrapper can remember the gateway URL and model.
+> Supply keys through its masked prompt or an environment variable set outside chat. Never bake
+> subscription keys, access tokens or customer identifiers into a script or committed config.
 
 > **npm is optional.** `winget install GitHub.Copilot` pulls a self-contained build, so you
 > do **not** need npm — just PowerShell 7 and Node 22. Use the npm path only if you prefer it
@@ -786,18 +880,21 @@ copilot --version
 
 ## 6. First developer test
 
-> **Authentication migration (planned, 2026-09-17):** Same-endpoint subscription key OR
-> Entra JWT OR Okta JWT is not implemented. Current CI deployments are key-only; switching
-> `authMode=jwt` replaces key authentication rather than enabling both. See
+> **Authentication rollout (2026-09-27):** Same-endpoint caller policies and deployment packages
+> are opt-in. Both pilots use approved key/Entra coexistence and both dev stacks passed provisioning
+> and smoke; fresh clones still default to key-only. Customer/client acceptance remains open;
+> legacy `authMode=jwt` alone replaces key authentication rather than enabling coexistence. See
 > [authentication.md](authentication.md) for all policy surfaces, Okta prerequisites,
 > native-subscription admission testing and rollout gates. No backend-auth change is needed.
 >
 > CLI 1.0.85 provider help documents `COPILOT_PROVIDER_API_KEY_COMMAND`. A configured helper
-> would print an access token per request (`api-key` for the Azure provider); use one
-> credential source, not a static key/token alongside the helper. Existing wrappers mint
-> only on invocation. Entra/Okta helper integration and real expiry tests are pending;
-> no Okta helper ships here. VS Code Custom Endpoint and IntelliJ need their own verified
-> renewal integration. See [current client evidence](feature-request-byok-credential-refresh.md).
+> prints an access token per request (`api-key` for the Azure provider); use one credential
+> source, not a static key/token alongside it. Use `-AuthMode jwt -RefreshToken` for the pinned
+> Entra helper, or the opt-in [Okta helper](../scripts/okta/README.md). Government Entra
+> continuing-session expiry was tested; real Okta is pending customer acceptance. The configured
+> native CLI is the renewable editor-agent route, subject to actual editor acceptance. Native
+> VS Code Custom Endpoint and IntelliJ AI Assistant keep per-user subscription keys. See
+> [current client evidence](feature-request-byok-credential-refresh.md).
 
 `COPILOT_PROVIDER_BASE_URL` must point at the gateway's `/openai` route — the wrapper
 **appends `/openai` automatically** if you leave it off, so `-ApimBaseUrl
@@ -805,9 +902,11 @@ copilot --version
 defaults to
 **`authMode=subscriptionKey`** — the developer presents their per-developer **APIM
 subscription key** (set it once in `$env:APIM_SUBSCRIPTION_KEY` to avoid putting the
-secret on the command line). Use `-AuthMode jwt -AppId <clientId-guid>` only if the
-gateway was deployed with `authMode=jwt`; the `-AppId` is the app **client-ID GUID**
-(v2-token audience), not the `api://` URI.
+secret on the command line). Use `-AuthMode jwt -RefreshToken -AppId <CLIENT_ID>` only when
+the route admits Entra through shared coexistence or legacy `authMode=jwt`. The `-AppId` is
+the gateway app's **client-ID GUID** (v2-token audience), not the `api://` URI. Sign in as the
+intended user in the correct pinned cloud before configuring the wrapper. Renewable mode is
+not compatible with the wrapper's one-shot `-Test` switch; test in the actual CLI session.
 
 > Get a developer's subscription key from APIM → **Subscriptions** (or the portal
 > "Show/Hide keys" action) for the subscription assigned to that developer.
@@ -1157,7 +1256,9 @@ send the key as a Bearer token, which APIM ignores (`Access denied due to missin
 subscription key`). Deliver the key via a custom `api-key` header where the client allows
 it, or use the subkey proxy for Bearer-only clients. In `authMode=jwt` deployments, a fresh
 Entra token must reach the current Foundry policy in `api-key`; Bearer alone is insufficient.
-Never put JWTs in query strings. Direct Okta and same-endpoint key/JWT support remain planned.
+Never put JWTs in query strings. The opt-in shared caller policy supports the documented single
+Bearer or `api-key` source only after that API's shared rollout is approved. The proxy translates
+one credential; it does not make an IDE refresh tokens or activate APIM's Okta trust.
 
 Ready-to-edit config and per-client walkthroughs (Continue config file, ProxyAI/AI Assistant
 UI, plus a curl/PowerShell smoke test) live in

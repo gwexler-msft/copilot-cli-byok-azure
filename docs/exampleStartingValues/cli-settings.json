@@ -1,0 +1,13 @@
+{
+  "defaultMode": "interactive",
+  "defaultPermissionMode": "manual",
+  "stayInAutopilot": false,
+  "trustedFolders": [],
+  "allowedUrls": [],
+  "disableAllHooks": true,
+  "memory": false,
+  "remote": "off",
+  "remoteExport": false,
+  "autoUpdate": false,
+  "powershellFlags": ["-NoProfile", "-NoLogo"]
+}

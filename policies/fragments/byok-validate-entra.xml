@@ -1,0 +1,67 @@
+<fragment>
+  <validate-jwt token-value="@((string)context.Variables[&quot;byokJwtToken&quot;])"
+                failed-validation-httpcode="401" failed-validation-error-message="Invalid caller access token."
+                require-expiration-time="true" require-signed-tokens="true" clock-skew="0"
+                output-token-variable-name="parsedJwt">
+    <openid-config url="{{entra-openid-config-url}}" />
+    <audiences><audience>{{api-audience}}</audience></audiences>
+    <issuers><issuer>{{caller-entra-issuer}}</issuer></issuers>
+    <required-claims>
+      <claim name="ver" match="all"><value>2.0</value></claim>
+      <claim name="tid" match="all"><value>{{caller-entra-tenant-id}}</value></claim>
+      <claim name="scp" match="any" separator=" "><value>{{required-scope}}</value></claim>
+    </required-claims>
+  </validate-jwt>
+  <set-variable name="byokJwtClaimsValid" value="@{
+    var token = (Jwt)context.Variables[&quot;parsedJwt&quot;];
+    if (token.Issuer != &quot;{{caller-entra-issuer}}&quot; || token.Audiences.Count() != 1
+        || token.Audiences.First() != &quot;{{api-audience}}&quot; || !token.ExpirationTime.HasValue
+        || token.ExpirationTime.Value &lt;= context.Timestamp
+        || (token.NotBefore.HasValue &amp;&amp; token.NotBefore.Value &gt; context.Timestamp)) { return false; }
+    var claims = token.Claims;
+    foreach (var name in new[] { &quot;tid&quot;, &quot;oid&quot;, &quot;azp&quot;, &quot;scp&quot;, &quot;ver&quot; }) {
+      if (!claims.ContainsKey(name) || claims[name] == null || claims[name].Length != 1
+          || string.IsNullOrWhiteSpace(claims[name][0])) { return false; }
+    }
+    Guid tenant;
+    Guid subject;
+    Guid client;
+    Guid configuredTenant;
+    if (!Guid.TryParse(claims[&quot;tid&quot;][0], out tenant) || tenant == Guid.Empty
+        || !Guid.TryParse(&quot;{{caller-entra-tenant-id}}&quot;, out configuredTenant) || tenant != configuredTenant
+        || !Guid.TryParse(claims[&quot;oid&quot;][0], out subject) || subject == Guid.Empty
+        || !Guid.TryParse(claims[&quot;azp&quot;][0], out client) || client == Guid.Empty
+        || client.ToString().Equals(&quot;{{api-audience}}&quot;, StringComparison.OrdinalIgnoreCase)
+        || claims[&quot;ver&quot;][0] != &quot;2.0&quot;
+        || !claims[&quot;scp&quot;][0].Split(' ').Contains(&quot;{{required-scope}}&quot;)) { return false; }
+    if (claims.ContainsKey(&quot;idtyp&quot;) &amp;&amp; (claims[&quot;idtyp&quot;] == null || claims[&quot;idtyp&quot;].Length != 1
+        || claims[&quot;idtyp&quot;][0] != &quot;user&quot;)) { return false; }
+    var clients = &quot;{{caller-entra-client-ids}}&quot;;
+    return clients == &quot;__any__&quot; || clients.Split(',').Any(allowed =&gt; allowed.Trim().Equals(client.ToString(), StringComparison.OrdinalIgnoreCase));
+  }" />
+  <choose>
+    <when condition="@(!(bool)context.Variables[&quot;byokJwtClaimsValid&quot;])">
+      <return-response>
+        <set-status code="401" reason="Invalid caller identity" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":{"code":"InvalidCallerIdentity","message":"A permitted user access token with a stable identity is required."}}</set-body>
+      </return-response>
+    </when>
+  </choose>
+  <set-variable name="callerAuthMethod" value="entraJwt" />
+  <set-variable name="callerIssuer" value="@(((Jwt)context.Variables[&quot;parsedJwt&quot;]).Issuer)" />
+  <set-variable name="callerSubject" value="@{
+    var claims = ((Jwt)context.Variables[&quot;parsedJwt&quot;]).Claims;
+    return Guid.Parse(claims[&quot;tid&quot;][0]).ToString() + &quot;:&quot; + Guid.Parse(claims[&quot;oid&quot;][0]).ToString();
+  }" />
+  <set-variable name="developerOid" value="@(Guid.Parse(((Jwt)context.Variables[&quot;parsedJwt&quot;]).Claims[&quot;oid&quot;][0]).ToString())" />
+  <set-variable name="developerUpn" value="@{
+    var claims = ((Jwt)context.Variables[&quot;parsedJwt&quot;]).Claims;
+    foreach (var name in new[] { &quot;preferred_username&quot;, &quot;upn&quot; }) {
+      if (claims.ContainsKey(name) &amp;&amp; claims[name] != null &amp;&amp; claims[name].Length == 1
+          &amp;&amp; !string.IsNullOrWhiteSpace(claims[name][0])) { return claims[name][0]; }
+    }
+    return (string)context.Variables[&quot;callerSubject&quot;];
+  }" />
+  <set-variable name="byokJwtValidated" value="@(true)" />
+</fragment>

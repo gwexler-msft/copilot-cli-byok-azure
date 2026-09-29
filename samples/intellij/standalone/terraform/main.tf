@@ -24,7 +24,7 @@ locals {
   # "off" (IsNullOrWhiteSpace), so 'auto' is a safe default that stays inert until mini+full are set.
   named_values = {
     "intellij-foundry-backend-id"    = { value = var.existing_backend_name, secret = false }
-    "intellij-foundry-api-key"       = { value = var.foundry_api_key == "" ? " " : var.foundry_api_key, secret = true }
+    "intellij-foundry-api-key"       = { value = var.foundry_auth_mode == "managedIdentity" || var.foundry_api_key == "" ? " " : var.foundry_api_key, secret = true }
     "intellij-api-version"           = { value = var.api_version, secret = false }
     "intellij-auto-sentinel"         = { value = var.auto_route_sentinel == "" ? " " : var.auto_route_sentinel, secret = false }
     "intellij-auto-mini-deployment"  = { value = var.auto_route_mini_deployment == "" ? " " : var.auto_route_mini_deployment, secret = false }
@@ -34,21 +34,21 @@ locals {
     "intellij-metrics-enabled"       = { value = "true", secret = false }
   }
 
-  operations = {
+  operations = merge({
     "chat-completions" = { display = "Chat Completions", method = "POST", url = "/v1/chat/completions" }
     "completions"      = { display = "Completions", method = "POST", url = "/v1/completions" }
     "embeddings"       = { display = "Embeddings", method = "POST", url = "/v1/embeddings" }
     "responses"        = { display = "Responses", method = "POST", url = "/v1/responses" }
     "list-models"      = { display = "List Models", method = "GET", url = "/v1/models" }
-  }
+  }, local.response_operations)
 
   # Bake the APIM private IP + gateway host into the shared cloud-init nginx config. When a pre-baked
   # image is supplied, use the config-only variant (no apt), mirroring proxy-vm.bicep.
-  cloud_init = replace(replace(
+  cloud_init = replace(replace(replace(replace(
     replace(
       var.proxy_image_id != "" ? file("${path.module}/../cloud-init.prebaked.yaml") : file("${path.module}/../cloud-init.yaml"),
       "__APIM_PRIVATE_IP__", var.apim_private_ip
     ),
     "__APIM_GATEWAY_HOST__", var.apim_gateway_host
-  ), "__INTELLIJ_API_PATH__", var.intellij_api_path)
+  ), "__INTELLIJ_API_PATH__", var.intellij_api_path), "__BYOK_CREDENTIAL_GUARD_BASE64__", filebase64("${path.module}/../nginx-credentials.mjs")), "__BYOK_NGINX_INSTALLER_BASE64__", filebase64("${path.module}/../../../../infra/runner-image/install-nginx-njs.sh"))
 }

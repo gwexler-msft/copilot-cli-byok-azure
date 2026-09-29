@@ -1,0 +1,8 @@
+{
+  "issuer": "https://<OKTA_DOMAIN>/oauth2/<AUTHORIZATION_SERVER_ID>",
+  "clientId": "<OKTA_PUBLIC_CLIENT_ID>",
+  "audience": "<GATEWAY_AUDIENCE>",
+  "requiredScope": "cli.invoke",
+  "subject": "<IMMUTABLE_OKTA_USER_ID>",
+  "redirectUri": "http://127.0.0.1:8765/callback"
+}

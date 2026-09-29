@@ -95,6 +95,9 @@ jobs:
   validate:
     name: Validate (${{ matrix.cloud }})
     needs: setup
+    concurrency:
+      group: dev-env-${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
@@ -145,6 +148,15 @@ jobs:
         run: |
           azd config set cloud.name "${{ matrix.cloud }}"
           cp "${CI_PARAMS_FILE}" infra/main.parameters.json
+          bash scripts/check-provision-params.sh --stage-caller-auth infra/main.parameters.json
+        env:
+          BYOK_CALLER_AUTH_PREPARATION: ${{ vars.BYOK_CALLER_AUTH_PREPARATION }}
+          BYOK_CALLER_AUTH_ROLLOUT: ${{ vars.BYOK_CALLER_AUTH_ROLLOUT }}
+          BYOK_CALLER_JWT_TIERING: ${{ vars.BYOK_CALLER_JWT_TIERING }}
+          BYOK_RESPONSE_OWNER_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_KEY }}
+          BYOK_RESPONSE_OWNER_PREVIOUS_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_PREVIOUS_KEY }}
+          ENTRA_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          API_AUDIENCE: ${{ vars.API_AUDIENCE }}
 
       - name: azd auth login (OIDC federated)
         run: |
@@ -161,9 +173,25 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           environment: ${{ matrix.cloud == 'AzureUSGovernment' && 'AzureUSGovernment' || 'AzureCloud' }}
 
+      - name: Guard private client access
+        shell: pwsh
+        env:
+          TARGET_ENVIRONMENT: ${{ env.AZURE_ENV_NAME }}
+          TARGET_SUBSCRIPTION: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          TARGET_CLOUD: ${{ matrix.cloud }}
+        run: ./scripts/check-private-client-access-hold.ps1 -EnvironmentName $env:TARGET_ENVIRONMENT -SubscriptionId $env:TARGET_SUBSCRIPTION -Cloud $env:TARGET_CLOUD -IncludeCallerTransition
+
+      - name: Resolve register assignment for preview
+        shell: pwsh
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: ./scripts/resolve-register-role-assignment.ps1 -Stage
+
       - name: What-if preview (no changes applied)
         run: azd provision --preview --no-prompt
         env:
+          BYOK_RESPONSE_OWNER_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_KEY }}
+          BYOK_RESPONSE_OWNER_PREVIOUS_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_PREVIOUS_KEY }}
           AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
           # Injected into the CI params file via azd ${...} substitution.
@@ -207,7 +235,7 @@ jobs:
         cloud: ${{ fromJson(needs.setup.outputs.clouds) }}
     # One in-flight provision per cloud; never cancel a running deploy.
     concurrency:
-      group: deploy-${{ matrix.cloud }}
+      group: dev-env-${{ matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot' }}
       cancel-in-progress: false
     runs-on: [self-hosted, "${{ (inputs.runnerLabel != '' && inputs.runnerLabel) || (matrix.cloud == 'AzureUSGovernment' && 'gov-pilot' || 'comm-pilot') }}"]
     # Apply target environment. Reaches here only via manual dispatch (action=deploy).
@@ -239,6 +267,15 @@ jobs:
         run: |
           azd config set cloud.name "${{ matrix.cloud }}"
           cp "${CI_PARAMS_FILE}" infra/main.parameters.json
+          bash scripts/check-provision-params.sh --stage-caller-auth infra/main.parameters.json
+        env:
+          BYOK_CALLER_AUTH_PREPARATION: ${{ vars.BYOK_CALLER_AUTH_PREPARATION }}
+          BYOK_CALLER_AUTH_ROLLOUT: ${{ vars.BYOK_CALLER_AUTH_ROLLOUT }}
+          BYOK_CALLER_JWT_TIERING: ${{ vars.BYOK_CALLER_JWT_TIERING }}
+          BYOK_RESPONSE_OWNER_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_KEY }}
+          BYOK_RESPONSE_OWNER_PREVIOUS_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_PREVIOUS_KEY }}
+          ENTRA_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          API_AUDIENCE: ${{ vars.API_AUDIENCE }}
 
       - name: azd auth login (OIDC federated)
         run: |
@@ -261,6 +298,14 @@ jobs:
       #   deploy  : push the real Blazor image
       #   setup   : create the app reg + store its secret in Key Vault (degrades to manual)
       #   phase 2 : provision again (Easy Auth params populated -> login attached)
+      - name: Guard private client access
+        shell: pwsh
+        env:
+          TARGET_ENVIRONMENT: ${{ env.AZURE_ENV_NAME }}
+          TARGET_SUBSCRIPTION: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          TARGET_CLOUD: ${{ matrix.cloud }}
+        run: ./scripts/check-private-client-access-hold.ps1 -EnvironmentName $env:TARGET_ENVIRONMENT -SubscriptionId $env:TARGET_SUBSCRIPTION -Cloud $env:TARGET_CLOUD -IncludeCallerTransition
+
       - name: Provision (phase 1 — hosting + Key Vault)
         # Bounded retry to ride out two independent transient provision flakes, both of which
         # leave the same-name resource in a state that a plain re-run self-heals:
@@ -305,6 +350,8 @@ jobs:
             fi
           done
         env:
+          BYOK_RESPONSE_OWNER_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_KEY }}
+          BYOK_RESPONSE_OWNER_PREVIOUS_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_PREVIOUS_KEY }}
           AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
           APIM_PUBLISHER_EMAIL: ${{ vars.APIM_PUBLISHER_EMAIL }}
@@ -375,6 +422,8 @@ jobs:
         # step degrades (no app-reg rights), so fall back to the pre-set gov-pilot env vars.
         run: azd provision --no-prompt
         env:
+          BYOK_RESPONSE_OWNER_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_KEY }}
+          BYOK_RESPONSE_OWNER_PREVIOUS_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_PREVIOUS_KEY }}
           AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
           APIM_PUBLISHER_EMAIL: ${{ vars.APIM_PUBLISHER_EMAIL }}

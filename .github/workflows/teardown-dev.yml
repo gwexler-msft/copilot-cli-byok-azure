@@ -78,6 +78,8 @@ jobs:
     # APIM/Foundry delete + purge comfortable headroom.
     timeout-minutes: 120
     steps:
+      - uses: actions/checkout@v4
+
       - name: Guardrail — never delete a pilot RG
         shell: bash
         run: |
@@ -115,6 +117,14 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           environment: ${{ steps.cfg.outputs.cloud }}
 
+      - name: Guard private client access
+        shell: pwsh
+        env:
+          TARGET_ENVIRONMENT: ${{ matrix.env }}
+          TARGET_SUBSCRIPTION: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          TARGET_CLOUD: ${{ steps.cfg.outputs.cloud }}
+        run: ./scripts/check-private-client-access-hold.ps1 -EnvironmentName $env:TARGET_ENVIRONMENT -SubscriptionId $env:TARGET_SUBSCRIPTION -Cloud $env:TARGET_CLOUD
+
       - name: Find dev RG(s)
         id: find
         shell: bash
@@ -133,6 +143,20 @@ jobs:
             az group show --name "$rg" --query '{name:name, tags:tags, location:location}' -o table
           else
             echo "No RG named $rg — nothing to do."
+          fi
+
+      - name: Guard caller transition hold
+        if: steps.find.outputs.exists == 'true'
+        shell: bash
+        env:
+          TARGET_ENVIRONMENT: ${{ matrix.env }}
+        run: |
+          set -euo pipefail
+          rg="rg-copilot-byok-${TARGET_ENVIRONMENT}"
+          hold=$(az group show --name "$rg" --query 'tags.byokCallerTransition' --output tsv --only-show-errors)
+          if [[ -n "$hold" ]]; then
+            echo '::error::A caller transition requires operator reconciliation before teardown.'
+            exit 2
           fi
 
       - name: Belt-and-suspenders tag check (must have azd-env-name=${{ matrix.env }})

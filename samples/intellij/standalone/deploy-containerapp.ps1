@@ -52,6 +52,16 @@ $ingressMode = Get-Value 'environmentIngressMode' 'internal'
 if ($ingressMode -isnot [string] -or $ingressMode -cnotin @('internal', 'privateEndpoint')) { throw 'environmentIngressMode must be internal or privateEndpoint.' }
 $configurePrivateDns = Get-Value 'configurePrivateDns' $false
 if ($configurePrivateDns -isnot [bool]) { throw 'configurePrivateDns must be a JSON boolean.' }
+$callerRollout = Get-Value 'callerAuthRollout' 'legacy'
+if ($callerRollout -isnot [string] -or $callerRollout -cnotin @('legacy','shared','coexistence')) { throw 'callerAuthRollout must be legacy, shared or coexistence.' }
+$sharedCaller = $callerRollout -cne 'legacy'
+$callerPreparation = Get-Value 'callerAuthPreparation' $null
+$tiering = Get-Value 'callerJwtTiering' $null
+if ($sharedCaller -or $callerPreparation -or $parameters.Contains('callerJwtTiering')) {
+  $callerCloud = Read-Azure @('cloud','show')
+  $null = & "$PSScriptRoot/../../../scripts/check-provision-params.ps1" -ParameterFile $ParametersFile -StandaloneCloud $callerCloud.name
+  if ($LASTEXITCODE -ne 0) { throw 'Standalone caller-auth preflight failed; no deployment started.' }
+}
 
 $null = Read-Azure @('account', 'show')
 $null = Read-Azure @('group', 'show', '--name', (Get-Value 'proxyResourceGroup'))
@@ -72,6 +82,7 @@ if ($ingressMode -eq 'internal') {
 if ($environment.properties.provisioningState -ne 'Succeeded') { throw 'The ACA environment is not ready.' }
 if (($environment.location -replace ' ', '') -ne ((Get-Value 'location') -replace ' ', '')) { throw 'location must match the ACA environment location.' }
 $apim = Read-Azure @('apim', 'show', '--resource-group', (Get-Value 'apimResourceGroup'), '--name', (Get-Value 'apimName'))
+if (($tiering.entra.enabled -or $tiering.okta.enabled) -and $apim.sku.name -cnotin @('Developer','Premium')) { throw 'JWT tiers currently require classic Developer or Premium APIM.' }
 if ($apim.virtualNetworkType -ne 'Internal' -or $privateIp -notin @($apim.privateIpAddresses)) {
   throw 'This proof of concept requires Internal APIM and one of its current private VIPs.'
 }
@@ -84,7 +95,8 @@ if ($configureApim) {
   }
   $cloud = Read-Azure @('cloud', 'show')
   $backendUrl = "$($cloud.endpoints.resourceManager.TrimEnd('/'))$($apim.id)/backends/$(Get-Value 'existingBackendName')?api-version=2024-05-01"
-  $null = Read-Azure @('rest', '--method', 'get', '--url', $backendUrl)
+  $backend = Read-Azure @('rest', '--method', 'get', '--url', $backendUrl)
+  if ($sharedCaller -and ([uri]$backend.properties.url).GetLeftPart([UriPartial]::Authority) -ine (Get-Value 'existingBackendOrigin')) { throw 'existingBackendOrigin must match the selected backend HTTPS origin.' }
   $null = Read-Azure @('resource', 'show', '--resource-group', (Get-Value 'appInsightsResourceGroup'), '--name', (Get-Value 'appInsightsName'), '--resource-type', 'Microsoft.Insights/components', '--api-version', '2020-02-02')
   $products = @((Get-Value 'existingProductName')) + @(Get-Value 'additionalProductNames' @())
   foreach ($product in ($products | Where-Object { $_ } | Select-Object -Unique)) {
@@ -92,8 +104,14 @@ if ($configureApim) {
   }
 } else {
   $api = Read-Azure @('apim', 'api', 'show', '--resource-group', (Get-Value 'apimResourceGroup'), '--service-name', (Get-Value 'apimName'), '--api-id', 'intellij-byok')
-  if ($api.path -ne $apiPath -or $api.subscriptionRequired -ne $true -or $api.subscriptionKeyParameterNames.header -ne 'api-key') {
+  $keyRequired = -not $sharedCaller -or $callerPreparation.keyEnabled
+  if ($api.path -ne $apiPath -or $api.subscriptionRequired -ne $keyRequired -or ($keyRequired -and $api.subscriptionKeyParameterNames.header -ne 'api-key')) {
     throw 'Existing intellij-byok API must match the path and require native api-key subscription authentication.'
+  }
+  if ($sharedCaller) {
+    $policyUrl = "$($callerCloud.endpoints.resourceManager.TrimEnd('/'))$($apim.id)/apis/intellij-byok/policies/policy?api-version=2024-05-01"
+    $policy = Read-Azure @('rest','--method','get','--url',$policyUrl)
+    if ($policy.properties.value -notmatch 'fragment-id="intellij-byok-authenticate"' -or $policy.properties.value -notmatch 'fragment-id="intellij-byok-apply-caller-limits"') { throw 'Existing shared API must already contain the namespaced caller authentication/accounting policies.' }
   }
 }
 
@@ -102,6 +120,10 @@ if ($ValidateOnly) { exit 0 }
 $operation = if ($Deploy) { 'create' } else { 'what-if' }
 $arguments = @('deployment', 'sub', $operation, '--name', 'intellij-containerapp', '--location', (Get-Value 'location'), '--template-file', "$PSScriptRoot/containerapp.bicep", '--parameters', "@$ParametersFile", '--only-show-errors')
 if ($configureApim -and $env:FOUNDRY_API_KEY) { $arguments += @('--parameters', "foundryApiKey=$env:FOUNDRY_API_KEY") }
+if ($configureApim -and $sharedCaller) {
+  $previous = if ($env:BYOK_RESPONSE_OWNER_PREVIOUS_KEY -ceq '__none__') { '' } else { $env:BYOK_RESPONSE_OWNER_PREVIOUS_KEY }
+  $arguments += @('--parameters', "responseOwnerKey=$env:BYOK_RESPONSE_OWNER_KEY", "responseOwnerPreviousKey=$previous")
+}
 if ($Deploy) { $arguments += @('--query', 'properties.outputs.clientBaseUrl.value', '-o', 'tsv') }
 & az @arguments
 if ($LASTEXITCODE -ne 0) { throw 'Deployment or what-if failed.' }

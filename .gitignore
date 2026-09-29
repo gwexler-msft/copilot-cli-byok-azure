@@ -45,6 +45,11 @@ scripts/.*.sh
 # Per-machine tenant/subscription IDs for scripts/Use-Cloud.ps1
 scripts/.cloud-config.json
 
+scripts/okta/node_modules/
+scripts/okta/client.local.json
+scripts/caller-upgrade.parameters.json
+samples/intellij/cli-agent.local.json
+
 # Python (project-local venv + caches)
 .venv/
 __pycache__/
@@ -57,6 +62,7 @@ samples/intellij/standalone/main.parameters.*-dryrun.json
 samples/intellij/standalone/containerapp.json
 samples/intellij/standalone/containerapp.parameters.json
 samples/intellij/standalone/containerapp.parameters.*-dryrun.json
+samples/intellij/standalone/caller-policies.json
 
 # Standalone bolt-on — Terraform route (state + secrets + provider cache; keep .example)
 samples/intellij/standalone/terraform/.terraform/

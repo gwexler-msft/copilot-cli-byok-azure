@@ -32,6 +32,7 @@ on:
       - '.github/workflows/**'
       - 'azure.yaml'
       - 'app/register/**'
+      - 'samples/intellij/standalone/**'
   push:
     branches: [main]
     paths:
@@ -42,6 +43,7 @@ on:
       - '.github/workflows/**'
       - 'azure.yaml'
       - 'app/register/**'
+      - 'samples/intellij/standalone/**'
 
 permissions:
   contents: read
@@ -74,6 +76,22 @@ jobs:
           bicep --version
       - name: Build main.bicep
         run: bicep build infra/main.bicep --outfile /tmp/main.json
+      - name: Render register assignment lifecycle selections
+        run: bicep build-params scripts/tests/register-role-render.bicepparam --outfile /tmp/register-role-render.json
+      - name: Verify register assignment reuse and recreation
+        shell: pwsh
+        run: ./scripts/tests/register-role.Tests.ps1 -RenderedSelectionPath /tmp/register-role-render.json -CompiledMainTemplatePath /tmp/main.json
+      - name: Build focused APIM caller rollout
+        run: bicep build infra/modules/apim-foundry-caller-rollout.bicep --outfile /tmp/apim-caller-rollout.json
+      - name: Development preview scope and secret-suppression regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import json,pathlib,yaml; print(json.dumps({name:yaml.load(pathlib.Path(".github/workflows/"+file+".yml").read_text(encoding="utf-8"),Loader=yaml.BaseLoader) for name,file in {"deploy":"deploy-dev","teardown":"teardown-dev","pilot":"deploy","smoke":"smoke-test"}.items()}))' |
+            pwsh -NoProfile -File scripts/tests/dev-preview.Tests.ps1 -CompiledMainTemplatePath /tmp/main.json -CompiledApimTemplatePath /tmp/apim-caller-rollout.json
+      - name: Isolated client-access preview regressions (no Azure calls)
+        shell: pwsh
+        run: ./scripts/tests/private-client-access.Tests.ps1
       - name: Build all modules (catches isolated module errors)
         run: |
           set -e
@@ -82,8 +100,73 @@ jobs:
             bicep build "$f" --outfile "/tmp/$(basename "$f" .bicep).json"
             echo "::endgroup::"
           done
+      - name: Render actual shared consumers for isolated validation
+        run: bicep build-params scripts/tests/caller-policy-render.bicepparam --outfile /tmp/caller-policy-render.json
+
+      - name: Build standalone shared-caller entry points
+        run: |
+          bicep build samples/intellij/standalone/main.bicep --outfile /tmp/intellij-vm.json
+          bicep build samples/intellij/standalone/containerapp.bicep --outfile /tmp/intellij-aca.json
+          bicep build-params samples/intellij/standalone/caller-policies.bicepparam --outfile samples/intellij/standalone/caller-policies.json
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.4
+          terraform_wrapper: false
+
+      - name: Validate standalone Terraform with mocked Azure providers
+        working-directory: samples/intellij/standalone/terraform
+        run: |
+          terraform init -backend=false -input=false -lockfile=readonly
+          terraform validate
+          terraform test
+
+      - name: Verify compiled caller-auth fragment package
+        shell: pwsh
+        run: >-
+          ./scripts/tests/caller-auth.Tests.ps1
+          -CompiledTemplatePath /tmp/apim-caller-auth.json
+          -CompiledMainTemplatePath /tmp/main.json
+          -CompiledFoundryTemplatePath /tmp/apim-foundry-api.json
+          -CompiledAoaiTemplatePath /tmp/apim-aoai-api.json
+          -CompiledOwnershipTemplatePath /tmp/apim-response-ownership.json
+          -RenderedConsumerPolicyPath /tmp/caller-policy-render.json
+          -CallerPackagePath samples/intellij/standalone/caller-policies.json
+          -CompiledTierEntryTemplatePaths /tmp/intellij-vm.json,/tmp/intellij-aca.json,/tmp/apim-caller-upgrade.json
       - name: Lint (warnings as errors via bicepconfig if present)
         run: bicep lint infra/main.bicep
+
+  private-access-security:
+    name: Private access security scan
+    runs-on: [self-hosted, comm-pilot]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pinned scanner
+        run: python -m pip install --disable-pip-version-check -r scripts/tests/private-client-access-requirements.txt
+      - name: Render and scan private-access candidate
+        shell: pwsh
+        env:
+          LOG_LEVEL: ERROR
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = Join-Path $env:RUNNER_TEMP ('private-access-scan-' + [guid]::NewGuid().ToString('N') + '.json')
+          try {
+            & pwsh -NoProfile -File scripts/tests/private-client-access.Tests.ps1 -SecurityTemplatePath $path
+            if ($LASTEXITCODE -ne 0) { throw 'Private-access tests or render failed.' }
+            $raw = & checkov --file $path --framework arm --skip-download --quiet --output json
+            $scanExit = $LASTEXITCODE
+            $reports = @($raw | Out-String | ConvertFrom-Json)
+            $passed = ($reports.summary | Measure-Object -Property passed -Sum).Sum
+            $failed = ($reports.summary | Measure-Object -Property failed -Sum).Sum
+            $parsingErrors = ($reports.summary | Measure-Object -Property parsing_errors -Sum).Sum
+            @{scanner = 'checkov';version = '3.3.19';passed = $passed;failed = $failed;parsingErrors = $parsingErrors;exitCode = $scanExit} | ConvertTo-Json -Compress
+            if ($scanExit -ne 0 -or $passed -lt 1 -or $failed -ne 0 -or $parsingErrors -ne 0) { throw 'Private-access security scan did not pass.' }
+          } finally {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path }
+          }
 
   register-build:
     name: Register app build (#64 compile gate)
@@ -232,6 +315,34 @@ jobs:
             }
           }
           if ($bad -gt 0) { exit 1 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: PowerShell credential helper and wrapper regressions
+        shell: pwsh
+        run: ./scripts/tests/copilot-credential.Tests.ps1
+      - name: Bash credential helper and wrapper regressions
+        shell: bash
+        run: bash scripts/tests/copilot-credential.Tests.sh
+      - name: Shared caller credential-source regressions
+        shell: bash
+        run: bash scripts/tests/caller-auth.Tests.sh -CheckProvisionGuards
+      - name: Standalone private topology and caller-auth deployment guards
+        shell: pwsh
+        run: ./samples/intellij/standalone/tests/deployment-guards.Tests.ps1
+      - name: Proxy one-credential and upstream TLS integration
+        shell: bash
+        run: |
+          command -v nginx >/dev/null || { echo 'Rebuild the runner image to include nginx; no elevated runtime install.' >&2; exit 1; }
+          command -v openssl >/dev/null
+          test -f /usr/lib/nginx/modules/ngx_http_js_module.so || { echo 'Rebuild the runner image to include the njs raw-header guard module.' >&2; exit 1; }
+          node --test samples/intellij/standalone/tests/proxy-credentials.test.mjs
+      - name: Okta public-client renewal and encrypted-cache regressions
+        working-directory: scripts/okta
+        run: |
+          npm ci --ignore-scripts --no-fund
+          npm test
+          npm audit --omit=dev --audit-level=moderate
 
   yaml:
     name: Workflow YAML validity

@@ -272,6 +272,9 @@
     "useAcrRunnerImage": {
       "value": true
     },
+    "runnerImageTag": {
+      "value": "c6aa05730fe4"
+    },
     "restrictRunnerEgress": {
       "value": false
     },

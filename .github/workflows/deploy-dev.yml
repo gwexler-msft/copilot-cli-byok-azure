@@ -1,6 +1,6 @@
 # Auto-deploy to the ephemeral dev envs on every push to main, then chain
-# into smoke-test for an end-to-end regression check. Pilots are NEVER touched
-# by this workflow — they remain manual-only via deploy.yml.
+# into smoke-test for an end-to-end regression check. Explicit manual caller
+# transitions may target one pilot; full pilot provisioning stays in deploy.yml.
 #
 # This workflow is also the SCHEDULED smoke entry point (it owns the cron, not
 # smoke-test.yml). Smoke needs a dev runner that is VNet-injected into the dev
@@ -60,9 +60,34 @@ on:
         type: boolean
         default: true
       envs:
-        description: Which dev envs to deploy (comma-separated subset of comm-dev,gov-dev)
+        description: Dev envs to deploy; one comm-pilot or gov-pilot is allowed only with caller_action and smoke=false
         type: string
         default: comm-dev,gov-dev
+      preview_only:
+        description: Validate and preview the selected dev environments without provisioning or smoke
+        type: boolean
+        default: false
+      preview_jwt:
+        description: Preview Entra/native-key coexistence using stored dev keys; requires preview_only
+        type: boolean
+        default: false
+      preview_apim_only:
+        description: Preview only existing Foundry APIM caller resources; requires preview_only and preview_jwt
+        type: boolean
+        default: false
+      recover_phase_two:
+        description: Recover comm-dev phase two only; requires smoke=false and reviewed recovery preview
+        type: boolean
+        default: false
+      caller_action:
+        description: Manual APIM-only caller transition; use preview_only first, one environment and smoke=false
+        type: choice
+        options: [none, activate, rollback, finalize]
+        default: none
+      caller_preview_digest:
+        description: Exact reviewed caller-preview fingerprint required for a non-preview main-branch transition
+        type: string
+        default: ''
 
 permissions:
   id-token: write
@@ -105,7 +130,7 @@ jobs:
     # bootstrap provisioning has to run on the matching cloud's pilot runner.
     # Routing: comm-dev -> comm-pilot (AzureCloud); gov-dev -> gov-pilot (AzureUSGovernment).
     # Each pilot's UAMI must hold the FIC for the dev env it bootstraps (#53).
-    runs-on: [self-hosted, "${{ matrix.env == 'gov-dev' && 'gov-pilot' || 'comm-pilot' }}"]
+    runs-on: [self-hosted, "${{ (matrix.env == 'gov-dev' || matrix.env == 'gov-pilot') && 'gov-pilot' || 'comm-pilot' }}"]
     strategy:
       fail-fast: false
       matrix:
@@ -119,9 +144,11 @@ jobs:
     concurrency:
       group: dev-env-${{ matrix.env }}
       cancel-in-progress: false
-    timeout-minutes: 60
+    timeout-minutes: ${{ endsWith(matrix.env, '-dev') && 70 || 60 }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install azd (skip if pre-baked)
         shell: bash
@@ -136,7 +163,37 @@ jobs:
       - name: Resolve per-env config
         id: cfg
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PREVIEW_ONLY: ${{ inputs.preview_only && 'true' || 'false' }}
+          PREVIEW_JWT: ${{ inputs.preview_jwt && 'true' || 'false' }}
+          RECOVER_PHASE_TWO: ${{ inputs.recover_phase_two && 'true' || 'false' }}
+          REQUESTED_ENVS: ${{ inputs.envs }}
+          REQUESTED_SMOKE: ${{ inputs.smoke && 'true' || 'false' }}
+          CALLER_ACTION: ${{ inputs.caller_action || 'none' }}
         run: |
+          case "$CALLER_ACTION" in
+            none) ;;
+            activate|rollback|finalize)
+              if [[ "$EVENT_NAME" != 'workflow_dispatch' || ! "$REQUESTED_ENVS" =~ ^(comm|gov)-(dev|pilot)$ || "$REQUESTED_SMOKE" != 'false' || "$RECOVER_PHASE_TWO" == 'true' || "$PREVIEW_JWT" == 'true' || '${{ inputs.preview_apim_only }}' == 'true' ]]; then
+                echo '::error::Caller transition requires one known environment, manual dispatch, smoke=false and no recovery/JWT preview flags.'
+                exit 2
+              fi
+              ;;
+            *) echo '::error::Unknown caller action.'; exit 2 ;;
+          esac
+          if [[ "$RECOVER_PHASE_TWO" == "true" && ( "$REQUESTED_ENVS" != "comm-dev" || "$REQUESTED_SMOKE" != "false" || "$PREVIEW_JWT" == "true" || '${{ inputs.preview_apim_only }}' == 'true' ) ]]; then
+            echo "::error::Phase-two recovery requires comm-dev only, smoke=false and no JWT preview flags."
+            exit 2
+          fi
+          if [[ "$PREVIEW_JWT" == "true" && "$PREVIEW_ONLY" != "true" ]]; then
+            echo "::error::JWT candidate preview requires preview_only; no deployment was started."
+            exit 2
+          fi
+          if [[ '${{ inputs.preview_apim_only }}' == 'true' && ( "$PREVIEW_ONLY" != "true" || "$PREVIEW_JWT" != "true" ) ]]; then
+            echo "::error::APIM caller preview requires both preview flags; no deployment was started."
+            exit 2
+          fi
           case "${{ matrix.env }}" in
             comm-dev)
               echo "cloud=AzureCloud"                                  >> "$GITHUB_OUTPUT"
@@ -146,8 +203,21 @@ jobs:
               echo "cloud=AzureUSGovernment"                           >> "$GITHUB_OUTPUT"
               echo "params=infra/main.parameters.ci.gov-dev.json"      >> "$GITHUB_OUTPUT"
               ;;
+            comm-pilot|gov-pilot)
+              if [[ "$CALLER_ACTION" == 'none' ]]; then
+                echo '::error::Pilot targets permit only explicit APIM caller transitions.'
+                exit 2
+              fi
+              if [[ '${{ matrix.env }}' == 'gov-pilot' ]]; then
+                echo 'cloud=AzureUSGovernment' >> "$GITHUB_OUTPUT"
+                echo 'params=infra/main.parameters.ci.gov.json' >> "$GITHUB_OUTPUT"
+              else
+                echo 'cloud=AzureCloud' >> "$GITHUB_OUTPUT"
+                echo 'params=infra/main.parameters.ci.commercial.json' >> "$GITHUB_OUTPUT"
+              fi
+              ;;
             *)
-              echo "::error::Unknown env '${{ matrix.env }}' — only comm-dev / gov-dev are auto-deployable"
+              echo '::error::Unknown environment; no deployment was started.'
               exit 2
               ;;
           esac
@@ -156,6 +226,15 @@ jobs:
         run: |
           azd config set cloud.name "${{ steps.cfg.outputs.cloud }}"
           cp "${{ steps.cfg.outputs.params }}" infra/main.parameters.json
+          bash scripts/check-provision-params.sh --stage-caller-auth infra/main.parameters.json
+        env:
+          BYOK_CALLER_AUTH_PREPARATION: ${{ vars.BYOK_CALLER_AUTH_PREPARATION }}
+          BYOK_CALLER_AUTH_ROLLOUT: ${{ vars.BYOK_CALLER_AUTH_ROLLOUT }}
+          BYOK_CALLER_JWT_TIERING: ${{ vars.BYOK_CALLER_JWT_TIERING }}
+          BYOK_RESPONSE_OWNER_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_KEY }}
+          BYOK_RESPONSE_OWNER_PREVIOUS_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_PREVIOUS_KEY }}
+          ENTRA_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          API_AUDIENCE: ${{ vars.API_AUDIENCE }}
 
       - name: azd auth login (OIDC)
         run: |
@@ -185,6 +264,1050 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           environment: ${{ steps.cfg.outputs.cloud }}
 
+      - name: Guard private client access
+        shell: pwsh
+        env:
+          TARGET_ENVIRONMENT: ${{ matrix.env }}
+          TARGET_SUBSCRIPTION: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          TARGET_CLOUD: ${{ steps.cfg.outputs.cloud }}
+          GUARD_CALLER_TRANSITION: ${{ (inputs.caller_action == '' || inputs.caller_action == 'none') && 'true' || 'false' }}
+        run: ./scripts/check-private-client-access-hold.ps1 -EnvironmentName $env:TARGET_ENVIRONMENT -SubscriptionId $env:TARGET_SUBSCRIPTION -Cloud $env:TARGET_CLOUD -IncludeCallerTransition:($env:GUARD_CALLER_TRANSITION -ceq 'true')
+
+      - name: Guard caller transition hold
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.caller_action == 'none' }}
+        shell: bash
+        env:
+          TARGET_ENVIRONMENT: ${{ matrix.env }}
+        run: |
+          set -euo pipefail
+          rg="rg-copilot-byok-${TARGET_ENVIRONMENT}"
+          exists=$(az group exists --name "$rg" --output tsv --only-show-errors)
+          if [[ "$exists" != 'true' && "$exists" != 'false' ]]; then
+            echo '::error::Cannot verify the caller transition hold.'
+            exit 2
+          fi
+          if [[ "$exists" == 'true' ]]; then
+            hold=$(az group show --name "$rg" --query 'tags.byokCallerTransition' --output tsv --only-show-errors)
+            if [[ -n "$hold" ]]; then
+              echo '::error::A caller transition requires operator reconciliation before provisioning.'
+              exit 2
+            fi
+          fi
+
+      - name: Resolve register assignment for full preview
+        if: ${{ github.event_name == 'workflow_dispatch' && (inputs.preview_only || inputs.recover_phase_two) && inputs.caller_action == 'none' && !inputs.preview_apim_only }}
+        shell: pwsh
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: ./scripts/resolve-register-role-assignment.ps1 -Stage
+
+      - name: Preview development infrastructure only
+        if: ${{ github.event_name == 'workflow_dispatch' && (inputs.preview_only || inputs.recover_phase_two || inputs.caller_action != 'none') }}
+        shell: pwsh
+        env:
+          PREVIEW_ENVIRONMENT: ${{ matrix.env }}
+          PREVIEW_ONLY: ${{ inputs.preview_only && 'true' || 'false' }}
+          PREVIEW_JWT: ${{ inputs.preview_jwt && 'true' || 'false' }}
+          PREVIEW_APIM_ONLY: ${{ inputs.preview_apim_only && 'true' || 'false' }}
+          RECOVER_PHASE_TWO: ${{ inputs.recover_phase_two && 'true' || 'false' }}
+          CALLER_ACTION: ${{ inputs.caller_action || 'none' }}
+          CALLER_PREVIEW_DIGEST: ${{ inputs.caller_preview_digest }}
+          BYOK_RESPONSE_OWNER_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_KEY }}
+          BYOK_RESPONSE_OWNER_PREVIOUS_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_PREVIOUS_KEY }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+          APIM_PUBLISHER_EMAIL: ${{ vars.APIM_PUBLISHER_EMAIL }}
+          ENTRA_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          API_APP_ID_URI: ${{ vars.API_APP_ID_URI }}
+          API_AUDIENCE: ${{ vars.API_AUDIENCE }}
+          GH_RUNNER_PAT: ${{ secrets.GH_RUNNER_PAT }}
+          GH_APP_ID: ${{ vars.GH_APP_ID }}
+          GH_APP_INSTALLATION_ID: ${{ vars.GH_APP_INSTALLATION_ID }}
+          GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          REGISTER_EASYAUTH_CLIENT_ID: ${{ inputs.preview_jwt && vars.REGISTER_EASYAUTH_CLIENT_ID || '' }}
+          REGISTER_EASYAUTH_SECRET_KV_URI: ${{ inputs.preview_jwt && vars.REGISTER_EASYAUTH_SECRET_KV_URI || '' }}
+          REGISTER_APP_IMAGE: ''
+          MANAGE_BYOK_GROUPS: ''
+        run: |
+          $ErrorActionPreference='Stop'
+          function Assert-DevCallerGroup {
+            param($Group,[string]$Environment,[string]$SubscriptionId)
+            $expectedId='/subscriptions/'+$SubscriptionId+'/resourceGroups/rg-copilot-byok-'+$Environment
+            if($Environment -cnotin @('comm-dev','gov-dev','comm-pilot','gov-pilot') -or
+              $SubscriptionId -cnotmatch '\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z' -or
+              $Group -isnot [Collections.IDictionary] -or $Group.id -ine $expectedId -or
+              $Group.properties.provisioningState -cne 'Succeeded' -or
+              ($Environment -clike '*-dev' -and $Group.tags.deployDevStatus -cne 'complete')){
+              throw 'Caller transition requires its healthy existing baseline.'
+            }
+          }
+          function Get-DevCallerServiceId {
+            param($Deployment,[string]$GroupId)
+            if($GroupId -inotmatch '\A/subscriptions/[0-9a-f-]{36}/resourceGroups/rg-copilot-byok-(?:comm|gov)-(?:dev|pilot)\z' -or
+              $Deployment.id -ine ($GroupId+'/providers/Microsoft.Resources/deployments/apim') -or
+              $Deployment.properties.provisioningState -cne 'Succeeded' -or
+              $Deployment.properties.outputs.apimName.value -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9-]{0,63}\z'){
+              throw 'The exact APIM deployment reference cannot be verified.'
+            }
+            $GroupId+'/providers/Microsoft.ApiManagement/service/'+$Deployment.properties.outputs.apimName.value
+          }
+          function Read-DevApimPreviewCollection {
+            param([string]$ArmBase,[string]$ServiceId,[string]$Path,[scriptblock]$ReadPage)
+            if($ArmBase -cnotin @('https://management.azure.com','https://management.usgovcloudapi.net') -or
+              $ServiceId -inotmatch '\A/subscriptions/[0-9a-f-]{36}/resourceGroups/rg-copilot-byok-(?:comm|gov)-(?:dev|pilot)/providers/Microsoft.ApiManagement/service/[A-Za-z0-9-]+\z' -or
+              ($Path -cnotin @('/namedValues','/policyFragments','/products','/apis/copilot-byok-foundry/operations','/apis/copilot-byok-foundry/products') -and
+                $Path -cnotmatch '\A/products/[A-Za-z0-9_-]{1,80}/apis\z') -or $null -eq $ReadPage){throw 'Invalid APIM inventory scope.'}
+            $origin=[uri]($ArmBase+$ServiceId+$Path+'?api-version=2024-05-01')
+            $next=$origin.AbsoluteUri
+            $pages=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            $names=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $items=[Collections.Generic.List[object]]::new()
+            while($next){
+              $uri=[uri]$next
+              if(-not $uri.IsAbsoluteUri -or $uri.Scheme -cne 'https' -or $uri.Authority -ine $origin.Authority -or
+                $uri.AbsolutePath -ine $origin.AbsolutePath -or $uri.UserInfo -or $uri.Fragment -or $pages.Count -ge 20 -or
+                -not $pages.Add($uri.AbsoluteUri)){throw 'Invalid APIM inventory pagination.'}
+              $query=[System.Web.HttpUtility]::ParseQueryString($uri.Query)
+              if($query['api-version'] -cne '2024-05-01'){throw 'Invalid APIM inventory pagination.'}
+              $page=& $ReadPage $uri.AbsoluteUri
+              if($page -isnot [Collections.IDictionary] -or $page.value -isnot [array] -or $page.error){throw 'Incomplete live APIM inventory.'}
+              foreach($entry in $page.value){
+                if($entry -isnot [Collections.IDictionary] -or $entry.name -isnot [string] -or
+                  [string]::IsNullOrWhiteSpace($entry.name) -or -not $names.Add($entry.name)){throw 'Duplicate or invalid APIM inventory entry.'}
+                $items.Add($entry)
+              }
+              if($page.Contains('nextLink') -and $null -ne $page.nextLink -and $page.nextLink -isnot [string]){throw 'Invalid APIM inventory pagination.'}
+              $next=[string]$page.nextLink
+            }
+            @{value=$items.ToArray()}
+          }
+          function Get-DevPreviewSummary {
+            param([string]$Output,[string]$Environment,[string]$SubscriptionId,[string]$ApimResourceId='',[string[]]$ExpectedApimPaths=@(),[bool]$SharedOnly=$false)
+            if($Environment -cnotin @('comm-dev','gov-dev','comm-pilot','gov-pilot') -or
+              ($Environment -clike '*-pilot' -and -not $ApimResourceId) -or
+              $SubscriptionId -notmatch '\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z' -or $Output.Length -gt 16777216){throw 'Invalid preview context.'}
+            $preview=ConvertFrom-Json -InputObject $Output -AsHashtable
+            if($preview.status -cne 'Succeeded' -or $preview.error -or $preview.changes -isnot [array] -or $preview.changes.Count -eq 0){throw 'Incomplete ARM preview.'}
+            $groupId='/subscriptions/'+$SubscriptionId+'/resourceGroups/rg-copilot-byok-'+$Environment
+            $operations=@()
+            $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $expected=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $evaluated=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            if($ApimResourceId){
+              if(-not $ApimResourceId.StartsWith($groupId+'/providers/Microsoft.ApiManagement/service/',[StringComparison]::OrdinalIgnoreCase) -or
+                $ApimResourceId.Substring($groupId.Length+1).Split('/').Count -ne 4 -or
+                $ExpectedApimPaths.Count -ne $(if($SharedOnly){48}else{49})){throw 'Invalid preview context.'}
+              foreach($path in $ExpectedApimPaths){if(-not $expected.Add($ApimResourceId+'/'+$path)){throw 'Invalid preview context.'}}
+            }elseif($ExpectedApimPaths.Count -or $SharedOnly){throw 'Invalid preview context.'}
+            foreach($change in $preview.changes){
+              $operation=$change.changeType
+              $resourceId=$change.resourceId
+              if($operation -cnotin @('Create','Modify','Delete','Deploy','Ignore','NoChange','Unsupported') -or
+                $resourceId -isnot [string] -or -not $seen.Add($resourceId) -or
+                -not $resourceId.StartsWith('/subscriptions/'+$SubscriptionId+'/',[StringComparison]::OrdinalIgnoreCase)) {throw 'Invalid ARM resource change.'}
+              $inScope=$resourceId.Equals($groupId,[StringComparison]::OrdinalIgnoreCase) -or
+                $resourceId.StartsWith($groupId+'/providers/',[StringComparison]::OrdinalIgnoreCase)
+              if(-not $inScope -and $operation -cnotin @('Ignore','NoChange')){throw 'Preview changes another scope.'}
+              if($ApimResourceId){
+                $inScope=$expected.Contains($resourceId)
+                if(-not $inScope -and $operation -cnotin @('Ignore','NoChange')){throw 'Preview changes an unapproved APIM resource.'}
+                if($inScope -and $operation -cin @('Create','Modify','NoChange')){[void]$evaluated.Add($resourceId)}
+                if($resourceId -ieq ($ApimResourceId+'/apis/copilot-byok-foundry')){
+                  $state=$change.after ?? $change.before
+                  if($state.properties.subscriptionRequired -ne $true -or $state.properties.subscriptionKeyParameterNames.header -cne 'api-key' -or
+                    $state.properties.subscriptionKeyParameterNames.query -cne 'api-key'){throw 'Preview changes native subscription admission.'}
+                }
+              }
+              if($resourceId -imatch '\A/subscriptions/[^/]+/resourceGroups/[^/]+\z'){
+                $type='Microsoft.Resources/resourceGroups'
+              }else{
+                $providerIndex=$resourceId.LastIndexOf('/providers/',[StringComparison]::OrdinalIgnoreCase)
+                if($providerIndex -lt 0){throw 'Invalid ARM resource change.'}
+                $segments=$resourceId.Substring($providerIndex+11).Split('/')
+                if($segments.Count -lt 3 -or $segments.Count%2 -ne 1){throw 'Invalid ARM resource change.'}
+                $type=$segments[0]
+                for($segmentIndex=1;$segmentIndex -lt $segments.Count;$segmentIndex+=2){$type+='/'+$segments[$segmentIndex]}
+                if($type -inotmatch '\AMicrosoft\.[A-Za-z]+(?:/[A-Za-z][A-Za-z0-9]*)+\z'){throw 'Invalid ARM resource change.'}
+              }
+              $operations+=@{operation=$operation;resourceType=$type;inScope=$inScope}
+            }
+            $blocked=@($operations|Where-Object {$_.operation -cin @('Delete','Unsupported','Deploy') -or ($_.inScope -and $_.operation -ceq 'Ignore')})
+            $diagnostics=@($preview.diagnostics|Where-Object {$null -ne $_})
+            $diagnosticCategories=@($diagnostics|ForEach-Object {
+              switch -CaseSensitive ($_.code){
+                'NestedDeploymentShortCircuited' {'nested-deployment-short-circuited'}
+                'ResourceNotSupported' {'unsupported-resource'}
+                'AuthorizationFailed' {'authorization'}
+                'RequestDisallowedByPolicy' {'policy'}
+                'InvalidTemplate' {'template'}
+                default {'other'}
+              }
+            }|Group-Object|Sort-Object Name|ForEach-Object {@{category=$_.Name;count=$_.Count}})
+            $requiredTypes=@('Microsoft.Resources/resourceGroups','Microsoft.ApiManagement/service','Microsoft.CognitiveServices/accounts',
+              'Microsoft.App/managedEnvironments','Microsoft.App/jobs','Microsoft.App/containerApps','Microsoft.ContainerRegistry/registries',
+              'Microsoft.KeyVault/vaults','Microsoft.ContainerInstance/containerGroups','Microsoft.Network/virtualNetworks')
+            if($ApimResourceId){$requiredTypes=@()}
+            $evaluatedTypes=@($operations|Where-Object {$_.inScope -and $_.operation -cin @('Create','Modify','NoChange')}|ForEach-Object resourceType)
+            $missingTypes=@($requiredTypes|Where-Object {$_ -inotin $evaluatedTypes})
+            $missingExpected=@($expected|Where-Object {-not $evaluated.Contains($_)}).Count
+            $counts=@($operations|Group-Object operation,resourceType,inScope|Sort-Object Name|ForEach-Object {@{operation=$_.Group[0].operation;resourceType=$_.Group[0].resourceType;inScope=$_.Group[0].inScope;count=$_.Count}})
+            @{test='dev-infrastructure-preview';environment=$Environment;source='ARM';resources=$operations.Count;changes=$counts;scopeVerified=$true;
+              diagnostics=$diagnostics.Count;diagnosticCategories=$diagnosticCategories;missingResourceTypes=$missingTypes;missingExpectedResources=$missingExpected;
+              passed=($blocked.Count -eq 0 -and $diagnostics.Count -eq 0 -and $missingTypes.Count -eq 0 -and $missingExpected -eq 0);rawOutputSuppressed=$true}
+          }
+          function Get-DevApimPreviewPaths {
+            param([string]$ProductId,[bool]$IncludeJwtLink=$true)
+            if($ProductId -cnotmatch '\A[A-Za-z0-9_-]{1,80}\z' -or $ProductId -cin @('byok-standard','byok-power')){throw 'Invalid APIM preview target.'}
+            $settings=@('caller-configuration-valid','caller-key-enabled','caller-native-subscription-required','caller-entra-enabled',
+              'caller-entra-login-host','caller-okta-enabled','caller-jwt-product-id','caller-entra-tenant-id','caller-entra-issuer',
+              'caller-entra-client-ids','caller-okta-issuer','caller-okta-openid-config-url','caller-okta-audience','caller-okta-required-scope',
+              'caller-okta-client-ids','caller-response-owner-key','caller-response-owner-key-previous','caller-response-backend-origins','caller-response-stores')
+            $fragments=@('byok-authenticate','byok-strip-caller-credentials','byok-apply-caller-limits','byok-response-owner-context',
+              'byok-prepare-responses-request','byok-read-response-owner','byok-verify-response-owner','byok-locate-response-owner')
+            $operations=@('chat-completions','completions','embeddings','responses','responses-get','responses-delete','responses-cancel',
+              'responses-input-items','chat-completions-deployment','completions-deployment','embeddings-deployment','list-models')
+            $policies=@('list-models','responses-get','responses-delete','responses-cancel','responses-input-items')
+            @($settings|ForEach-Object {'namedValues/'+$_})+@($fragments|ForEach-Object {'policyFragments/'+$_})+
+              @('apis/copilot-byok-foundry','apis/copilot-byok-foundry/policies/policy')+
+              @($operations|ForEach-Object {'apis/copilot-byok-foundry/operations/'+$_})+
+              @($policies|ForEach-Object {'apis/copilot-byok-foundry/operations/'+$_+'/policies/policy'})+
+                @(('products/'+$ProductId),('products/'+$ProductId+'/policies/policy'))+
+                @($(if($IncludeJwtLink){'products/'+$ProductId+'/apis/copilot-byok-foundry'}))
+          }
+          function Get-DevCallerPreviewFingerprint {
+            param($Template,$Parameters,[string]$Environment,[string]$SourceSha,[string]$ApimResourceId,$CallerContract)
+            if($Environment -cnotin @('comm-dev','gov-dev','comm-pilot','gov-pilot') -or $SourceSha -cnotmatch '\A[0-9a-f]{40}\z' -or
+              $Template -isnot [Collections.IDictionary] -or $Parameters.parameters -isnot [Collections.IDictionary] -or
+              $ApimResourceId -inotmatch '\A/subscriptions/[0-9a-f-]{36}/resourceGroups/[^/]+/providers/Microsoft.ApiManagement/service/[^/]+\z' -or
+              $CallerContract -isnot [Collections.IDictionary] -or $CallerContract.Count -eq 0){throw 'Invalid caller transition receipt.'}
+            function ConvertTo-CallerFingerprintValue {
+              param($Value)
+              if($Value -is [Collections.IDictionary]){
+                $result=[ordered]@{}
+                foreach($key in @($Value.Keys|Sort-Object -CaseSensitive)){$result[$key]=ConvertTo-CallerFingerprintValue $Value[$key]}
+                return $result
+              }
+              if($Value -is [array]){
+                $items=[Collections.Generic.List[object]]::new()
+                foreach($entry in $Value){$items.Add((ConvertTo-CallerFingerprintValue $entry))}
+                return ,$items.ToArray()
+              }
+              $Value
+            }
+            $receipt=ConvertTo-CallerFingerprintValue @{version=1;environment=$Environment;source=$SourceSha;target=$ApimResourceId;
+              template=$Template;parameters=$Parameters;callerContract=$CallerContract}
+            $bytes=[Text.Encoding]::UTF8.GetBytes(($receipt|ConvertTo-Json -Depth 100 -Compress))
+            try{[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()}
+            finally{[Array]::Clear($bytes,0,$bytes.Length);$receipt=$null}
+          }
+          function New-DevCallerCandidate {
+            param($Document,[ValidateSet('shared','coexistence')][string]$Rollout,[string]$PreviousKeyState)
+            $candidate=$Document|ConvertTo-Json -Depth 100|ConvertFrom-Json -AsHashtable
+            $trust=$candidate.parameters.callerAuthPreparation.value
+            if($trust -isnot [Collections.IDictionary] -or $trust.enabled -isnot [bool] -or $trust.keyEnabled -ne $true -or
+              $trust.entraEnabled -ne $true -or $trust.oktaTrust.enabled -ne $false -or
+              $candidate.parameters.callerAuthRollout.value -cnotin @('legacy','shared','coexistence') -or
+              [string]::IsNullOrWhiteSpace($PreviousKeyState)){throw 'Invalid caller transition candidate.'}
+            foreach($entry in @(@{name='responseOwnerKey';reference='${BYOK_RESPONSE_OWNER_KEY}'},@{name='responseOwnerPreviousKey';reference='${BYOK_RESPONSE_OWNER_PREVIOUS_KEY}'})){
+              if($candidate.parameters.Contains($entry.name) -and $candidate.parameters[$entry.name].value -cne $entry.reference -and
+                -not ($entry.name -ceq 'responseOwnerPreviousKey' -and $candidate.parameters[$entry.name].value -ceq '')){throw 'Invalid caller transition candidate.'}
+            }
+            $trust.enabled=$true
+            $candidate.parameters.callerAuthRollout.value=$Rollout
+            $candidate.parameters.responseOwnerKey=@{value='${BYOK_RESPONSE_OWNER_KEY}'}
+            $candidate.parameters.responseOwnerPreviousKey=@{value=$(if($PreviousKeyState -ceq '__none__'){''}else{'${BYOK_RESPONSE_OWNER_PREVIOUS_KEY}'})}
+            $candidate
+          }
+          function Resolve-DevCallerArtifactSource {
+            param([ValidateSet('activate','rollback','finalize')][string]$Action,[string]$WorkflowSha,[string]$ExistingHold,[scriptblock]$VerifySource)
+            if($WorkflowSha -cnotmatch '\A[0-9a-f]{40}\z'){throw 'Invalid caller transition receipt.'}
+            if($Action -cne 'finalize'){return $WorkflowSha}
+            if($ExistingHold -cnotmatch '\Av1:([0-9a-f]{40}):(?:shared|coexistence):[0-9a-f]{64}\z'){
+              throw 'Caller transition hold requires reconciliation.'
+            }
+            $artifactSha=$Matches[1]
+            if($artifactSha -cne $WorkflowSha){
+              if($null -eq $VerifySource){throw 'Caller artifact source changed.'}
+              $verified=& $VerifySource $artifactSha $WorkflowSha
+              if($verified -isnot [bool] -or -not $verified){throw 'Caller artifact source changed.'}
+            }
+            $artifactSha
+          }
+          function New-DevCallerTransitionPlan {
+            param([ValidateSet('activate','rollback','finalize')][string]$Action,[ValidateSet('shared','coexistence')][string]$Rollout,
+              [bool]$PreviewOnly,[string]$Fingerprint,[string]$ReviewedFingerprint,[string]$SourceSha,[string]$SourceRef,
+              [string]$GitHubEvent,[int]$RunAttempt,[string]$ExistingHold)
+            if($Fingerprint -cnotmatch '\A[0-9a-f]{64}\z' -or $SourceSha -cnotmatch '\A[0-9a-f]{40}\z' -or
+              ($Action -ceq 'activate' -and $Rollout -cne 'coexistence') -or ($Action -ceq 'rollback' -and $Rollout -cne 'shared')){
+              throw 'Invalid caller transition receipt.'
+            }
+            $hold='v1:'+$SourceSha+':'+$Rollout+':'+$Fingerprint
+            if($ExistingHold -and $ExistingHold -cnotmatch '\Av1:[0-9a-f]{40}:(?:shared|coexistence):[0-9a-f]{64}\z'){
+              throw 'Caller transition hold requires reconciliation.'
+            }
+            if(($Action -ceq 'finalize' -and $ExistingHold -cne $hold) -or
+              ($Action -ceq 'activate' -and $ExistingHold -and $ExistingHold -cne $hold)){
+              throw 'Caller transition hold requires reconciliation.'
+            }
+            if(-not $PreviewOnly -and ($ReviewedFingerprint -cne $Fingerprint -or $SourceRef -cne 'refs/heads/main' -or
+              $GitHubEvent -cne 'workflow_dispatch' -or $RunAttempt -ne 1)){throw 'Caller transition requires a reviewed main-branch preview.'}
+            $steps=switch($Action){
+              'activate' {@('set-hold','apply-coexistence','verify-coexistence')}
+              'rollback' {@('set-hold','close-jwt-guard','detach-jwt-link','verify-link-absent','apply-shared','verify-shared')}
+              'finalize' {
+                if($PreviewOnly){@(('verify-'+$Rollout))}else{@('verify-persisted-settings',('verify-'+$Rollout),'clear-hold')}
+              }
+            }
+            @{action=$Action;rollout=$Rollout;previewOnly=$PreviewOnly;hold=$hold;steps=@($steps)}
+          }
+          function Invoke-DevCallerTransitionPlan {
+            param($Plan,[scriptblock]$Execute)
+            if($Plan.previewOnly){
+              if($Plan.action -cne 'finalize'){return}
+              if($Plan.steps.Count -ne 1 -or $Plan.steps[0] -cne ('verify-'+$Plan.rollout)){
+                throw 'Invalid caller readback preview plan.'
+              }
+            }
+            foreach($step in $Plan.steps){& $Execute $step}
+          }
+          function ConvertTo-DevRawPolicyXml {
+            param([string]$Text,[string]$Marker)
+            if($Text.Length -gt 524288 -or $Text.Contains($Marker)){throw 'Invalid raw policy comparison input.'}
+            Add-Type -AssemblyName Microsoft.CodeAnalysis.CSharp
+            $options=[Microsoft.CodeAnalysis.CSharp.CSharpParseOptions]::Default
+            $entities=[regex]::new('&(?:quot|apos|amp|lt|gt|#[0-9]+|#x[0-9a-fA-F]+);')
+            $expressions=[regex]::new('<!--[\s\S]*?-->|@[({]')
+            $result=[Text.StringBuilder]::new()
+            $offset=0
+            while($offset -lt $Text.Length){
+              $match=$expressions.Match($Text,$offset)
+              if(-not $match.Success){[void]$result.Append($Text.Substring($offset));break}
+              [void]$result.Append($Text.Substring($offset,$match.Index-$offset))
+              if($match.Value.StartsWith('<!--',[StringComparison]::Ordinal)){
+                [void]$result.Append($match.Value)
+                $offset=$match.Index+$match.Length
+                continue
+              }
+              $tail=$Text.Substring($match.Index+1)
+              $decoded=$entities.Replace($tail,[Text.RegularExpressions.MatchEvaluator]{param($entity) [Net.WebUtility]::HtmlDecode($entity.Value)})
+              $opening=if($match.Value -ceq '@('){[Microsoft.CodeAnalysis.CSharp.SyntaxKind]::OpenParenToken}else{[Microsoft.CodeAnalysis.CSharp.SyntaxKind]::OpenBraceToken}
+              $closing=if($match.Value -ceq '@('){[Microsoft.CodeAnalysis.CSharp.SyntaxKind]::CloseParenToken}else{[Microsoft.CodeAnalysis.CSharp.SyntaxKind]::CloseBraceToken}
+              $depth=0;$expressionLength=0
+              foreach($lexicalToken in [Microsoft.CodeAnalysis.CSharp.SyntaxFactory]::ParseTokens($decoded,0,0,$options)){
+                if($lexicalToken.RawKind -eq [int]$opening){$depth++}
+                if($lexicalToken.RawKind -eq [int]$closing){
+                  $depth--
+                  if($depth -eq 0){$expressionLength=$lexicalToken.Span.End;break}
+                }
+              }
+              if($expressionLength -eq 0){throw 'Invalid raw policy expression.'}
+              $expression=$decoded.Substring(0,$expressionLength)
+              $syntax=if($match.Value -ceq '@('){
+                [Microsoft.CodeAnalysis.CSharp.SyntaxFactory]::ParseExpression($expression,0,$options,$true)
+              }else{
+                [Microsoft.CodeAnalysis.CSharp.SyntaxFactory]::ParseStatement($expression,0,$options,$true)
+              }
+              if($null -eq $syntax -or $syntax.ContainsDiagnostics -or $syntax.ContainsDirectives -or $syntax.Span.Start -ne 0 -or
+                ($match.Value -ceq '@(' -and $syntax -isnot [Microsoft.CodeAnalysis.CSharp.Syntax.ParenthesizedExpressionSyntax]) -or
+                ($match.Value -ceq '@{' -and $syntax -isnot [Microsoft.CodeAnalysis.CSharp.Syntax.BlockSyntax])){throw 'Invalid raw policy expression.'}
+              $entityMap=@($entities.Matches($tail)|ForEach-Object {@{index=$_.Index;length=$_.Length;decodedLength=([Net.WebUtility]::HtmlDecode($_.Value)).Length}})
+              function Get-DevRawSourceOffset {
+                param([int]$DecodedOffset)
+                $sourceOffset=$DecodedOffset
+                foreach($entity in $entityMap){
+                  if($entity.index -ge $sourceOffset){break}
+                  $sourceOffset+=$entity.length-$entity.decodedLength
+                }
+                $sourceOffset
+              }
+              $sourceLength=Get-DevRawSourceOffset $syntax.Span.End
+              $tokens=@(foreach($token in $syntax.DescendantTokens()){
+                if($token.IsMissing){throw 'Invalid raw policy token.'}
+                $start=Get-DevRawSourceOffset $token.Span.Start
+                $end=Get-DevRawSourceOffset $token.Span.End
+                $lexeme=$tail.Substring($start,$end-$start)
+                if($entities.Replace($lexeme,[Text.RegularExpressions.MatchEvaluator]{param($entity) [Net.WebUtility]::HtmlDecode($entity.Value)}) -cne $token.Text){throw 'Ambiguous raw policy token.'}
+                [ordered]@{kind=$token.RawKind;text=$lexeme}
+              })
+              $bytes=[Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $tokens -Depth 5 -Compress))
+              $digest=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+              [void]$result.Append($Marker+$digest)
+              $offset=$match.Index+1+$sourceLength
+            }
+            $result.ToString()
+          }
+          function Test-DevCallerProperties {
+            param($Expected,$Actual,[string]$Path='properties',[bool]$RawPolicy=$false)
+            if($Expected -is [Collections.IDictionary]){
+              if($Actual -isnot [Collections.IDictionary]){return $false}
+              $rawContent=$RawPolicy -or ($Path -ceq 'properties' -and $Expected.format -ceq 'rawxml')
+              foreach($key in $Expected.Keys){
+                if(-not (Test-DevCallerProperties $Expected[$key] $Actual[$key] ($Path+'.'+$key) $rawContent)){return $false}
+              }
+              return $true
+            }
+            if($Expected -is [array]){
+              if($Actual -isnot [array] -or $Expected.Count -ne $Actual.Count){return $false}
+              for($index=0;$index -lt $Expected.Count;$index++){
+                if(-not (Test-DevCallerProperties $Expected[$index] $Actual[$index] ($Path+'[]'))){return $false}
+              }
+              return $true
+            }
+            if($Expected -is [string] -and $Actual -is [string]){
+              if($Path -ceq 'properties.format' -and $Expected -cin @('xml','rawxml')){return $Actual -cin @('xml','rawxml')}
+              if($Path -ceq 'properties.value' -and $Expected.TrimStart().StartsWith('<')){
+                try{
+                  $documents=@()
+                  $marker='byokReadback'+[guid]::NewGuid().ToString('N')
+                  foreach($text in @($Expected,$Actual)){
+                    $content=$text.Replace("`r`n","`n")
+                    if($RawPolicy){$content=ConvertTo-DevRawPolicyXml $content $marker}
+                    $settings=[Xml.XmlReaderSettings]::new();$settings.DtdProcessing=[Xml.DtdProcessing]::Prohibit;$settings.XmlResolver=$null
+                    $reader=[Xml.XmlReader]::Create([IO.StringReader]::new($content),$settings)
+                    try{$xml=[Xml.XmlDocument]::new();$xml.XmlResolver=$null;$xml.Load($reader);$documents+=,$xml.OuterXml}finally{$reader.Dispose()}
+                  }
+                  return $documents[0] -ceq $documents[1]
+                }catch{return $false}
+              }
+              return $Expected -ceq $Actual
+            }
+            [Newtonsoft.Json.Linq.JToken]::DeepEquals(
+              [Newtonsoft.Json.Linq.JToken]::Parse((ConvertTo-Json -InputObject $Expected -Depth 100 -Compress)),
+              [Newtonsoft.Json.Linq.JToken]::Parse((ConvertTo-Json -InputObject $Actual -Depth 100 -Compress)))
+          }
+          function Assert-DevCallerReadback {
+            param($Preview,[string]$ApimId,[string[]]$Paths,$Parameters,[scriptblock]$Read)
+            foreach($path in $Paths){
+              $resourceId=$ApimId+'/'+$path
+              $change=@($Preview.changes|Where-Object {$_.resourceId -ieq $resourceId -and $_.changeType -cin @('Create','Modify','NoChange')})
+              if($change.Count -ne 1){throw 'Caller resource readback failed.'}
+              if($path -cmatch '\Aproducts/[A-Za-z0-9_-]+/apis/copilot-byok-foundry\z'){
+                $association=& $Read ('/'+$path) 'HEAD'
+                if($association.status -ne 204){throw 'Caller product association readback failed.'}
+                continue
+              }
+              $expected=($change[0].after ?? $change[0].before).properties
+              if($expected -isnot [Collections.IDictionary]){throw 'Caller resource readback failed.'}
+              $expected=$expected|ConvertTo-Json -Depth 100|ConvertFrom-Json -AsHashtable
+              $format=if($path -cmatch '\ApolicyFragments/[A-Za-z0-9_-]+\z|/policies/policy\z' -and $expected.format -cin @('xml','rawxml')){$expected.format}else{''}
+              $actual=& $Read ('/'+$path) 'GET' $format
+              if($actual.id -ine $resourceId -or $actual.properties -isnot [Collections.IDictionary]){throw 'Caller resource readback failed.'}
+              $actualProperties=$actual.properties|ConvertTo-Json -Depth 100|ConvertFrom-Json -AsHashtable
+              if($path -cmatch '\ApolicyFragments/[A-Za-z0-9_-]+\z' -and -not $actualProperties.Contains('format')){
+                $actualProperties.format='xml'
+              }
+              if($path -ceq 'apis/copilot-byok-foundry' -and $expected.Contains('apiType')){
+                if($expected.apiType -cnotin @('http','*******')){throw 'Caller resource readback failed.'}
+                foreach($typeField in @('apiType','type')){
+                  if($actualProperties.Contains($typeField) -and $actualProperties[$typeField] -cne 'http'){throw 'Caller resource readback failed.'}
+                }
+                [void]$expected.Remove('apiType')
+              }
+              if($path -cin @('namedValues/caller-response-owner-key','namedValues/caller-response-owner-key-previous')){
+                [void]$expected.Remove('value')
+                if($actual.properties.secret -ne $true -or $actual.properties.keyVault){throw 'Caller resource readback failed.'}
+                $secret=& $Read ('/'+$path+'/listValue') 'POST'
+                $key=if($path -ceq 'namedValues/caller-response-owner-key'){$Parameters.parameters.responseOwnerKey.value}else{$Parameters.parameters.responseOwnerPreviousKey.value}
+                if($key -ceq ''){$key='__none__'}
+                if($secret.value -cne $key){throw 'Caller ownership key mismatch.'}
+                $secret=$null;$key=$null
+              }
+              if(-not (Test-DevCallerProperties $expected $actualProperties)){throw 'Caller resource readback failed.'}
+            }
+          }
+          function Assert-DevCallerTieringParameters {
+            param([Collections.IDictionary]$Parameters)
+            if(-not $Parameters.Contains('callerJwtTiering')){return}
+            $params=$Parameters|ConvertTo-Json -Depth 100|ConvertFrom-Json
+            $StandaloneCloud=''
+            $parseErrors=$null
+            $guard=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'scripts/check-provision-params.ps1'),[ref]$null,[ref]$parseErrors)
+            if($parseErrors.Count){throw 'Invalid JWT tier configuration.'}
+            foreach($name in @('Resolve-ParamValue','Resolve-PreparationValue','Test-PreparationProperties','Test-PreparationString','Test-CallerAuthPreparation','Test-CallerJwtTiering')){
+              $definition=@($guard.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name},$false))
+              if($definition.Count -ne 1){throw 'Invalid JWT tier configuration.'}
+              . ([scriptblock]::Create($definition[0].Extent.Text))
+            }
+            try{$valid=Test-CallerJwtTiering}catch{$valid=$false}
+            if(-not $valid){throw 'Invalid JWT tier configuration.'}
+          }
+          function New-DevApimPreviewParameters {
+            param($Parameters,$Apim,$Api,$Backend,$NamedValues,$Operations,$Products,$Fragments,[bool]$AllowPrepared=$false)
+            Assert-DevCallerTieringParameters $Parameters
+            $tiering=$Parameters.callerJwtTiering.value
+            if(($tiering.entra.enabled -or $tiering.okta.enabled) -and $Apim.sku.name -cnotin @('Developer','Premium')){throw 'Invalid JWT tier configuration.'}
+            $trust=$Parameters.callerAuthPreparation.value
+            if($Parameters.deployFoundry.value -ne $true -or $Parameters.deployAoai.value -ne $false -or
+              $Parameters.deployBackendPool.value -ne $false -or $Parameters.deployFoundryCommercial.value -eq $true -or
+              @($Parameters.foundryRegions.value).Count -ne 0 -or @($Parameters.aoaiRegions.value).Count -ne 0 -or
+              $Parameters.callerAuthRollout.value -cnotin @('shared','coexistence') -or $trust.enabled -ne $true -or $trust.keyEnabled -ne $true -or
+              $trust.entraEnabled -ne $true -or $trust.oktaTrust.enabled -ne $false -or
+              $Apim.properties.provisioningState -cne 'Succeeded' -or $Apim.properties.virtualNetworkType -cne 'Internal' -or
+              $Api.id -ine ($Apim.id+'/apis/copilot-byok-foundry') -or $Api.properties.path -cne 'openai' -or
+              $Api.properties.subscriptionRequired -ne $true -or $Api.properties.subscriptionKeyParameterNames.header -cne 'api-key' -or
+              $Api.properties.subscriptionKeyParameterNames.query -cne 'api-key' -or @($Api.properties.protocols).Count -ne 1 -or
+              $Api.properties.protocols[0] -cne 'https' -or $Backend.id -ine ($Apim.id+'/backends/foundry')){throw 'Invalid APIM preview target.'}
+            $origin=[uri]$Backend.properties.url
+            if($origin.Scheme -cne 'https' -or $origin.IsLoopback -or $origin.Port -ne 443 -or $origin.UserInfo -or $origin.Query -or $origin.Fragment -or
+              $origin.AbsolutePath -cnotin @('/','/openai','/openai/') -or $Api.properties.serviceUrl -cne $Backend.properties.url){throw 'Invalid APIM preview target.'}
+            foreach($collection in @($NamedValues,$Operations,$Products,$Fragments)){
+              if($collection.value -isnot [array] -or $collection.nextLink){throw 'Incomplete live APIM inventory.'}
+            }
+            $loginHost=if($Parameters.cloudEnv.value -ceq 'AzureUSGovernment'){'login.microsoftonline.us'}else{'login.microsoftonline.com'}
+            $audience=if($Parameters.cloudEnv.value -ceq 'AzureUSGovernment'){'https://cognitiveservices.azure.us'}else{'https://cognitiveservices.azure.com'}
+            $required=@{'entra-openid-config-url'='https://'+$loginHost+'/'+$Parameters.entraTenantId.value+'/v2.0/.well-known/openid-configuration';
+              'api-audience'=$Parameters.apiAudience.value;'required-scope'=$Parameters.requiredScope.value;
+              'foundry-private-base-url'=$Backend.properties.url;'foundry-backend-id'='foundry';'foundry-mi-audience'=$audience;
+              'commercial-models'='__none__';'jwt-calls-per-minute'=[string]$Parameters.jwtDefaultCallsPerMinute.value;
+              'jwt-tokens-per-minute'=[string]$Parameters.jwtDefaultTokensPerMinute.value;'jwt-monthly-call-quota'=[string]$Parameters.jwtDefaultMonthlyCallQuota.value}
+            foreach($name in $required.Keys){
+              $setting=@($NamedValues.value|Where-Object name -CEQ $name)
+              if($setting.Count -ne 1 -or $setting[0].properties.secret -ne $false -or $setting[0].properties.value -cne $required[$name]){throw 'Live APIM trust or routing differs from the candidate.'}
+            }
+            $pinned=@($NamedValues.value|Where-Object name -CEQ 'aoai-pinned-models')
+            $nativeProducts=@($Products.value|Where-Object name -cin @('byok-standard','byok-power'))
+            $otherProducts=@($Products.value|Where-Object name -cnotin @('byok-standard','byok-power'))
+            $callerSettings=@($NamedValues.value|Where-Object name -like 'caller-*')
+            $callerFragments=@($Fragments.value|Where-Object {$_.name -cin @('byok-authenticate','byok-strip-caller-credentials','byok-apply-caller-limits','byok-response-owner-context','byok-prepare-responses-request','byok-read-response-owner','byok-verify-response-owner','byok-locate-response-owner')})
+            if($pinned.Count -ne 1 -or -not [string]::IsNullOrWhiteSpace($pinned[0].properties.value) -or
+              $nativeProducts.Count -ne 2 -or @($nativeProducts.name|Sort-Object -Unique).Count -ne 2 -or
+              @($nativeProducts|Where-Object {$_.properties.subscriptionRequired -ne $true}).Count -or
+              $otherProducts.Count -gt 1 -or @($otherProducts|Where-Object {$_.name -cne $trust.jwtProductId -or $_.properties.subscriptionRequired -ne $false}).Count -or
+              (-not $AllowPrepared -and ($callerSettings.Count -or $callerFragments.Count -or $otherProducts.Count))){throw 'Gateway is not the verified native-key-only baseline.'}
+            if($AllowPrepared){
+              $expectedSettings=@(Get-DevApimPreviewPaths $trust.jwtProductId|Where-Object {$_ -clike 'namedValues/*'}|ForEach-Object {$_.Substring(12)})
+              if(@($callerSettings|Where-Object name -cnotin $expectedSettings).Count -or
+                @($callerSettings.name|Sort-Object -Unique).Count -ne $callerSettings.Count){throw 'Unrecognized prepared caller resources.'}
+            }
+            $operationPaths=@{'chat-completions'='POST /v1/chat/completions';'completions'='POST /v1/completions';'embeddings'='POST /v1/embeddings';
+              'responses'='POST /v1/responses';'responses-get'='GET /v1/responses/{response_id}';'responses-delete'='DELETE /v1/responses/{response_id}';
+              'responses-cancel'='POST /v1/responses/{response_id}/cancel';'responses-input-items'='GET /v1/responses/{response_id}/input_items';
+              'chat-completions-deployment'='POST /deployments/{deployment}/chat/completions';'completions-deployment'='POST /deployments/{deployment}/completions';
+              'embeddings-deployment'='POST /deployments/{deployment}/embeddings';'list-models'='GET /v1/models'}
+            if($Operations.value.Count -ne $operationPaths.Count){throw 'Live APIM operation coverage differs.'}
+            foreach($name in $operationPaths.Keys){
+              $operation=@($Operations.value|Where-Object name -CEQ $name)
+              if($operation.Count -ne 1 -or ($operation[0].properties.method+' '+$operation[0].properties.urlTemplate) -cne $operationPaths[$name]){throw 'Live APIM operation coverage differs.'}
+            }
+            $result=@{parameters=@{apimName=@{value=$Apim.name};foundryPrivateBaseUrl=@{value=$Backend.properties.url};entraTenantId=$Parameters.entraTenantId;
+              entraClientIds=@{value=$trust.entraClientIds};jwtProductId=@{value=$trust.jwtProductId};
+              callerAuthRollout=$Parameters.callerAuthRollout;
+              responseOwnerKey=$Parameters.responseOwnerKey;responseOwnerPreviousKey=$Parameters.responseOwnerPreviousKey}}
+            if($Parameters.Contains('callerJwtTiering')){
+              $result.parameters.callerJwtTiering=$Parameters.callerJwtTiering
+              $tierCatalog=@()
+              if($tiering.entra.enabled -or $tiering.okta.enabled){$tierCatalog=@($Parameters.productTiers.value)}
+              $result.parameters.productTiers=@{value=$tierCatalog}
+            }
+            $result
+          }
+          function ConvertFrom-DevPreviewAuthResponse {
+            param([int]$StatusCode,[string]$Output)
+            $payload=ConvertFrom-Json -InputObject $Output -AsHashtable
+            if($payload -isnot [Collections.IDictionary]){throw 'Live register configuration is required for JWT preview.'}
+            $errorCode=$payload.error.code ?? $payload.code
+            if($StatusCode -eq 404 -and $errorCode -ceq 'AuthConfigNotFound'){return @{value=@()}}
+            if($StatusCode -ne 200 -or $payload.error -or $payload.code -or $payload.value -isnot [array]){
+              throw 'Live register configuration is required for JWT preview.'
+            }
+            $payload
+          }
+          function Get-DevPreviewRegisterConfig {
+            param($Application,$AuthConfigs,$Deployment)
+            $containers=@($Application.properties.template.containers)
+            $parameters=$Deployment.properties.parameters
+            if($Application.tags.'azd-service-name' -cne 'register' -or $Application.properties.provisioningState -cne 'Succeeded' -or
+              $containers.Count -ne 1 -or [string]::IsNullOrWhiteSpace($containers[0].image) -or
+              $Deployment.properties.provisioningState -cne 'Succeeded' -or $parameters -isnot [Collections.IDictionary] -or
+              -not $parameters.Contains('easyAuthClientId') -or -not $parameters.Contains('easyAuthSecretKeyVaultUri') -or
+              -not $parameters.Contains('registerImage') -or $parameters.registerImage.value -cne $containers[0].image -or
+              $AuthConfigs.value -isnot [array]){throw 'Live register configuration is required for JWT preview.'}
+            $clientId=$parameters.easyAuthClientId.value
+            $secretUri=$parameters.easyAuthSecretKeyVaultUri.value
+            if($clientId -isnot [string] -or $secretUri -isnot [string]){throw 'Live register configuration is required for JWT preview.'}
+            if($clientId -ceq ''){
+              if($secretUri -cne '' -or $AuthConfigs.value.Count -ne 0){throw 'Live register configuration is required for JWT preview.'}
+            }else{
+              $auth=@($AuthConfigs.value|Where-Object name -CEQ 'current')
+              if($clientId -cnotmatch '\A[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\z' -or $secretUri -cnotmatch '\Ahttps://[^/?#@]+/secrets/[A-Za-z0-9-]+(?:/[A-Za-z0-9]+)?\z' -or
+                $AuthConfigs.value.Count -ne 1 -or $auth.Count -ne 1 -or $auth[0].properties.platform.enabled -ne $true -or
+                $auth[0].properties.identityProviders.azureActiveDirectory.enabled -ne $true -or
+                $auth[0].properties.identityProviders.azureActiveDirectory.registration.clientId -cne $clientId -or
+                $auth[0].properties.identityProviders.azureActiveDirectory.registration.clientSecretSettingName -cne 'easyauth-client-secret'){
+                throw 'Live register configuration is required for JWT preview.'
+              }
+            }
+            @{image=$containers[0].image;clientId=$clientId;secretUri=$secretUri}
+          }
+          function Test-DevRecoveryTemplate {
+            param($Deployed,$Candidate)
+            function ConvertTo-RecoveryComparableTemplate {
+              param($Value,[string]$Path='template')
+              if($Value -is [Collections.IDictionary]){
+                $normalized=[ordered]@{}
+                $isTemplate=$Value.Contains('$schema') -and $Value.Contains('resources') -and $Value.Contains('contentVersion')
+                $isDeclaration=$Path -match '\.(?:parameters|outputs|definitions)\.[^.]+\z'
+                foreach($key in @($Value.Keys|Sort-Object -CaseSensitive)){
+                  if($key -ceq 'metadata' -and ($isTemplate -or $isDeclaration)){continue}
+                  $entry=$Value[$key]
+                  if($key -ceq 'type' -and ($isDeclaration -or $Path -match '\.definitions\.') -and
+                    $entry -is [string] -and $entry -iin @('string','securestring','int','bool','object','secureobject','array')){
+                    $entry=$entry.ToLowerInvariant()
+                  }
+                  $normalized[$key]=ConvertTo-RecoveryComparableTemplate $entry ($Path+'.'+$key)
+                }
+                return $normalized
+              }
+              if($Value -is [array]){return ,@($Value|ForEach-Object {ConvertTo-RecoveryComparableTemplate $_ ($Path+'[]')})}
+              if($Value -is [string]){return $Value.Replace("`r`n","`n")}
+              $Value
+            }
+            $before=ConvertTo-RecoveryComparableTemplate $Deployed
+            $after=ConvertTo-RecoveryComparableTemplate $Candidate
+            [Newtonsoft.Json.Linq.JToken]::DeepEquals(
+              [Newtonsoft.Json.Linq.JToken]::Parse(($before|ConvertTo-Json -Depth 100 -Compress)),
+              [Newtonsoft.Json.Linq.JToken]::Parse(($after|ConvertTo-Json -Depth 100 -Compress)))
+          }
+          function Get-DevRecoveryRegisterConfig {
+            param($Application,$AuthConfigs,$NestedDeployment,$Parent,$ParentOperations,[string]$GroupId,[bool]$TemplateMatches)
+            $settings=$Parent.properties.parameters
+            $timestamp=[DateTimeOffset]$Parent.properties.timestamp
+            $failed=@($ParentOperations|Where-Object {$_.properties.provisioningState -cne 'Succeeded' -and $_.properties.provisioningOperation -cne 'EvaluateDeploymentOutput'})
+            if($Parent.properties.provisioningState -cne 'Failed' -or -not $TemplateMatches -or
+              $timestamp -lt [DateTimeOffset]::UtcNow.AddHours(-24) -or $timestamp -gt [DateTimeOffset]::UtcNow -or
+              $settings.envName.value -cne 'comm-dev' -or $settings.namePrefix.value -cne 'copilot-byok' -or
+              $settings.cloudEnv.value -cne 'AzureCloud' -or $settings.callerAuthRollout.value -cne 'legacy' -or
+              $settings.callerAuthPreparation.value.enabled -ne $false -or $failed.Count -ne 1 -or
+              $failed[0].properties.targetResource.id -ine ($GroupId+'/providers/Microsoft.Resources/deployments/apim') -or
+              -not $Application.id.StartsWith($GroupId+'/providers/Microsoft.App/containerApps/',[StringComparison]::OrdinalIgnoreCase) -or
+              $NestedDeployment.properties.provisioningState -cne 'Succeeded' -or
+              $NestedDeployment.properties.parameters.easyAuthClientId.value -cne $settings.registerEasyAuthClientId.value -or
+              $NestedDeployment.properties.parameters.easyAuthSecretKeyVaultUri.value -cne $settings.registerEasyAuthSecretKeyVaultUri.value){throw 'Recovery baseline cannot be verified.'}
+            $copy=$NestedDeployment|ConvertTo-Json -Depth 100|ConvertFrom-Json -AsHashtable
+            $copy.properties.parameters.registerImage=@{value=$settings.registerAppImage.value}
+            Get-DevPreviewRegisterConfig $Application $AuthConfigs $copy
+          }
+          function New-DevPreviewCandidate {
+            param($Document,[bool]$PreviewOnly,[bool]$PreviewJwt,[string]$PreviousKeyState)
+            if(-not $PreviewJwt){return $Document}
+            if(-not $PreviewOnly){throw 'JWT preview requires preview-only dispatch.'}
+            $candidate=$Document|ConvertTo-Json -Depth 100|ConvertFrom-Json -AsHashtable
+            $trust=$candidate.parameters.callerAuthPreparation.value
+            if($trust -isnot [Collections.IDictionary] -or $trust.enabled -ne $false -or $trust.keyEnabled -ne $true -or
+              $trust.entraEnabled -ne $true -or $trust.oktaTrust.enabled -ne $false -or
+              $candidate.parameters.callerAuthRollout.value -cne 'legacy' -or [string]::IsNullOrWhiteSpace($PreviousKeyState) -or
+              $candidate.parameters.Contains('responseOwnerKey') -or $candidate.parameters.Contains('responseOwnerPreviousKey')){throw 'Invalid disabled candidate preparation.'}
+            $trust.enabled=$true
+            $candidate.parameters.callerAuthRollout.value='coexistence'
+            $candidate.parameters.responseOwnerKey=@{value='${BYOK_RESPONSE_OWNER_KEY}'}
+            $candidate.parameters.responseOwnerPreviousKey=@{value=$(if($PreviousKeyState -ceq '__none__'){''}else{'${BYOK_RESPONSE_OWNER_PREVIOUS_KEY}'})}
+            $candidate
+          }
+          function Resolve-DevPreviewParameters {
+            param($Document,$Template,[string]$Environment,[string]$Location,[ValidateSet('legacy','shared','coexistence')][string]$CallerRollout='legacy',[bool]$AllowPilotCaller=$false)
+            if($Environment -cnotin @('comm-dev','gov-dev','comm-pilot','gov-pilot') -or $Document.parameters -isnot [Collections.IDictionary] -or
+              ($Environment -clike '*-pilot' -and (-not $AllowPilotCaller -or $CallerRollout -ceq 'legacy'))){throw 'Invalid preview parameters.'}
+            $parameters=[ordered]@{}
+            foreach($name in $Document.parameters.Keys){
+              $parameter=$Document.parameters[$name]
+              if($parameter -isnot [Collections.IDictionary] -or $parameter.Count -ne 1 -or -not $parameter.Contains('value') -or -not $Template.parameters.Contains($name)){throw 'Invalid preview parameters.'}
+              $value=$parameter.value
+              if($value -is [string] -and $value -cmatch '\A\$\{([A-Z_][A-Z0-9_]*)\}\z'){
+                $value=[Environment]::GetEnvironmentVariable($Matches[1])
+                if($null -eq $value){continue}
+                $definition=$Template.parameters[$name]
+                if($definition.type -inotmatch '\A(?:secure)?string\z'){throw 'Unsupported preview substitution.'}
+                if($value -ceq '' -and $definition.defaultValue -ceq ''){continue}
+              }elseif(($value|ConvertTo-Json -Depth 100 -Compress) -match '\$\{'){
+                throw 'Unsupported preview substitution.'
+              }
+              $parameters[$name]=@{value=$value}
+            }
+            Assert-DevCallerTieringParameters $parameters
+            $expectedCloud=if($Environment.StartsWith('gov-',[StringComparison]::Ordinal)){'AzureUSGovernment'}else{'AzureCloud'}
+            $expectedLocation=if($Environment.StartsWith('gov-',[StringComparison]::Ordinal)){'usgovvirginia'}else{'eastus2'}
+            if($parameters.envName.value -cne $Environment -or $parameters.namePrefix.value -cne 'copilot-byok' -or
+              $parameters.cloudEnv.value -cne $expectedCloud -or $parameters.location.value -cne $expectedLocation -or $Location -cne $expectedLocation -or
+              $parameters.authMode.value -cne 'subscriptionKey'){throw 'Invalid preview context.'}
+            if($CallerRollout -ceq 'legacy' -and (($parameters.Contains('callerAuthRollout') -and $parameters.callerAuthRollout.value -cne 'legacy') -or
+              ($parameters.Contains('callerAuthPreparation') -and $parameters.callerAuthPreparation.value.enabled) -or
+              $parameters.Contains('responseOwnerKey') -or $parameters.Contains('responseOwnerPreviousKey'))){throw 'Preview is not the approved legacy baseline.'}
+            if($CallerRollout -cin @('shared','coexistence')){
+              $trust=$parameters.callerAuthPreparation.value
+              $key=$parameters.responseOwnerKey.value
+              $previous=$parameters.responseOwnerPreviousKey.value
+              $keyPattern='\A[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=\z'
+              if($parameters.callerAuthRollout.value -cne $CallerRollout -or $trust.enabled -ne $true -or $trust.keyEnabled -ne $true -or
+                $trust.entraEnabled -ne $true -or $trust.oktaTrust.enabled -ne $false -or $key -isnot [string] -or $key -cnotmatch $keyPattern -or $key -ceq ('A'*43+'=') -or
+                $previous -isnot [string] -or ($previous -cne '' -and ($previous -cnotmatch $keyPattern -or $previous -ceq ('A'*43+'=') -or $previous -ceq $key))){throw 'Invalid coexistence preview parameters.'}
+            }
+            @{parameters=$parameters}
+          }
+          function Invoke-DevPreviewProcess {
+            param([string]$FileName,[string[]]$Arguments,[string]$InputJson='')
+            $executable=Get-Command $FileName -CommandType Application|Select-Object -First 1
+            $start=[Diagnostics.ProcessStartInfo]::new($executable.Source)
+            $start.UseShellExecute=$false
+            $start.RedirectStandardOutput=$true
+            $start.RedirectStandardError=$true
+            $start.RedirectStandardInput=$true
+            $start.StandardInputEncoding=[Text.UTF8Encoding]::new($false)
+            $start.StandardOutputEncoding=[Text.UTF8Encoding]::new($false)
+            $start.StandardErrorEncoding=[Text.UTF8Encoding]::new($false)
+            foreach($argument in $Arguments){$start.ArgumentList.Add($argument)}
+            $process=[Diagnostics.Process]::Start($start)
+            try{
+              $stdout=$process.StandardOutput.ReadToEndAsync()
+              $stderr=$process.StandardError.ReadToEndAsync()
+              if($InputJson){$process.StandardInput.Write($InputJson)}
+              $process.StandardInput.Close()
+              $process.WaitForExit()
+              $output=$stdout.GetAwaiter().GetResult()
+              $failure=$stderr.GetAwaiter().GetResult()
+              if($process.ExitCode -ne 0){
+                $categories=@([regex]::Matches($failure,'AuthorizationFailed|InvalidTemplate|InvalidTemplateDeployment|RequestDisallowedByPolicy|InvalidParameter|SubscriptionNotFound|SkuNotAvailable|QuotaExceeded')|ForEach-Object Value|Select-Object -Unique)
+                @{test='dev-infrastructure-preview-command';passed=$false;categories=$categories;rawOutputSuppressed=$true}|ConvertTo-Json -Compress|Write-Host
+                throw 'Preview command failed.'
+              }
+              $output
+            }finally{$output=$null;$failure=$null;$process.Dispose()}
+          }
+          try{
+            if($env:PREVIEW_ENVIRONMENT -cnotin @('comm-dev','gov-dev','comm-pilot','gov-pilot') -or
+              ($env:PREVIEW_ENVIRONMENT -clike '*-pilot' -and ($env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or
+                $env:CALLER_ACTION -cnotin @('activate','rollback','finalize')))){throw 'Invalid caller transition target.'}
+            $account=Invoke-DevPreviewProcess az @('account','show','--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json')|ConvertFrom-Json
+            $expectedCloud=if($env:PREVIEW_ENVIRONMENT.StartsWith('gov-',[StringComparison]::Ordinal)){'AzureUSGovernment'}else{'AzureCloud'}
+            if($account.id -ine $env:AZURE_SUBSCRIPTION_ID -or $account.tenantId -ine $env:ENTRA_TENANT_ID -or $account.environmentName -cne $expectedCloud){throw 'Invalid preview context.'}
+            $template=Invoke-DevPreviewProcess bicep @('build','infra/main.bicep','--stdout')|ConvertFrom-Json -AsHashtable
+            $document=Get-Content -Raw -LiteralPath infra/main.parameters.json|ConvertFrom-Json -AsHashtable
+            $previewJwt=$env:PREVIEW_JWT -ceq 'true'
+            $previewApimOnly=$env:PREVIEW_APIM_ONLY -ceq 'true'
+            $recoverPhaseTwo=$env:RECOVER_PHASE_TWO -ceq 'true'
+            $callerAction=$env:CALLER_ACTION
+            $manualCaller=$callerAction -cin @('activate','rollback','finalize')
+            $previewOnly=$env:PREVIEW_ONLY -ceq 'true'
+            $storedRollout=$document.parameters.callerAuthRollout.value
+            $storedPreparation=$document.parameters.callerAuthPreparation.value.enabled
+            if($recoverPhaseTwo -and ($env:PREVIEW_ENVIRONMENT -cne 'comm-dev' -or $previewJwt -or $previewApimOnly -or
+              $document.parameters.callerAuthRollout.value -cne 'legacy' -or $document.parameters.callerAuthPreparation.value.enabled -ne $false)){
+              throw 'Invalid recovery mode.'
+            }
+            if($previewApimOnly -and (-not $previewJwt -or $env:PREVIEW_ONLY -cne 'true')){throw 'JWT preview requires preview-only dispatch.'}
+            $armBase=if($expectedCloud -ceq 'AzureUSGovernment'){'https://management.usgovcloudapi.net'}else{'https://management.azure.com'}
+            if($manualCaller){
+              if($recoverPhaseTwo -or $previewJwt -or $previewApimOnly){throw 'Invalid caller transition candidate.'}
+              $groupName='rg-copilot-byok-'+$env:PREVIEW_ENVIRONMENT
+              $groupId='/subscriptions/'+$env:AZURE_SUBSCRIPTION_ID+'/resourceGroups/'+$groupName
+              $group=Invoke-DevPreviewProcess az @('group','show','--name',$groupName,'--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json')|ConvertFrom-Json -AsHashtable
+              Assert-DevCallerGroup $group $env:PREVIEW_ENVIRONMENT $env:AZURE_SUBSCRIPTION_ID
+              $existingHold=[string]$group.tags.byokCallerTransition
+              $callerRollout=if($callerAction -ceq 'activate'){'coexistence'}elseif($callerAction -ceq 'rollback'){'shared'}else{
+                if($existingHold -cnotmatch '\Av1:[0-9a-f]{40}:(shared|coexistence):[0-9a-f]{64}\z'){throw 'Caller transition hold requires reconciliation.'}
+                $Matches[1]
+              }
+              $artifactSourceSha=Resolve-DevCallerArtifactSource $callerAction $env:GITHUB_SHA $existingHold {
+                param($artifactSha,$workflowSha)
+                try{
+                  $null=Invoke-DevPreviewProcess git @('merge-base','--is-ancestor',$artifactSha,$workflowSha)
+                  $null=Invoke-DevPreviewProcess git @('diff','--quiet',$artifactSha,$workflowSha,'--','infra','policies','azure.yaml',
+                    'scripts/check-provision-params.ps1','scripts/check-provision-params.sh')
+                  $true
+                }catch{$false}
+              }
+              $allowPrepared=$storedPreparation -eq $true -or -not [string]::IsNullOrWhiteSpace($existingHold)
+              if($callerAction -cin @('rollback','finalize') -and -not $allowPrepared){throw 'Caller transition requires prepared resources.'}
+              $document=New-DevCallerCandidate $document $callerRollout $env:BYOK_RESPONSE_OWNER_PREVIOUS_KEY
+              $deployments=@(Invoke-DevPreviewProcess az @('deployment','group','list','--resource-group',$groupName,'--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json')|ConvertFrom-Json -AsHashtable)
+              if(@($deployments|Where-Object {$_.properties.provisioningState -cnotin @('Succeeded','Failed','Canceled')}).Count){throw 'Caller transition cannot overlap a deployment.'}
+            }else{
+              $document=New-DevPreviewCandidate $document $previewOnly $previewJwt $env:BYOK_RESPONSE_OWNER_PREVIOUS_KEY
+              $callerRollout=if($previewJwt){'coexistence'}elseif($previewOnly -and $storedPreparation -is [bool] -and $storedPreparation -and $storedRollout -cin @('shared','coexistence')){$storedRollout}else{'legacy'}
+            }
+            if((($previewJwt -or (-not $manualCaller -and $previewOnly -and $callerRollout -cin @('shared','coexistence'))) -and -not $previewApimOnly) -or $recoverPhaseTwo){
+              $apps=Invoke-DevPreviewProcess az @('containerapp','list','--resource-group',('rg-copilot-byok-'+$env:PREVIEW_ENVIRONMENT),'--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json')|ConvertFrom-Json
+              $register=@($apps|Where-Object {$_.tags.'azd-service-name' -ceq 'register'})
+              if($register.Count -ne 1){throw 'Live register configuration is required for JWT preview.'}
+              $armToken=Invoke-DevPreviewProcess az @('account','get-access-token','--subscription',$env:AZURE_SUBSCRIPTION_ID,'--resource-type','arm','--output','json')|ConvertFrom-Json
+              $handler=[Net.Http.HttpClientHandler]::new()
+              $handler.AllowAutoRedirect=$false
+              $client=[Net.Http.HttpClient]::new($handler)
+              try{
+                $client.DefaultRequestHeaders.Authorization=[Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer',$armToken.accessToken)
+                $client.DefaultRequestHeaders.Accept.ParseAdd('application/json')
+                $armToken=$null
+                $response=$client.GetAsync($armBase+$register[0].id+'/authConfigs?api-version=2024-10-02-preview').GetAwaiter().GetResult()
+                try{
+                  $authConfigs=ConvertFrom-DevPreviewAuthResponse ([int]$response.StatusCode) ($response.Content.ReadAsStringAsync().GetAwaiter().GetResult())
+                }finally{$response.Dispose()}
+              }finally{$client.Dispose();$armToken=$null}
+              $registerDeployment=Invoke-DevPreviewProcess az @('deployment','group','show','--resource-group',('rg-copilot-byok-'+$env:PREVIEW_ENVIRONMENT),'--name','register-app','--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json')|ConvertFrom-Json -AsHashtable
+              if($recoverPhaseTwo){
+                $groupName='rg-copilot-byok-comm-dev'
+                $groupId='/subscriptions/'+$env:AZURE_SUBSCRIPTION_ID+'/resourceGroups/'+$groupName
+                $deployments=@(Invoke-DevPreviewProcess az @('deployment','sub','list','--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json')|ConvertFrom-Json -AsHashtable)
+                $projectDeployments=@($deployments|Where-Object {$_.properties.parameters.envName.value -ceq 'comm-dev' -and $_.properties.parameters.namePrefix.value -ceq 'copilot-byok'})
+                if(@($projectDeployments|Where-Object {$_.properties.provisioningState -cnotin @('Succeeded','Failed','Canceled')}).Count){throw 'Recovery baseline cannot be verified.'}
+                $parent=@($projectDeployments|Sort-Object {[DateTimeOffset]$_.properties.timestamp} -Descending|Select-Object -First 1)
+                if($parent.Count -ne 1){throw 'Recovery baseline cannot be verified.'}
+                $parentOperations=@(Invoke-DevPreviewProcess az @('deployment','operation','sub','list','--name',$parent[0].name,'--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json')|ConvertFrom-Json -AsHashtable)
+                $deployedTemplate=Invoke-DevPreviewProcess az @('deployment','sub','export','--name',$parent[0].name,'--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json')|ConvertFrom-Json -AsHashtable -Depth 100
+                $templateMatches=Test-DevRecoveryTemplate $deployedTemplate $template
+                $gateways=@(Invoke-DevPreviewProcess az @('apim','list','--resource-group',$groupName,'--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json')|ConvertFrom-Json -AsHashtable)
+                if($gateways.Count -ne 1 -or $gateways[0].provisioningState -cne 'Succeeded' -or $gateways[0].virtualNetworkType -cne 'Internal'){throw 'Recovery baseline cannot be verified.'}
+                $registerConfig=Get-DevRecoveryRegisterConfig $register[0] $authConfigs $registerDeployment $parent[0] $parentOperations $groupId $templateMatches
+              }else{
+                $registerConfig=Get-DevPreviewRegisterConfig $register[0] $authConfigs $registerDeployment
+              }
+              $env:REGISTER_APP_IMAGE=$registerConfig.image
+              $env:REGISTER_EASYAUTH_CLIENT_ID=$registerConfig.clientId
+              $env:REGISTER_EASYAUTH_SECRET_KV_URI=$registerConfig.secretUri
+            }
+            if($recoverPhaseTwo -and $env:PREVIEW_ONLY -cne 'true'){throw 'Recovery apply is not enabled until its preserving-state preview is reviewed.'}
+            if($previewJwt -or $manualCaller){
+              [IO.File]::WriteAllText((Join-Path $PWD 'infra/main.parameters.json'),($document|ConvertTo-Json -Depth 100),[Text.UTF8Encoding]::new($false))
+            }
+            $null=Invoke-DevPreviewProcess pwsh @('-NoProfile','-File','scripts/check-provision-params.ps1','-ParameterFile','infra/main.parameters.json')
+            $parameters=Resolve-DevPreviewParameters $document $template $env:PREVIEW_ENVIRONMENT $env:AZURE_LOCATION $callerRollout -AllowPilotCaller:$manualCaller
+            if($previewApimOnly -or $manualCaller){
+              $groupName='rg-copilot-byok-'+$env:PREVIEW_ENVIRONMENT
+              $groupId='/subscriptions/'+$env:AZURE_SUBSCRIPTION_ID+'/resourceGroups/'+$groupName
+              $apimDeployment=Invoke-DevPreviewProcess az @('deployment','group','show','--resource-group',$groupName,'--name','apim',
+                '--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json')|ConvertFrom-Json -AsHashtable
+              $serviceId=Get-DevCallerServiceId $apimDeployment $groupId
+              $expectedPrefix='/subscriptions/'+$env:AZURE_SUBSCRIPTION_ID+'/resourceGroups/'+$groupName+'/providers/Microsoft.ApiManagement/service/'
+              if(-not $serviceId.StartsWith($expectedPrefix,[StringComparison]::OrdinalIgnoreCase)){throw 'Invalid APIM preview target.'}
+              function Read-DevApimPreviewResource {
+                param([string]$Path,[string]$Method='GET',[ValidateSet('','xml','rawxml')][string]$Format='')
+                $formatQuery=if($Format){'&format='+$Format}else{''}
+                Invoke-DevPreviewProcess az @('rest','--method',$Method,'--url',($armBase+$serviceId+$Path+'?api-version=2024-05-01'+$formatQuery),
+                  '--headers','Accept=application/json','--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json','--only-show-errors')|ConvertFrom-Json -AsHashtable -Depth 100
+              }
+              function Read-DevApimInventory {
+                param([string]$Path)
+                Read-DevApimPreviewCollection $armBase $serviceId $Path {
+                  param($url)
+                  Invoke-DevPreviewProcess az @('rest','--method','GET','--url',$url,'--headers','Accept=application/json',
+                    '--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json','--only-show-errors')|ConvertFrom-Json -AsHashtable -Depth 100
+                }
+              }
+              $apim=Read-DevApimPreviewResource ''
+              $api=Read-DevApimPreviewResource '/apis/copilot-byok-foundry'
+              $backend=Read-DevApimPreviewResource '/backends/foundry'
+              $namedValues=Read-DevApimInventory '/namedValues'
+              $operations=Read-DevApimInventory '/apis/copilot-byok-foundry/operations'
+              $products=Read-DevApimInventory '/apis/copilot-byok-foundry/products'
+              $fragments=Read-DevApimInventory '/policyFragments'
+              $focusedParameters=New-DevApimPreviewParameters $parameters.parameters $apim $api $backend $namedValues $operations $products $fragments ($manualCaller -and $allowPrepared)
+              $productId=$focusedParameters.parameters.jwtProductId.value
+              $paths=@(Get-DevApimPreviewPaths $productId ($callerRollout -ceq 'coexistence'))
+              $focusedFile=Join-Path $env:RUNNER_TEMP ('byok-caller-'+[guid]::NewGuid().ToString('N')+'.json')
+              $null=Invoke-DevPreviewProcess bicep @('build','infra/modules/apim-foundry-caller-rollout.bicep','--outfile',$focusedFile)
+              $focusedTemplate=Get-Content -LiteralPath $focusedFile -Raw|ConvertFrom-Json -AsHashtable -Depth 100
+              if($focusedTemplate.resources.consumer.properties.template.resources.api.properties.apiType -cne 'http'){
+                throw 'Invalid APIM preview target.'
+              }
+              if($manualCaller){
+                $callerContract=@{}
+                foreach($name in @('cloudEnv','apiAudience','requiredScope','jwtDefaultCallsPerMinute','jwtDefaultTokensPerMinute','jwtDefaultMonthlyCallQuota')){
+                  $callerContract[$name]=$parameters.parameters[$name].value
+                }
+                $fingerprint=Get-DevCallerPreviewFingerprint $focusedTemplate $focusedParameters $env:PREVIEW_ENVIRONMENT $artifactSourceSha $serviceId $callerContract
+                $transition=New-DevCallerTransitionPlan $callerAction $callerRollout $previewOnly $fingerprint $env:CALLER_PREVIEW_DIGEST `
+                  $artifactSourceSha $env:GITHUB_REF $env:GITHUB_EVENT_NAME ([int]$env:GITHUB_RUN_ATTEMPT) $existingHold
+                $productInventory=Read-DevApimInventory '/products'
+                if($productInventory.nextLink -or $productInventory.value -isnot [array]){throw 'Incomplete live APIM inventory.'}
+                $jwtProducts=@($productInventory.value|Where-Object name -CEQ $productId)
+                if($jwtProducts.Count -gt 1 -or ($jwtProducts.Count -and -not $allowPrepared)){throw 'Unrecognized prepared caller resources.'}
+                $guardTemplate=$focusedTemplate.resources.admission.properties.template.variables.jwtProductGuardTemplate
+                if([string]::IsNullOrWhiteSpace($guardTemplate)){throw 'Caller product guard template is missing.'}
+                $closedGuard=@{format='xml';value=$guardTemplate.Replace('__ACTIVE__','false')}
+                $activeGuard=@{format='xml';value=$guardTemplate.Replace('__ACTIVE__','true')}
+                $linked=$false
+                if($jwtProducts.Count){
+                  if($jwtProducts[0].properties.subscriptionRequired -ne $false -or $jwtProducts[0].properties.state -cne 'notPublished'){
+                    throw 'Unrecognized prepared caller resources.'
+                  }
+                  $guard=Read-DevApimPreviewResource ('/products/'+$productId+'/policies/policy')
+                  if(-not (Test-DevCallerProperties $closedGuard $guard.properties) -and -not (Test-DevCallerProperties $activeGuard $guard.properties)){
+                    throw 'Unrecognized prepared caller resources.'
+                  }
+                  $links=Read-DevApimInventory ('/products/'+$productId+'/apis')
+                  if($links.nextLink -or $links.value -isnot [array] -or $links.value.Count -gt 1 -or
+                    @($links.value|Where-Object name -CNE 'copilot-byok-foundry').Count){throw 'Unrecognized prepared caller resources.'}
+                  $linked=$links.value.Count -eq 1
+                }
+                $keyNames=@('caller-response-owner-key','caller-response-owner-key-previous')
+                $existingKeys=@($namedValues.value|Where-Object name -cin $keyNames)
+                if($allowPrepared -and -not $existingHold -and $existingKeys.Count -ne 2){throw 'Caller ownership keys are incomplete.'}
+                foreach($setting in $existingKeys){
+                  if($setting.properties.secret -ne $true -or $setting.properties.keyVault){throw 'Caller ownership key mismatch.'}
+                  $keyValue=Read-DevApimPreviewResource ('/namedValues/'+$setting.name+'/listValue') 'POST'
+                  $expectedKey=if($setting.name -ceq 'caller-response-owner-key'){$focusedParameters.parameters.responseOwnerKey.value}else{$focusedParameters.parameters.responseOwnerPreviousKey.value}
+                  if($expectedKey -ceq ''){$expectedKey='__none__'}
+                  if($keyValue.value -cne $expectedKey){throw 'Caller ownership key mismatch.'}
+                  $keyValue=$null;$expectedKey=$null
+                }
+              }
+              $arguments=@('deployment','group','what-if','--subscription',$env:AZURE_SUBSCRIPTION_ID,'--resource-group',$groupName,
+                '--template-file',$focusedFile,'--parameters','@/dev/stdin','--result-format','FullResourcePayloads',
+                '--no-pretty-print','--only-show-errors','--output','json')
+              $output=Invoke-DevPreviewProcess az $arguments ($focusedParameters|ConvertTo-Json -Depth 100 -Compress)
+              $summary=Get-DevPreviewSummary $output $env:PREVIEW_ENVIRONMENT $env:AZURE_SUBSCRIPTION_ID $serviceId $paths ($callerRollout -ceq 'shared')
+              $summary.previewScope='apim-only'
+              if($manualCaller){
+                $summary.callerPreviewDigest=$fingerprint
+                $summary.callerAction=$callerAction
+                $summary.callerArtifactSource=$artifactSourceSha
+                $summary.callerVerifierSource=$env:GITHUB_SHA
+                $summary.explicitJwtLinkRemoval=$callerAction -ceq 'rollback' -and $linked
+                if(-not $summary.passed){$summary.applied=$false;$summary|ConvertTo-Json -Depth 6 -Compress;exit 1}
+                $desiredPreview=$output|ConvertFrom-Json -AsHashtable -Depth 100
+                if(-not $previewOnly -or $callerAction -ceq 'finalize'){
+                  $armToken=Invoke-DevPreviewProcess az @('account','get-access-token','--subscription',$env:AZURE_SUBSCRIPTION_ID,'--resource-type','arm','--output','json')|ConvertFrom-Json
+                  $handler=[Net.Http.HttpClientHandler]::new();$handler.AllowAutoRedirect=$false
+                  $callerClient=[Net.Http.HttpClient]::new($handler)
+                  $callerClient.DefaultRequestHeaders.Authorization=[Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer',$armToken.accessToken)
+                  $callerClient.DefaultRequestHeaders.Accept.ParseAdd('application/json');$armToken=$null
+                  function Invoke-DevCallerArm {
+                    param([string]$Method,[string]$Path,$Body=$null,[string]$ETag='',[int[]]$AllowedStatus=@(200))
+                    $request=[Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::new($Method),$armBase+$serviceId+$Path+'?api-version=2024-05-01')
+                    try{
+                      if($ETag){$null=$request.Headers.TryAddWithoutValidation('If-Match',$ETag)}
+                      if($null -ne $Body){$request.Content=[Net.Http.StringContent]::new(($Body|ConvertTo-Json -Depth 100 -Compress),[Text.Encoding]::UTF8,'application/json')}
+                      $response=$callerClient.SendAsync($request).GetAwaiter().GetResult()
+                      try{
+                        if([int]$response.StatusCode -notin $AllowedStatus){throw 'Caller control-plane request failed.'}
+                        $text=$response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+                        $bodyValue=if([string]::IsNullOrWhiteSpace($text)){$null}else{$text|ConvertFrom-Json -AsHashtable -Depth 100}
+                        @{status=[int]$response.StatusCode;body=$bodyValue;etag=[string]$response.Headers.ETag}
+                      }finally{$response.Dispose()}
+                    }finally{$request.Dispose()}
+                  }
+                  Invoke-DevCallerTransitionPlan $transition {
+                    param($step)
+                    switch($step){
+                      'set-hold' {
+                        $current=Invoke-DevPreviewProcess az @('group','show','--name',$groupName,'--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json')|ConvertFrom-Json
+                        if([string]$current.tags.byokCallerTransition -cne $existingHold){throw 'Caller transition hold requires reconciliation.'}
+                        $null=Invoke-DevPreviewProcess az @('tag','update','--resource-id',$groupId,'--operation','Merge','--tags',('byokCallerTransition='+$transition.hold),'--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','none')
+                        $current=Invoke-DevPreviewProcess az @('group','show','--name',$groupName,'--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json')|ConvertFrom-Json
+                        if($current.tags.byokCallerTransition -cne $transition.hold){throw 'Caller transition hold requires reconciliation.'}
+                      }
+                      'close-jwt-guard' {
+                        if($jwtProducts.Count){
+                          $path='/products/'+$productId+'/policies/policy'
+                          $current=Invoke-DevCallerArm 'GET' $path
+                          if([string]::IsNullOrWhiteSpace($current.etag) -or
+                            (-not (Test-DevCallerProperties $closedGuard $current.body.properties) -and -not (Test-DevCallerProperties $activeGuard $current.body.properties))){throw 'Caller product guard changed.'}
+                          $null=Invoke-DevCallerArm 'PUT' $path @{properties=$closedGuard} $current.etag @(200)
+                          $current=Invoke-DevCallerArm 'GET' $path
+                          if(-not (Test-DevCallerProperties $closedGuard $current.body.properties)){throw 'Caller product guard did not close.'}
+                        }
+                      }
+                      'detach-jwt-link' {
+                        if($jwtProducts.Count){$null=Invoke-DevCallerArm 'DELETE' ('/products/'+$productId+'/apis/copilot-byok-foundry') $null '' @(200,204)}
+                      }
+                      'verify-link-absent' {
+                        $association=Invoke-DevCallerArm 'HEAD' ('/products/'+$productId+'/apis/copilot-byok-foundry') $null '' @(204,404)
+                        $apiProducts=Read-DevApimInventory '/apis/copilot-byok-foundry/products'
+                        if($association.status -ne 404 -or $apiProducts.nextLink -or $apiProducts.value -isnot [array] -or
+                          $apiProducts.value.Count -ne 2 -or @($apiProducts.value|Where-Object {$_.name -cnotin @('byok-standard','byok-power') -or $_.properties.subscriptionRequired -ne $true}).Count){throw 'Caller JWT association is still present.'}
+                      }
+                      {$_ -cin @('apply-coexistence','apply-shared')} {
+                        $result=Invoke-DevPreviewProcess az @('deployment','group','create','--subscription',$env:AZURE_SUBSCRIPTION_ID,'--resource-group',$groupName,
+                          '--name',('byok-caller-'+$env:GITHUB_SHA.Substring(0,12)+'-'+$callerRollout),'--template-file',$focusedFile,'--parameters','@/dev/stdin',
+                          '--only-show-errors','--output','json') ($focusedParameters|ConvertTo-Json -Depth 100 -Compress)|ConvertFrom-Json
+                        if($result.properties.provisioningState -cne 'Succeeded'){throw 'Caller deployment did not succeed.'}
+                      }
+                      {$_ -cin @('verify-coexistence','verify-shared')} {
+                        Assert-DevCallerReadback $desiredPreview $serviceId $paths $focusedParameters {
+                          param($path,$method,$format)
+                          if($method -ceq 'HEAD'){Invoke-DevCallerArm 'HEAD' $path $null '' @(204,404)}else{Read-DevApimPreviewResource $path $method $format}
+                        }
+                        $apiProducts=Read-DevApimInventory '/apis/copilot-byok-foundry/products'
+                        $jwtLinks=@($apiProducts.value|Where-Object name -CEQ $productId)
+                        $expectedCount=if($callerRollout -ceq 'coexistence'){3}else{2}
+                        if($apiProducts.nextLink -or $apiProducts.value -isnot [array] -or $apiProducts.value.Count -ne $expectedCount -or
+                          $jwtLinks.Count -ne $(if($callerRollout -ceq 'coexistence'){1}else{0})){throw 'Caller product association readback failed.'}
+                      }
+                      'verify-persisted-settings' {
+                        if($storedPreparation -ne $true -or $storedRollout -cne $callerRollout){throw 'Persist matching caller settings before finalizing.'}
+                      }
+                      'clear-hold' {
+                        $current=Invoke-DevPreviewProcess az @('group','show','--name',$groupName,'--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json')|ConvertFrom-Json
+                        if($current.tags.byokCallerTransition -cne $transition.hold){throw 'Caller transition hold requires reconciliation.'}
+                        $null=Invoke-DevPreviewProcess az @('tag','update','--resource-id',$groupId,'--operation','Delete','--tags',('byokCallerTransition='+$transition.hold),'--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','none')
+                        $current=Invoke-DevPreviewProcess az @('group','show','--name',$groupName,'--subscription',$env:AZURE_SUBSCRIPTION_ID,'--output','json')|ConvertFrom-Json
+                        if($current.tags.byokCallerTransition){throw 'Caller transition hold did not clear.'}
+                      }
+                      default {throw 'Unknown caller transition step.'}
+                    }
+                  }
+                }
+                $summary.applied=-not $previewOnly -and $callerAction -cne 'finalize'
+                $summary.finalized=-not $previewOnly -and $callerAction -ceq 'finalize'
+                $summary.readbackVerified=-not $previewOnly -or $callerAction -ceq 'finalize'
+                $summary.holdRetained=if($previewOnly){-not [string]::IsNullOrWhiteSpace($existingHold)}else{$callerAction -cne 'finalize'}
+              }
+            }else{
+              $null=Invoke-DevPreviewProcess azd @('provision','--preview','--no-prompt','--output','json')
+              $arguments=@('deployment','sub','what-if','--subscription',$env:AZURE_SUBSCRIPTION_ID,'--location',$env:AZURE_LOCATION,
+                '--template-file','infra/main.bicep','--parameters','@/dev/stdin','--result-format','FullResourcePayloads','--no-pretty-print','--only-show-errors','--output','json')
+              $output=Invoke-DevPreviewProcess az $arguments ($parameters|ConvertTo-Json -Depth 100 -Compress)
+              $summary=Get-DevPreviewSummary -Output $output -Environment $env:PREVIEW_ENVIRONMENT -SubscriptionId $env:AZURE_SUBSCRIPTION_ID
+              $summary.previewScope='full-stack'
+            }
+            $summary.callerRollout=$callerRollout
+            if(-not $manualCaller){$summary.applied=$false}
+            $summary|ConvertTo-Json -Depth 6 -Compress
+            if(-not $summary.passed){exit 1}
+          }catch{
+            $category=switch -Exact ($_.Exception.Message){
+              'Invalid preview context.' {'invalid-context'}
+              'Incomplete ARM preview.' {'incomplete-inventory'}
+              'Invalid ARM resource change.' {'invalid-resource'}
+              'Preview changes another scope.' {'unexpected-scope'}
+              'Preview changes an unapproved APIM resource.' {'unexpected-apim-resource'}
+              'Preview changes native subscription admission.' {'native-admission-change'}
+              'Invalid APIM preview target.' {'invalid-apim-target'}
+              'Incomplete live APIM inventory.' {'incomplete-apim-inventory'}
+              'Live APIM trust or routing differs from the candidate.' {'apim-trust-routing-mismatch'}
+              'Gateway is not the verified native-key-only baseline.' {'not-native-baseline'}
+              'Live APIM operation coverage differs.' {'apim-operation-mismatch'}
+              'Invalid preview parameters.' {'invalid-parameters'}
+              'Invalid JWT tier configuration.' {'invalid-jwt-tiering'}
+              'Unsupported preview substitution.' {'unsupported-substitution'}
+              'Preview is not the approved legacy baseline.' {'not-legacy-baseline'}
+              'JWT preview requires preview-only dispatch.' {'preview-only-required'}
+              'Invalid disabled candidate preparation.' {'invalid-candidate-preparation'}
+              'Invalid coexistence preview parameters.' {'invalid-coexistence-inputs'}
+              'Live register configuration is required for JWT preview.' {'missing-live-register-config'}
+              'Preview command failed.' {'command-failed'}
+              'Invalid recovery mode.' {'invalid-recovery-mode'}
+              'Recovery baseline cannot be verified.' {'unverified-recovery-baseline'}
+              'Recovery apply is not enabled until its preserving-state preview is reviewed.' {'recovery-apply-not-reviewed'}
+              'Caller transition requires a reviewed main-branch preview.' {'unreviewed-caller-transition'}
+              'Caller transition hold requires reconciliation.' {'caller-transition-held'}
+              'Caller artifact source changed.' {'caller-artifact-changed'}
+              'Invalid caller readback preview plan.' {'unsafe-readback-preview'}
+              'Caller transition requires a completed development baseline.' {'incomplete-development-baseline'}
+              'Caller transition cannot overlap a deployment.' {'active-deployment'}
+              'Caller ownership key mismatch.' {'caller-owner-key-mismatch'}
+              'Caller resource readback failed.' {'caller-readback-failed'}
+              'Persist matching caller settings before finalizing.' {'caller-settings-not-persisted'}
+              default {'invalid-json-or-schema'}
+            }
+            @{test='dev-infrastructure-preview';passed=$false;category=$category;rawOutputSuppressed=$true}|ConvertTo-Json -Compress
+            exit 1
+          }finally{
+            if($callerClient){$callerClient.Dispose()}
+            if($focusedFile -and (Test-Path -LiteralPath $focusedFile)){Remove-Item -LiteralPath $focusedFile -Force}
+            $output=$null;$parameters=$null;$focusedParameters=$null;$document=$null;$template=$null;$account=$null;$apps=$null;$register=$null
+            $registerConfig=$null;$authConfigs=$null;$registerDeployment=$null;$namedValues=$null;$desiredPreview=$null;$armToken=$null
+          }
+          exit 0
+
       # Provision gate. The first daily schedule always runs the complete two-phase
       # deployment, even if teardown left an RG behind. Later schedules skip only
       # when the preceding deployment wrote its completion marker after phase 2.
@@ -196,13 +1319,18 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           SCHEDULE_EXPR: ${{ github.event.schedule }}
+          PREVIEW_ONLY: ${{ inputs.preview_only && 'true' || 'false' }}
+          CALLER_ACTION: ${{ inputs.caller_action || 'none' }}
         run: |
           rg="rg-copilot-byok-${{ matrix.env }}"
           exists=$(az group exists --name "$rg")
           provision=true
           reason="event requires provisioning"
 
-          if [[ "$EVENT_NAME" == "schedule" && "$SCHEDULE_EXPR" != "0 12 * * *" && "$exists" == "true" ]]; then
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && ( "$PREVIEW_ONLY" == "true" || "$CALLER_ACTION" != 'none' ) ]]; then
+            provision=false
+            reason="explicit preview or isolated caller transition"
+          elif [[ "$EVENT_NAME" == "schedule" && "$SCHEDULE_EXPR" != "0 12 * * *" && "$exists" == "true" ]]; then
             completion=$(az group show --name "$rg" --query 'tags.deployDevStatus' -o tsv 2>/dev/null || true)
             if [[ "$completion" == "complete" ]]; then
               provision=false
@@ -237,7 +1365,7 @@ jobs:
       # same-named Failed APIM. Deleting a Failed-state APIM HARD-deletes it (no tombstone),
       # so the name frees immediately and no purge is needed after.
       - name: Purge soft-deleted tombstones (self-heal)
-        if: ${{ steps.preflight.outputs.provision == 'true' }}
+        if: ${{ steps.preflight.outputs.provision == 'true' && !inputs.recover_phase_two }}
         shell: bash
         env:
           ENV_NAME: ${{ matrix.env }}
@@ -287,6 +1415,17 @@ jobs:
           done
           echo "Self-heal purge complete."
 
+      - name: Refresh Azure CLI OIDC before phase one
+        if: ${{ steps.preflight.outputs.provision == 'true' && !inputs.recover_phase_two }}
+        uses: azure/login@v2
+        env:
+          AZURE_LOGIN_PRE_CLEANUP: 'true'
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ steps.cfg.outputs.cloud }}
+
       # Register-app Easy Auth is a TWO-PHASE bring-up (the redirect URI needs the
       # Container App FQDN, which doesn't exist until the first provision):
       #   phase 1  : provision hosting + Key Vault + UAMI (Easy Auth params empty -> auth off)
@@ -294,7 +1433,7 @@ jobs:
       #   setup    : create the app reg + store its secret in Key Vault (degrades to manual)
       #   phase 2  : provision again (Easy Auth params now populated -> login attached)
       - name: azd provision (phase 1 — hosting + Key Vault)
-        if: ${{ steps.preflight.outputs.provision == 'true' }}
+        if: ${{ steps.preflight.outputs.provision == 'true' && !inputs.recover_phase_two }}
         # Bounded retry to ride out the transient APIM Internal VNet-injection
         # "ActivationFailed: Unable to activate API service at this time ... this could be a
         # temporary issue in the region" flake (aka.ms/apiminternalvnet). It hits comm-dev
@@ -346,6 +1485,8 @@ jobs:
             fi
           done
         env:
+          BYOK_RESPONSE_OWNER_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_KEY }}
+          BYOK_RESPONSE_OWNER_PREVIOUS_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_PREVIOUS_KEY }}
           AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
           APIM_PUBLISHER_EMAIL: ${{ vars.APIM_PUBLISHER_EMAIL }}
@@ -364,8 +1505,19 @@ jobs:
           # Commercial only: let the preprovision hook create/verify the BYOK tier groups.
           MANAGE_BYOK_GROUPS: ${{ startsWith(matrix.env, 'comm') && 'true' || '' }}
 
+      - name: Refresh Azure CLI OIDC before register image deployment
+        if: ${{ steps.preflight.outputs.provision == 'true' && !inputs.recover_phase_two }}
+        uses: azure/login@v2
+        env:
+          AZURE_LOGIN_PRE_CLEANUP: 'true'
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ steps.cfg.outputs.cloud }}
+
       - name: Deploy register app image
-        if: ${{ steps.preflight.outputs.provision == 'true' }}
+        if: ${{ steps.preflight.outputs.provision == 'true' && !inputs.recover_phase_two }}
         shell: bash
         run: |
           azd deploy register --no-prompt
@@ -383,11 +1535,22 @@ jobs:
           # Point it at the deterministic RG (rg-copilot-byok-<env>) holding the tagged app.
           AZURE_RESOURCE_GROUP: rg-copilot-byok-${{ matrix.env }}
 
+      - name: Refresh Azure CLI OIDC before Easy Auth setup
+        if: ${{ steps.preflight.outputs.provision == 'true' && !inputs.recover_phase_two }}
+        uses: azure/login@v2
+        env:
+          AZURE_LOGIN_PRE_CLEANUP: 'true'
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ steps.cfg.outputs.cloud }}
+
       - name: Easy Auth setup (app reg + secret -> Key Vault)
         # Idempotent + degrades to a printed manual command when the deploy principal lacks
         # Entra app-management rights (expected in Gov) — never fails the deployment; Easy
         # Auth simply stays off until an admin runs it.
-        if: ${{ steps.preflight.outputs.provision == 'true' }}
+        if: ${{ steps.preflight.outputs.provision == 'true' && !inputs.recover_phase_two }}
         shell: bash
         run: |
           rg="rg-copilot-byok-${{ matrix.env }}"
@@ -410,6 +1573,17 @@ jobs:
           grep -q '^REGISTER_EASYAUTH_CLIENT_ID='     "$GITHUB_ENV" || echo "REGISTER_EASYAUTH_CLIENT_ID="     >> "$GITHUB_ENV"
           grep -q '^REGISTER_EASYAUTH_SECRET_KV_URI=' "$GITHUB_ENV" || echo "REGISTER_EASYAUTH_SECRET_KV_URI=" >> "$GITHUB_ENV"
 
+      - name: Refresh Azure CLI OIDC before phase two
+        if: ${{ steps.preflight.outputs.provision == 'true' }}
+        uses: azure/login@v2
+        env:
+          AZURE_LOGIN_PRE_CLEANUP: 'true'
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ steps.cfg.outputs.cloud }}
+
       - name: azd provision (phase 2 — attach Easy Auth)
         # REGISTER_EASYAUTH_* arrive via $GITHUB_ENV from the setup step, which DEGRADES when the
         # deploy principal lacks Entra app-management rights (it does, in both clouds) and then
@@ -425,6 +1599,8 @@ jobs:
         if: ${{ steps.preflight.outputs.provision == 'true' }}
         run: azd provision --no-prompt
         env:
+          BYOK_RESPONSE_OWNER_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_KEY }}
+          BYOK_RESPONSE_OWNER_PREVIOUS_KEY: ${{ secrets.BYOK_RESPONSE_OWNER_PREVIOUS_KEY }}
           REGISTER_EASYAUTH_CLIENT_ID: ${{ env.REGISTER_EASYAUTH_CLIENT_ID || vars.REGISTER_EASYAUTH_CLIENT_ID }}
           REGISTER_EASYAUTH_SECRET_KV_URI: ${{ env.REGISTER_EASYAUTH_SECRET_KV_URI || vars.REGISTER_EASYAUTH_SECRET_KV_URI }}
           AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
@@ -441,6 +1617,17 @@ jobs:
           REGISTER_APP_IMAGE: ${{ env.REGISTER_APP_IMAGE }}
           MANAGE_BYOK_GROUPS: ${{ startsWith(matrix.env, 'comm') && 'true' || '' }}
 
+      - name: Refresh Azure CLI OIDC before completion marker
+        if: ${{ steps.preflight.outputs.provision == 'true' }}
+        uses: azure/login@v2
+        env:
+          AZURE_LOGIN_PRE_CLEANUP: 'true'
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          environment: ${{ steps.cfg.outputs.cloud }}
+
       - name: Mark dev environment complete
         if: ${{ steps.preflight.outputs.provision == 'true' }}
         shell: bash
@@ -453,12 +1640,12 @@ jobs:
 
       - name: Skip note (env already present)
         if: ${{ steps.preflight.outputs.provision == 'false' }}
-        run: echo "dev env rg-copilot-byok-${{ matrix.env }} is marked complete — skipping provision, running smoke only."
+        run: echo "Development provisioning skipped by preflight; preview-only dispatches also skip smoke."
 
   smoke-comm-dev:
     name: Smoke comm-dev
     needs: [matrix, provision]
-    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.smoke) && contains(needs.matrix.outputs.envs, 'comm-dev') }}
+    if: ${{ (github.event_name != 'workflow_dispatch' || (inputs.smoke && !inputs.preview_only && !inputs.recover_phase_two && inputs.caller_action == 'none')) && contains(needs.matrix.outputs.envs, 'comm-dev') }}
     uses: ./.github/workflows/smoke-test.yml
     with:
       env: comm-dev
@@ -466,7 +1653,7 @@ jobs:
   smoke-gov-dev:
     name: Smoke gov-dev
     needs: [matrix, provision]
-    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.smoke) && contains(needs.matrix.outputs.envs, 'gov-dev') }}
+    if: ${{ (github.event_name != 'workflow_dispatch' || (inputs.smoke && !inputs.preview_only && !inputs.recover_phase_two && inputs.caller_action == 'none')) && contains(needs.matrix.outputs.envs, 'gov-dev') }}
     uses: ./.github/workflows/smoke-test.yml
     with:
       env: gov-dev

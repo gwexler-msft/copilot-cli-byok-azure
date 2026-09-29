@@ -1,0 +1,36 @@
+{
+  "parameters": {
+    "cloudEnv": { "value": "AzureUSGovernment" },
+    "apimResourceGroup": { "value": "<APIM_RESOURCE_GROUP>" },
+    "apimName": { "value": "<APIM_NAME>" },
+    "apiId": { "value": "<EXISTING_API_ID>" },
+    "modelsOperationId": { "value": "listModels" },
+    "responsesOperationId": { "value": "responses" },
+    "resourcePrefix": { "value": "wizard-caller-" },
+    "existingBackendName": { "value": "<EXISTING_BACKEND_ID>" },
+    "existingBackendOrigin": { "value": "https://<BACKEND_HOST>" },
+    "existingBackendPath": { "value": "/openai" },
+    "foundryAuthMode": { "value": "managedIdentity" },
+    "entraTenantId": { "value": "<TENANT_ID>" },
+    "apiAudience": { "value": "<CLIENT_ID>" },
+    "requiredScope": { "value": "cli.invoke" },
+    "callerAuthRollout": { "value": "shared" },
+    "callerAuthPreparation": {
+      "value": {
+        "enabled": false,
+        "keyEnabled": true,
+        "entraEnabled": false,
+        "entraClientIds": [],
+        "jwtProductId": "wizard-caller-jwt",
+        "oktaTrust": {
+          "enabled": false,
+          "issuer": "",
+          "openIdConfigUrl": "",
+          "audience": "",
+          "requiredScope": "",
+          "clientIds": []
+        }
+      }
+    }
+  }
+}

@@ -51,6 +51,21 @@
     "autoRouteAmbiguousBand": { "value": 1500 },
     "autoRouteClassifierEnabled": { "value": false },
     "authMode":           { "value": "subscriptionKey" },
+    "callerAuthPreparation": { "value": {
+      "enabled": false,
+      "keyEnabled": true,
+      "entraEnabled": false,
+      "entraClientIds": [],
+      "oktaTrust": {
+        "enabled": false,
+        "issuer": "",
+        "openIdConfigUrl": "",
+        "audience": "",
+        "requiredScope": "",
+        "clientIds": []
+      },
+      "jwtProductId": "byok-jwt"
+    } },
     "deployTestSubscriptions": { "value": true },
     "testSubscriptions":  { "value": [ { "name": "dev1", "product": "byok-standard" }, { "name": "dev2", "product": "byok-power" } ] },
     "productTiers":       { "value": [

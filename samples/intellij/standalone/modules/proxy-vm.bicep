@@ -47,7 +47,8 @@ param proxyImageId string = ''
 // Bake the APIM private IP + gateway host into the cloud-init nginx config. When a pre-baked image is
 // supplied, use the config-only cloud-init (no apt) since nginx already ships in the image.
 var cloudInitSource = empty(proxyImageId) ? loadTextContent('../cloud-init.yaml') : loadTextContent('../cloud-init.prebaked.yaml')
-var cloudInit = replace(replace(replace(cloudInitSource, '__APIM_PRIVATE_IP__', apimPrivateIp), '__APIM_GATEWAY_HOST__', apimGatewayHost), '__INTELLIJ_API_PATH__', intellijApiPath)
+var cloudInitWithRuntime = replace(cloudInitSource, '__BYOK_NGINX_INSTALLER_BASE64__', base64(loadTextContent('../../../../infra/runner-image/install-nginx-njs.sh')))
+var cloudInit = replace(replace(replace(replace(cloudInitWithRuntime, '__APIM_PRIVATE_IP__', apimPrivateIp), '__APIM_GATEWAY_HOST__', apimGatewayHost), '__INTELLIJ_API_PATH__', intellijApiPath), '__BYOK_CREDENTIAL_GUARD_BASE64__', base64(loadTextContent('../nginx-credentials.mjs')))
 
 var createNic = empty(proxyNicId)
 

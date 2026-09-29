@@ -9,6 +9,41 @@
 @description('Name of the customer\'s existing APIM service.')
 param apimName string
 
+import { callerAuthPreparationConfig } from '../../../../infra/main.bicep'
+import { callerJwtTieringConfig } from '../../../../infra/modules/apim-caller-auth.bicep'
+import { sharedModelsAuthentication, sharedResponsesPreparation, sharedCallerThrottleTelemetry, responsesItemTemplate, guardNativePolicy } from '../../../../infra/modules/apim-foundry-api.bicep'
+
+param callerAuthPreparation callerAuthPreparationConfig = {
+  enabled: false
+  keyEnabled: true
+  entraEnabled: false
+  entraClientIds: []
+  oktaTrust: { enabled: false, issuer: '', openIdConfigUrl: '', audience: '', requiredScope: '', clientIds: [] }
+  jwtProductId: 'intellij-jwt'
+}
+@allowed(['legacy', 'shared', 'coexistence'])
+param callerAuthRollout string = 'legacy'
+param callerJwtTiering callerJwtTieringConfig = {
+  entra: { enabled: false, mappings: [] }
+  okta: { enabled: false, claimName: 'byok_tier', mappings: [] }
+}
+@description('The same reviewed tier catalog owned by the existing gateway deployment. This bolt-on does not rewrite existing native product policies.')
+param productTiers array = []
+param entraTenantId string = ''
+param apiAudience string = ''
+param requiredScope string = 'cli.invoke'
+param existingBackendOrigin string = ''
+@secure()
+param responseOwnerKey string = ''
+@secure()
+param responseOwnerPreviousKey string = ''
+@minValue(1)
+param jwtDefaultCallsPerMinute int = 120
+@minValue(1)
+param jwtDefaultTokensPerMinute int = 200000
+@minValue(1)
+param jwtDefaultMonthlyCallQuota int = 200000
+
 @description('Name of the customer\'s EXISTING Foundry backend entity in APIM (the one the default API uses). The policy set-backend-service\'s to it.')
 param existingBackendName string
 
@@ -61,6 +96,81 @@ resource apim 'Microsoft.ApiManagement/service@2024-05-01' existing = {
   name: apimName
 }
 
+var sharedCallerAuth = callerAuthRollout != 'legacy'
+var keyRequired = !sharedCallerAuth || callerAuthPreparation.keyEnabled
+var entraLoginHost = replace(replace(environment().authentication.loginEndpoint, 'https://', ''), '/', '')
+var entraIssuer = 'https://${entraLoginHost}/${entraTenantId}/v2.0'
+var callerValues = [
+  { name: 'intellij-entra-openid-config-url', value: '${entraIssuer}/.well-known/openid-configuration' }
+  { name: 'intellij-api-audience', value: empty(apiAudience) ? '__none__' : apiAudience }
+  { name: 'intellij-required-scope', value: requiredScope }
+  { name: 'intellij-jwt-calls-per-minute', value: string(jwtDefaultCallsPerMinute) }
+  { name: 'intellij-jwt-tokens-per-minute', value: string(jwtDefaultTokensPerMinute) }
+  { name: 'intellij-jwt-monthly-call-quota', value: string(jwtDefaultMonthlyCallQuota) }
+  { name: 'intellij-foundry-mi-audience', value: foundryManagedIdentityAudience }
+]
+
+@batchSize(1)
+resource callerNvs 'Microsoft.ApiManagement/service/namedValues@2024-05-01' = [for setting in callerValues: if (callerAuthPreparation.enabled) {
+  parent: apim
+  name: setting.name
+  properties: { displayName: setting.name, value: setting.value, secret: false }
+}]
+
+module callerAuth '../../../../infra/modules/apim-caller-auth.bicep' = if (callerAuthPreparation.enabled) {
+  name: 'intellij-caller-auth'
+  params: {
+    apimName: apimName
+    resourcePrefix: 'intellij-'
+    keyEnabled: callerAuthPreparation.keyEnabled
+    entraLoginHost: entraLoginHost
+    entraTrust: { enabled: callerAuthPreparation.entraEnabled, tenantId: entraTenantId, issuer: entraIssuer, clientIds: callerAuthPreparation.entraClientIds }
+    oktaTrust: callerAuthPreparation.oktaTrust
+    jwtProductId: callerAuthPreparation.jwtProductId
+    namedValueIds: [for (setting, index) in callerValues: callerNvs[index].id]
+    jwtTiering: callerJwtTiering
+    tierCatalog: callerJwtTiering.entra.enabled || callerJwtTiering.okta.enabled ? map(productTiers, tier => {
+      name: tier.name
+      callsPerMinute: tier.callsPerMinute
+      tokensPerMinute: tier.tokensPerMinute
+      monthlyCallQuota: tier.monthlyCallQuota
+    }) : []
+  }
+}
+
+@export()
+var standaloneOwnershipCredential string = '''
+<fragment>
+<set-variable name="byokResponseBackendCredential" value="" />
+<set-variable name="byokResponseBackendCredentialHeader" value="api-key" />
+<choose>
+  <when condition="@(&quot;__BACKEND_AUTH_MODE__&quot; == &quot;managedIdentity&quot;)">
+    <set-variable name="byokResponseBackendToken" value="" />
+    <authentication-managed-identity resource="{{foundry-mi-audience}}" output-token-variable-name="byokResponseBackendToken" ignore-error="true" />
+    <set-variable name="byokResponseBackendCredentialHeader" value="Authorization" />
+    <set-variable name="byokResponseBackendCredential" value="@(string.IsNullOrWhiteSpace((string)context.Variables[&quot;byokResponseBackendToken&quot;]) ? &quot;&quot; : &quot;Bearer &quot; + (string)context.Variables[&quot;byokResponseBackendToken&quot;])" />
+    <set-variable name="byokResponseBackendToken" value="" />
+  </when>
+  <otherwise><set-variable name="byokResponseBackendCredential" value="{{foundry-api-key}}" /></otherwise>
+</choose>
+</fragment>
+'''
+
+module responseOwnership '../../../../infra/modules/apim-response-ownership.bicep' = if (sharedCallerAuth) {
+  name: 'intellij-response-ownership'
+  params: {
+    apimName: apimName
+    resourcePrefix: 'intellij-'
+    responseOwnerKey: responseOwnerKey
+    responseOwnerPreviousKey: responseOwnerPreviousKey
+    backendOrigins: [existingBackendOrigin]
+    responseStores: [{ origin: existingBackendOrigin, backendId: existingBackendName, kind: 'foundry' }]
+    backendCredentialPolicy: replace(standaloneOwnershipCredential, '__BACKEND_AUTH_MODE__', foundryAuthMode)
+    callerAuthFragmentIds: callerAuth!.outputs.fragmentIds
+  }
+  dependsOn: [nvs]
+}
+
 // ---- Named values the policies read via {{...}} ------------------------------------------------
 var namedValues = [
   { name: 'intellij-foundry-backend-id', value: existingBackendName, secret: false }
@@ -99,11 +209,11 @@ resource api 'Microsoft.ApiManagement/service/apis@2024-05-01' = {
     protocols: ['https']
     // The APIM subscription key rides in the 'api-key' header (what the proxy re-injects), so
     // APIM validates it natively before the policy runs.
-    subscriptionRequired: true
-    subscriptionKeyParameterNames: {
+    subscriptionRequired: keyRequired
+    subscriptionKeyParameterNames: keyRequired ? {
       header: 'api-key'
       query: 'api-key'
-    }
+    } : null
     apiType: 'http'
   }
 }
@@ -135,6 +245,45 @@ resource opModels 'Microsoft.ApiManagement/service/apis/operations@2024-05-01' =
   properties: { displayName: 'List Models', method: 'GET', urlTemplate: '/v1/models' }
 }
 
+var responseOperations = [
+  { name: 'responses-get', method: 'GET', path: '/v1/responses/{response_id}' }
+  { name: 'responses-delete', method: 'DELETE', path: '/v1/responses/{response_id}' }
+  { name: 'responses-cancel', method: 'POST', path: '/v1/responses/{response_id}/cancel' }
+  { name: 'responses-input-items', method: 'GET', path: '/v1/responses/{response_id}/input_items' }
+]
+@batchSize(1)
+resource responseItems 'Microsoft.ApiManagement/service/apis/operations@2024-05-01' = [for operation in responseOperations: if (sharedCallerAuth) {
+  parent: api
+  name: operation.name
+  properties: { displayName: operation.name, method: operation.method, urlTemplate: operation.path, templateParameters: [{name:'response_id',type:'string',required:true}] }
+}]
+
+@export()
+func namespaceCallerPolicy(source string) string => replace(replace(source, '{{', '{{intellij-'), 'fragment-id="byok-', 'fragment-id="intellij-byok-')
+
+var sharedEntry = namespaceCallerPolicy(sharedModelsAuthentication)
+var inferenceSource = loadTextContent('../policies/intellij-inference.xml')
+var modelsSource = loadTextContent('../policies/intellij-models.xml')
+var inboundEnd = indexOf(inferenceSource, '<inbound>') + length('<inbound>')
+var inferenceWithAuth = '${substring(inferenceSource, 0, inboundEnd)}${replace(sharedEntry, '<include-fragment fragment-id="intellij-byok-strip-caller-credentials" />', '')}${substring(inferenceSource, inboundEnd)}'
+var inferenceWithAccounting = replace(inferenceWithAuth, '<set-variable name="developerOid" value="@(context.Subscription?.Id ?? "unknown")" />', '<include-fragment fragment-id="intellij-byok-apply-caller-limits" /><include-fragment fragment-id="intellij-byok-strip-caller-credentials" />${namespaceCallerPolicy(sharedResponsesPreparation)}')
+var inferenceWithIdentity = replace(inferenceWithAccounting, '<set-variable name="developerUpn" value="@(context.Subscription?.Name ?? context.Subscription?.Id ?? "unknown")" />', '')
+@export()
+var standaloneInferenceTemplate string = replace(inferenceWithIdentity, '</on-error>', '${sharedCallerThrottleTelemetry}</on-error>')
+@export()
+var standaloneModelsTemplate string = replace(modelsSource, '<set-header name="api-key" exists-action="delete" />', sharedEntry)
+@export()
+var standaloneResponsesTemplate string = namespaceCallerPolicy(replace(responsesItemTemplate, '__SHARED_AUTHENTICATION__', sharedModelsAuthentication))
+var ownedResponsesPolicy = replace(standaloneResponsesTemplate, '__NATIVE_SUBSCRIPTION_REQUIRED__', toLower(string(keyRequired)))
+
+@batchSize(1)
+resource responseItemPolicies 'Microsoft.ApiManagement/service/apis/operations/policies@2024-05-01' = [for (operation, index) in responseOperations: if (sharedCallerAuth) {
+  parent: responseItems[index]
+  name: 'policy'
+  properties: { format: 'xml', value: ownedResponsesPolicy }
+  dependsOn: [responseOwnership]
+}]
+
 // ---- Policies ----------------------------------------------------------------------------------
 var keyAuthVariable = '<set-variable name="fdKey" value="{{intellij-foundry-api-key}}" />'
 var backendAuth = foundryAuthMode == 'managedIdentity'
@@ -148,9 +297,9 @@ resource opModelsPolicy 'Microsoft.ApiManagement/service/apis/operations/policie
   name: 'policy'
   properties: {
     format: 'rawxml'
-    value: replace(loadTextContent('../policies/intellij-models.xml'), keyAuthVariable, backendAuth)
+    value: replace(sharedCallerAuth ? replace(standaloneModelsTemplate, '__NATIVE_SUBSCRIPTION_REQUIRED__', toLower(string(keyRequired))) : guardNativePolicy(modelsSource), keyAuthVariable, backendAuth)
   }
-  dependsOn: [ nvs ]
+  dependsOn: [ nvs, callerAuth ]
 }
 
 // API-scoped inference policy (applies to chat/completions/embeddings/responses).
@@ -159,9 +308,22 @@ resource apiPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = 
   name: 'policy'
   properties: {
     format: 'rawxml'
-    value: replace(loadTextContent('../policies/intellij-inference.xml'), keyAuthVariable, backendAuth)
+    value: replace(sharedCallerAuth ? replace(standaloneInferenceTemplate, '__NATIVE_SUBSCRIPTION_REQUIRED__', toLower(string(keyRequired))) : guardNativePolicy(inferenceSource), keyAuthVariable, backendAuth)
   }
-  dependsOn: [ nvs, opChat, opComp, opEmbed, opResponses, opModels ]
+  dependsOn: [ nvs, opChat, opComp, opEmbed, opResponses, opModels, responseOwnership, callerAuth ]
+}
+
+var responsePolicyIds = [for (operation, index) in responseOperations: responseItemPolicies[index].id]
+
+module jwtProduct '../../../../infra/modules/apim-jwt-product.bicep' = if (callerAuthPreparation.enabled) {
+  name: 'intellij-jwt-product'
+  params: {
+    apimName: apimName
+    productId: callerAuthPreparation.jwtProductId
+    active: callerAuthRollout == 'coexistence' && callerAuthPreparation.keyEnabled && (callerAuthPreparation.entraEnabled || callerAuthPreparation.oktaTrust.enabled)
+    apiNames: [api.name]
+    consumerPolicyIds: concat([apiPolicy.id, opModelsPolicy.id], responsePolicyIds)
+  }
 }
 
 // ---- Product association (reuse the customer's existing subscription keys) ----------------------

@@ -28,7 +28,7 @@ param aciSubnetId string
 @description('APIM gateway host (e.g. apim-...azure-api.us) the proxy forwards to. Pass apim.outputs.apimGatewayHost.')
 param apimGatewayHost string
 
-@description('nginx container image. The standard Docker Hub nginx mirrored on MCR (reachable under restricted egress; same /etc/nginx/conf.d layout this config targets).')
+@description('nginx image with ngx_http_js_module.so and system CA certificates. The standard full nginx image mirrored on MCR includes njs; slim images do not.')
 param image string = 'mcr.microsoft.com/mirror/docker/library/nginx:1.25'
 
 @description('Path segment of the private inference route the proxy targets (matches the client base path). Default "openai".')
@@ -53,7 +53,8 @@ var cgName = take('aci-${namePrefix}-subkeyproxy-${envName}-${suffix}', 63)
 // injects the "auto" sentinel — so the proxy no longer hardcodes a list and new deployments appear
 // automatically. nginx variables ($http_authorization, $byok_key, $1) are literal here; only
 // ${apimGatewayHost} is a Bicep interpolation.
-var nginxConf = 'map $http_authorization $byok_key {\n    default "";\n    "~*^Bearer (.+)$" $1;\n}\n\nserver {\n    listen 8080;\n    server_name _;\n    location / {\n        proxy_pass https://${apimGatewayHost};\n        proxy_set_header Host ${apimGatewayHost};\n        proxy_set_header api-key $byok_key;\n        proxy_set_header Authorization "";\n        proxy_ssl_server_name on;\n        proxy_http_version 1.1;\n        proxy_buffering off;\n        proxy_request_buffering off;\n        proxy_read_timeout 600s;\n        client_max_body_size 50m;\n    }\n}\n'
+var standaloneNginxConf = replace(loadTextContent('../../samples/intellij/standalone/nginx.containerapp.conf'), '\r\n', '\n')
+var nginxConf = replace(replace(replace(replace(standaloneNginxConf, '    location / {\n        return 404;\n    }', ''), 'location ^~ /__INTELLIJ_API_PATH__/', 'location /'), '__APIM_PRIVATE_IP__', apimGatewayHost), '__APIM_GATEWAY_HOST__', apimGatewayHost)
 
 resource cg 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = {
   name: cgName
@@ -76,6 +77,7 @@ resource cg 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = {
         name: 'nginxconf'
         secret: {
           'default.conf': base64(nginxConf)
+          'nginx-credentials.mjs': base64(loadTextContent('../../samples/intellij/standalone/nginx-credentials.mjs'))
         }
       }
     ]
@@ -84,6 +86,7 @@ resource cg 'Microsoft.ContainerInstance/containerGroups@2023-05-01' = {
         name: 'nginx'
         properties: {
           image: image
+          command: ['nginx', '-g', 'load_module /usr/lib/nginx/modules/ngx_http_js_module.so; daemon off;']
           ports: [
             { protocol: 'TCP', port: 8080 }
           ]

@@ -18,6 +18,299 @@ Resource-name patterns used below (`<env>` = role, `<suffix>` = deterministic az
 
 ---
 
+## Registration Identity Recreation
+
+An ephemeral UAMI can be recreated at the same resource ID with a new principal ID. A role
+assignment named from only the UAMI resource ID then collides with its previous incarnation:
+Azure returns `RoleAssignmentUpdateNotPermitted` because the assignment's principal is immutable.
+The resource name being unchanged does not establish identity continuity.
+
+New registration assignments are named from APIM scope, resolved principal ID and role definition.
+The assignment lives in a child module because Bicep cannot use a newly created identity's runtime
+principal in a resource name in the same template. Existing valid grants must retain their names:
+blindly switching every deployment to the new naming scheme can instead cause `RoleAssignmentExists`.
+
+The paired `resolve-register-role-assignment` helpers read the exact deployment/identity/role and
+complete assignment inventory before staging `existingRegisterRoleAssignment` in the local
+parameter file. The reference binds name, principal, APIM scope and role together. Invalid context,
+ambiguous grants, incomplete pagination or failed reads stop before parameter mutation. Grants to
+other principals are counted but never deleted. Review any obsolete grant separately, including
+whether its principal still exists and has legitimate consumers.
+
+Both azd pre-provision hooks refresh this reference; CI previews invoke the resolver explicitly
+because azd preview skips provisioning hooks. Direct ARM deployments and local previews must run
+the resolver with `-ParameterFile <LOCAL_PARAMETER_FILE> -Stage` first when upgrading an existing
+registration deployment. The helper requires PowerShell 7.4+, the Azure CLI, an explicit
+`AZURE_SUBSCRIPTION_ID` and the matching cloud-pinned cache. It makes no Azure write and never
+resolves secret placeholders into the parameter file.
+
+Do not retry an entire dev deployment merely because its gateway is now healthy. An APIM ETag
+failure can be followed by an independent registration RBAC failure. A CI timeout can also leave
+ARM work running; inspect final parent/child deployments, the real application and readiness marker
+before recovery. A missing completion marker and skipped smoke remain incomplete acceptance even
+when some child resources eventually report `Succeeded`.
+
+## Deployment Preview Completeness
+
+An azd preview exit code does not establish a complete change inventory. In azd 1.34.1, preview
+console events are written to stderr; their resource projection omits resource IDs and skips ARM
+changes without before/after state. Capture both streams privately, but use raw ARM what-if JSON
+for scope and completeness checks. Never log raw policy bodies, resolved parameters or credentials.
+
+ARM can also skip entire nested deployments when runtime references cannot be evaluated. The
+legacy cold-start baseline and its unchanged control produced the same missing-resource diagnostics.
+An explicitly accepted limitation for that baseline is not approval for later JWT activation.
+Full-stack JWT previews reported unrelated infrastructure changes and omitted ownership resources;
+the focused APIM preview instead reuses canonical modules with deterministic dependency IDs and
+requires all expected APIM child resources to be evaluated. Preview dispatches never apply;
+activation and rollback use separate reviewed manual actions with a retained transition hold.
+
+Preserving the registration app during a preview requires its live image and successful deployment
+metadata, not an assumption that GitHub Easy Auth variables are populated. Container Apps can return
+HTTP 404 with AuthConfigNotFound for the authConfigs list when Easy Auth is absent. Only that exact
+status/code pair means an empty auth list; other 404s, authorization errors and malformed responses
+must reject. An anonymous-access smoke assertion is not evidence that Easy Auth is attached.
+
+Development environments are ephemeral. A preview can finish before the nightly teardown starts,
+then the next live read finds the group Deleting. Check the lifecycle run and exact group state;
+do not interpret an empty filtered resource list as sufficient deletion proof, interrupt a running
+teardown, or silently recreate resources. Obtain a bounded restoration approval when needed.
+
+## APIM Policy Readback Contracts
+
+A failed verification step does not undo a successful ARM deployment. Inspect the exact deployment,
+product associations and retained transition hold before retrying or describing the gateway as
+key-only. Keep a failed CI result as historical evidence even if a corrected local check passes.
+Do not clear the hold or replay activation merely because the deployment itself succeeded.
+
+APIM GET and ARM what-if do not have identical property representations:
+
+- Policy fragments can omit `format`; its documented default is `xml`. Normalize only that
+  absent field on fragment resources, not arbitrary missing properties or an explicit null.
+- Request each policy's submitted `xml` or `rawxml` format during readback. The default XML
+  export can change entity encoding. Raw C# expressions may contain quotes and operators that
+  are not valid standalone XML, so a strict XML parse alone can reject the correctly deployed policy.
+- For raw policy comparison, use the bundled Roslyn tokenizer/parser to delimit expressions
+  and preserve token spelling and string literals while ignoring only C# trivia. Securely parse
+  the surrounding XML with DTDs and external resolution disabled. XML comments are not C#;
+  closing tags and attribute quotes must not be consumed as part of an expression.
+- The `2024-05-01` resource schema marks API `apiType` as write-only. What-if can mask it as
+  `*******`, and GET may omit it and the optional `type`. Bind the create type to the compiled
+  HTTP template; reject an explicitly conflicting returned type. Do not invent an omission
+  default or broadly ignore masked fields. Route, backend, native admission and readable
+  properties still require explicit matching values.
+
+Reproduce the original source/target/trust/key fingerprint during read-only reconciliation,
+without printing keys or raw policy bodies. Passing local readback does not make an unpublished
+verifier CI-validated or authorize a changed source receipt. A failed apply requires separately
+reviewed reconciliation; retained holds can keep dev resources running past scheduled teardown.
+For a verifier-only repair, retain the artifact SHA from the hold. Require that it is an ancestor
+of the verifier SHA, that deployment/policy/staging files are unchanged, and that current compiled
+inputs reproduce the held receipt. A finalize preview performs readback only; applying finalize
+also checks persisted settings before clearing its matching hold. Never rewrite the hold to make
+a new artifact fit an old approval.
+
+## Pilot Caller Rollout Inventory
+
+- APIM named-value collections paginate. A pilot's first page can omit an existing required scope,
+  falsely appearing to contradict its CI profile. Compare exact GETs to diagnose this, then collect
+  every page before enforcing the unchanged trust contract. Follow only the same ARM host, service,
+  collection path and API version; reject page cycles, duplicate names and incomplete envelopes.
+- Resolve the existing gateway from its exact successful `apim` deployment output. An empty or
+  filtered resource list is not proof that the gateway is absent. Require the correct group and
+  healthy gateway/native API before any caller-only change.
+- Manual pilot caller transitions must not enable automatic full-stack pilot provisioning. Share
+  the non-cancelling per-environment lock with ordinary pilot preview, deploy and smoke, and reject
+  any retained caller hold before those ordinary jobs. Older queued jobs and out-of-band operators
+  still require explicit coordination; tags are not Azure locks.
+- Dev activation and current availability are different facts. Nightly teardown can remove a
+  successfully finalized dev gateway while stored settings remain. Timestamp direct reads and
+  distinguish component completion, operational deployment, actual client acceptance and release.
+
+## Retained APIM Probe Cleanup
+
+Older admission probes intentionally retain APIs, products and subscriptions for follow-up. A
+successful later test's cleanup does not prove earlier probe runs left nothing behind. Enumerate
+all pages of API, product, subscription and fragment metadata, then bind an explicit deletion list
+to ownership markers and product/API relationships. Never classify a subscription by name alone:
+unnamed subscriptions can belong to probe products, while `dev1` and `dev2` are retained BYOK users.
+
+The owner-approved cleanup on 2026-09-27 removed 614 probe resources from the two pilots:
+
+| Pilot | APIs | Products | Subscriptions | Fragments |
+|---|---:|---:|---:|---:|
+| Government | 31 | 64 | 252 | 14 |
+| Commercial | 27 | 42 | 184 | 0 |
+
+All deletes used exact resource IDs and current ETags, with journaled progress and absence checks.
+Subscriptions were removed before products; APIs before their unused fragments. No product
+subscription cascade or API revision cascade was used. The 106 unnamed probe-product subscriptions
+and 33 named all-API probe subscriptions were included in the reviewed list. All 80 retained policy
+records and the remaining resource metadata/product links matched the pre-cleanup inventory.
+No production key was read, rotated or replaced; no model, network or VM action ran.
+
+Keep the live `byok-standard` and `byok-power` products for native subscription-key tiers and
+`byok-jwt` for validated JWT admission. Preserve real developer subscriptions, production fragments
+and backends. Government retained nine subscriptions and Commercial eight, including APIM-owned
+or unnamed entries. An unnamed subscription on `byok-jwt` is not an individual JWT-user assignment.
+The `starter`/`unlimited` products and `echo-api` are default samples, not BYOK access tiers; they
+were deliberately outside this probe-only cleanup. The built-in `master` subscription is for
+service administration/testing, not routine developer use.
+
+ARM response details matter: product/API collection IDs can use
+`/products/<PRODUCT>/apis/<API>` rather than `/apis/<API>`; revision-list `apiRevision` and
+`isCurrent` fields are top-level. ARM resource-type casing is insensitive. Test collection helpers
+with zero, one and multiple entries: returning an array as one pipeline item can falsely report
+inventory drift. Stop on genuine drift or uncertain deletion, and never rerun an unbounded prefix
+delete as recovery. A scheduled dev-only job on a verified source does not modify pilot resources;
+manual, pilot-changing or unknown-source lifecycle runs still require coordination.
+
+## Network Preview Representation
+
+- ARM validates parent resource identifiers even for disabled or zero-count child branches.
+  Supply well-formed inert names while retaining the conditions; empty names can fail validation.
+- What-if can show new NSG rules inline on their parent and separately as child resources. Accept
+  that representation only when the exact planned rules and properties match in both places.
+- An empty subnet delegation list can be omitted or null in what-if. Normalize only an expected
+  empty list; missing populated delegations, extra writable properties and changed services fail.
+- Private-access preview helpers are test tooling, not customer topology requirements. Provider
+  validation does not prove runtime isolation, lifecycle safety or delegated-service compatibility.
+
+## Private-Access Recovery And Scan Gates
+
+- Bind the exact per-resource write allowlist into the reviewed digest, not only its upstream
+  parameters. Otherwise a changed allowlist and matching recovery entry can escape the receipt.
+- Reserve workflow holds before resource writes and exclude retained caller-transition holds.
+  Guard azd preview jobs as well as provision: preprovision hooks are a separate execution surface.
+  Drain older jobs before connectivity opens. Resource-group tags are not atomic leases or Azure
+  locks; require a single operator and no out-of-band writers during the attended session.
+- Save pending state before each conditional write. Unknown outcomes require read-only operation
+  reconciliation, not automatic retries or adoption of resources that happen to look correct.
+  Disconnect verified owned peerings before relaxing protection or handling an uncertain DNS write.
+  Preserve the journal, isolation and holds whenever ownership or completion is uncertain.
+- Match original rollback tooling without requiring current main to remain unchanged. An expired
+  human test window is not an automatic cleanup mechanism: holds remain until verified rollback.
+- Checkov 3.3.19 does not support `python -m checkov`. On Windows its isolated environment installs
+  a `Scripts/checkov` Python script and `checkov.cmd`, not `checkov.exe`; invoke the script with that
+  environment's Python. On the Linux CI runner use the installed `checkov` command. Require a parsed,
+  nonempty report with zero findings and parsing errors; do not mistake command failure for a scan.
+- The materialized 17-resource ARM fixture passed 27 Checkov checks locally on 2026-09-27. This
+  does not scan live effective policy, prove conditional ARM concurrency support, or replace
+  delegated-service, negative-connectivity, actual editor or customer acceptance tests.
+
+## Proxy credential presence and image dependencies
+
+Stock nginx `$http_*` variables cannot distinguish a missing credential header from an explicitly
+empty one. A map that concatenates their values can therefore accept `Authorization: Bearer ...`
+plus an empty `api-key`, then overwrite the empty field and hide the original conflict from APIM.
+A local real-nginx test reproduced this after an initial smaller matrix passed. Percent-encoded
+query names are another reason not to count credential sources with a raw-string regex alone.
+
+The shared proxy guard now uses njs `rawHeadersIn` and its query-string parser, rejecting mixed,
+empty, unsupported and repeated sources before translation. It neither validates JWTs nor dedups
+credentials; APIM still performs authentication and native subscription admission. Node fixture
+tests alone prove selector behavior, not nginx integration. On 2026-09-23, no-push image builds
+passed 33 selector cases and 88 forwarding/TLS/conflict cases across four configurations per runtime:
+the actual main nginx 1.25.5 and standalone nginx 1.28.0 images, plus the pinned installer on Ubuntu
+22.04 and the actual runner base. Full package deployment and long-stream acceptance remain separate.
+Keep the discovered failing case in the runtime matrix.
+
+The distribution `libnginx-mod-http-js` package was unavailable on the selected base. New images
+and VM bootstraps instead use the shared pinned nginx 1.30.5/njs 1.0.1 installer, verifying the
+vendor signing-key fingerprint and using its signed HTTPS package feed. Standard VM cloud-init
+must stage the proxy configuration until njs is installed: otherwise the installer's `nginx -t`
+sees `js_import` before the module exists. Keep install/configure/test/start in one `set -eu`
+block, so a failed command cannot be followed by an unsafe service start. Never use this new-image
+installer as an implicit upgrade of an existing proxy or locked-down runner.
+
+Full container images must provide `/usr/lib/nginx/modules/ngx_http_js_module.so`. An older
+pre-baked VM or slim image may compile in IaC but fail startup. Node accepted optional catch
+binding (`catch {}`) while the main image's njs rejected it; `catch (error)` passed that actual
+runtime. Image tests, not just Node parsing, are mandatory. ACR `outputImages` metadata can exist
+for a no-push build; verify the test tag is absent from the registry before claiming non-publication.
+No image was published or deployed in this acceptance window. Keep upstream TLS verification
+enabled and omit credential headers/query strings from logs. A proxy is not a token-renewal service.
+
+The later full candidate build exposed a separate Windows packaging failure: `git archive` of a
+subtree omitted the root `.gitattributes`, and `core.autocrlf` converted LF shell blobs to CRLF.
+Bash then rejected `set -euo pipefail` even though both the working and committed source were LF.
+Export a subtree with `git -c core.autocrlf=false archive`, then compare each extracted file's
+`git hash-object --no-filters` result with its committed blob before a billable build. The corrected
+Commercial and Government candidates built successfully without changing `latest` or live jobs.
+
+On Windows, `git commit --only -- <paths>` can also omit staged executable-mode changes while
+leaving them in the index. Inspect the committed tree, not only `git ls-files`; commit a verified
+mode-only index separately when needed. Never include unrelated staged content in that repair.
+
+## Private Runner Credential Rotation
+
+### Git Bash Parameter Staging
+
+Git Bash can rewrite slash-containing environment values when starting a native Windows
+`jq.exe`. A valid base64 ownership key may then fail validation only in Bash, making random-key
+tests appear intermittent while PowerShell succeeds. Reproduce with synthetic current and previous
+keys containing slashes, including values starting with `/` or `+/`; never print real keys to debug it.
+
+The paired parameter guard excludes its ownership-key, backend-key and JSON caller-configuration
+variables from MSYS2 environment conversion, preserving existing exclusions. Argument/path conversion
+is not disabled globally. Regression tests verify successful staging stores only secret references
+and that rejected configurations leave the target unchanged.
+
+Recent successful ephemeral runner registration proves current PAT usability, not its expiry.
+Repository-secret update timestamps and Key Vault attributes can lack the actual GitHub expiration.
+The September rotation used a fine-grained PAT, verified against the repository queue-read and
+runner-registration endpoints. Do not apply historical classic-PAT lifetime assumptions to a
+different token type. GitHub omitted the expiry header, so the owner-confirmed lifetime was used
+with an earlier operational vault cutoff. Confirm type, permissions and expiry before distribution.
+
+The approved rotation updated the repository secret and both existing pilot vault/job copies without
+opening vault networking, granting roles or reprovisioning infrastructure. Secure ARM parameters
+traveled through child stdin; continuation state was Windows-encrypted and removed after both fresh
+runner pings passed. Version-specific Key Vault references forced the jobs to resolve the new secret.
+Dev runners were absent after completed teardown; their next normal provision uses the repository
+secret. Existing running/queued teardown work must finish before rotation, not be cancelled mid-delete.
+
+A successful secret deployment initially failed its strict post-check because ARM normalized empty
+command/argument arrays, added empty registry fields and added an empty ephemeral-storage field.
+Operator access then failed. Authorized read-only CI compared hashed baseline fields, confirmed the
+new secret version and full unchanged vault ACLs, and exposed only those empty-field differences.
+Accept only verified normalization; real command, storage, registry credential or image changes must
+still reject. Do not replay an already-completed credential write when readback fails. Recovery
+continued with fresh validation of the unchanged remaining cloud and no repeated Commercial write.
+
+The caller package test also needs an explicit successful exit after all assertions. Expected
+negative native commands otherwise leave a nonzero LASTEXITCODE for GitHub's PowerShell wrapper,
+even when every assertion passes. Verify both the all-pass exit and a real failing assertion.
+
+## Shared Caller Operational Evidence (2026-09-23)
+
+Both clouds accepted all sixteen actual main/standalone/wizard policies behind mandatory diagnostic
+denials, then passed seven signed-auth controls, 175 mock-governance cases and 30 detach-first
+admission-rollback cases. The owner keys and four protected utility policies survived the admission
+rollback. Both throttle metrics ingested equal totals for burst, token and quota limits, with two
+identities and no invalid identity rows. No inference was made during these operational runs.
+Their owned resources, transport certificates and temporary revocation rule were removed, and
+original VM power states restored. An older separately owned Government diagnostic group was left
+untouched; current-run cleanup is not evidence that all historical diagnostics are absent.
+
+Resolve telemetry through the tested gateway's primary API diagnostic/logger and its workspace,
+not the first workspace or a same-region Linux host. Commercial's first telemetry attempt failed
+in the VM harness before querying because of an unrelated gateway-URL precondition. Exempting
+telemetry-only phases and testing the complete entry point fixed it. The already-emitted Commercial
+metrics were recovered with a run-scoped aggregate query, without repeating gateway traffic.
+Government queried inside its VNet with a protected token and required no new RBAC. Do not turn
+an eventual-consistency delay into unbounded traffic replay or log raw caller identities.
+
+For ARM CLI transport, send both `Content-Type: application/json` and `Accept: application/json`,
+set the child process's output encoding and `PYTHONIOENCODING` to UTF-8, and tolerate a leading JSON
+BOM. `-o json` does not negotiate an HTTP response format. In PowerShell argument arrays, construct
+an `@file` request body as one argument, `('@' + $path)`. Preserve exact ownership and completed
+delete/readback checks; initial DELETE acceptance is not confirmed resource absence.
+
+These results establish policy compatibility, mock governance, metric ingestion and admission
+rollback. They do not establish a customer installer deployment, a CI rollback with retained real
+objects, actual editor renewal, or the durable client certificate-revocation egress design.
+
 ## Authentication admission warning (2026-09-18)
 
 An isolated no-backend probe in both Government and Commercial found that setting
@@ -32,6 +325,15 @@ Do not merge key/JWT policies using only a non-null subscription check. See
 APIM also requires unique API/product display names, not just resource IDs. Give disposable
 probe resources unique names on each run. VM Run Command output is bounded; keep evidence
 compact and assert the complete expected result set rather than accepting a partial log.
+
+Normalize top-level CLI JSON arrays explicitly when supporting Windows PowerShell 5.1.
+A helper that only emits `$raw | ConvertFrom-Json` can return the whole array as one object;
+wrapping its call in `@(...)` does not flatten that nested result. With two APIM services,
+property enumeration then combines subnet values and breaks exact VNet selection. Assign
+the parsed result and emit its entries with `foreach`, while retaining ARM object envelopes
+such as `{ "value": [...] }`. A native PowerShell 5.1 regression reproduced this on 2026-09-21
+and passed after normalization. Preserve exact-one matching and stable-state checks; report
+safe counts and precise discovery stages instead of selecting the first resource.
 
 For API policy ownership reads on Windows, explicitly request JSON with
 `az rest --headers 'Accept=application/json'`. The default request can return policy XML whose
@@ -67,6 +369,17 @@ CRL retrieval timed out. Keep certificate validation enabled. For an explicitly 
 use a temporary VM-source `/32` outbound TCP-80 allowance, verify write/delete permission and
 rule ownership, and remove only that rule in `finally` with readback. A cleanup failure must fail
 the overall test. This diagnostic window is not a permanent certificate-revocation egress design.
+
+Model API support is not proof that every parameter combination is supported. On 2026-09-21,
+an isolated GPT-5.6 Chat call returned 400; bounded response capture identified
+`invalid_request_error` for `reasoning_effort`. The CLI still sent function-tool schemas with
+`medium` effort despite tool-denial flags. [Microsoft documents this combination as unsupported](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning#tool-calling-with-reasoning-models):
+use Responses for tools with reasoning, or explicitly opt into Chat with `none`. Removing the
+parameter alone retains the model's `medium` default. The live API version was
+`2025-04-01-preview`; an older-schema explanation did not fit. The owner chose Responses,
+with no further Chat retries, API-version changes, silent reasoning downgrade, or production
+policy edits. Authentication and renewal tests had passed independently. Capture the exact
+request shape and consult model-specific constraints before normalizing fields or changing routes.
 
 The follow-up product-context guard blocked wrong-scope keys in both clouds but also rejected
 legitimate API-scoped and all-APIs subscriptions. Product context is not a general replacement
@@ -297,6 +610,44 @@ XML. This control does not establish real alternate-issuer or Okta acceptance.
 ---
 
 ## 4. Dev environment lifecycle (ephemeral comm-dev / gov-dev)
+
+- **Runner PAT expiry is not Azure OIDC assertion expiry.** The PAT lets the self-hosted runner
+  register and acquire jobs; its remaining lifetime does not keep Azure CLI authenticated. On
+  2026-09-29, a dev job reached phase-two post-provision hooks but failed with `AADSTS700024`:
+  a GitHub OIDC assertion valid for five minutes near job start was reused roughly an hour later.
+  `azd auth login --federated-credential-provider github` refreshes azd's federation independently;
+  it does not refresh the Azure CLI session used by shell hooks. The workflow fix repeats
+  `azure/login@v2` with the same cloud/client/tenant/subscription and pre-cleanup immediately before
+  phase one, the register image deployment, Easy Auth setup, phase two, and the completion marker.
+  Refresh failure stops the job. Do not replace OIDC with a static secret, rotate an otherwise-valid
+  PAT, or use an interactive developer login to work around this CI failure. A single phase that
+  itself outlasts the Azure access-token lifetime still requires separate hook-level renewal;
+  phase-boundary logins do not make tokens nonexpiring.
+
+- **Budget the whole two-phase job, not just the last step.** The same run's Commercial job
+  reached phase two near minute 55 and GitHub cancelled it at the previous 60-minute limit.
+  Dev provisioning now has a 70-minute job budget, below the existing 4500-second (75-minute)
+  runner execution lifetime. Pilot caller transitions retain 60 minutes. Lifecycle locks,
+  `cancel-in-progress: false`, `fail-fast: false`, preview/recovery guards and completion-marker
+  sequencing remain unchanged. Check the deployed runner lifetime before increasing the job
+  budget again; increasing only GitHub's limit cannot extend the underlying Container Apps Job.
+
+- **Preview the stored caller mode without staging a transition.** A normal `preview_only=true`
+  dispatch with `caller_action=none` must retain an already-prepared `shared` or `coexistence`
+  configuration. The old legacy-only selection rejected both dev environments before ARM preview
+  with `not-legacy-baseline`. Keep `preview_jwt=false`: that option previews activation from a
+  disabled legacy candidate, not an existing coexistence baseline. Full previews of prepared
+  settings also verify and preserve the current registration image and Easy Auth configuration.
+  Invalid trust, missing live configuration, lifecycle holds and mutation/smoke guards still fail
+  closed; do not change stored authentication settings to make a preview pass.
+
+- **CI failure is not ARM cancellation or readiness.** Read retained parent deployment status
+  after a timeout before proposing recovery: ARM may finish after the CI job exits. In the
+  2026-09-29 incident both phase-two parent deployments ultimately succeeded, but completion-marker
+  and smoke steps were skipped. Separate generated alert/diagnostic deployments also had failures;
+  do not confuse those with the parent deployment result. Preserve those findings for the owning
+  monitoring/policy review. Never set the completion marker manually to skip unfinished hooks or
+  smoke tests, and do not blindly repeat provisioning against a still-active deployment.
 
 - **Resource-group existence is not deployment readiness.** A failed subscription deployment can
   create the dev RG and only part of APIM/register infrastructure. If later scheduled runs treat
@@ -560,9 +911,84 @@ pilot provides the Foundry).
 The `policies/*.xml` files are the highest-risk thing in the repo to edit: they are applied at
 provision time, and a bad expression fails the deploy or — worse — degrades silently.
 
-- **They are `rawxml`, not well-formed XML.** Expressions contain bare `<` (e.g. `As<JObject>`),
+- **Existing feature policies are `rawxml`, not well-formed XML.** Expressions contain bare `<` (e.g. `As<JObject>`),
   so `[xml]`/strict parsers reject these files *at HEAD too*. A parse error is not evidence you
-  broke something. The only real validation is APIM accepting the policy on provision.
+  broke something. New shared-auth fragment sources use XML-escaped expressions and `format=xml`;
+  local XML/C# checks still do not prove APIM runtime compatibility.
+- **APIM fragments cannot include other fragments.** Keep reusable source components, but flatten
+  them in deployment packaging. The caller-auth module renders three flat fragments; the separate
+  ownership module renders five. Main binds Foundry/AOAI only in an explicit shared rollout;
+  `legacy` remains the default. Test the exact raw
+  replacement markers and every emitted fragment, not normalized XML that can hide a failed
+  substitution. Fragments cannot contain policy section wrappers or `base` either. The documented
+  limit is 512 KB; the local package tests use a conservative 32 KB budget.
+- **A cached Bicep build can contain stale `loadTextContent` imports.** During local auth work the
+  language-server build/snapshot retained an older XML body after the source changed. A fresh
+  standalone Bicep process included the current source. Compare embedded content to the files
+  during packaging checks, including compiler-hoisted text variables. Compilation alone does not
+  prove the current policy was packaged or accepted by APIM.
+- **Preparation is not activation.** `callerAuthPreparation` creates shared-auth resources only
+  when explicitly enabled, including an inactive JWT product. `callerAuthRollout=legacy` keeps
+  legacy API selection; `shared` binds consumers and ownership; `coexistence` adds guarded JWT
+  product links last. Rollback must detach those links first. Incremental ARM does not delete
+  omitted links or conditional AOAI operations. Paired
+  pre-provision guards validate typed trust settings and nested environment substitutions without
+  printing values; `SKIP_PROVISION_PARAM_CHECK` cannot bypass these trust checks. Tests use explicit
+  synthetic parameter-file paths, never overwrite the staged deployment file, and run both helpers.
+- **Fragment PUT acceptance is not completion.** APIM can return 200/201 while fragment creation
+  remains `InProgress`. Follow the ARM long-running operation to a terminal result, then read back
+  the owned fragment before including it. A 404 during an unfinished create does not prove cleanup.
+  The diagnostic harness uses Azure CLI's completed resource operations; `--is-full-object` needs
+  `location` inside the JSON envelope, even when a separate location argument was supplied.
+- **Local C# compilation does not establish the APIM type allowlist.** The shared fragment's
+  `Uri.TryCreate(..., UriKind.Absolute, ...)` passed local tests but APIM rejected `System.UriKind`.
+  Use the supported `Uri` constructor inside the existing fail-closed catch and its properties;
+  avoid URI enums. All eight corrected fragments completed installation in both clouds.
+- **Do not overwrite authentication errors in `on-error`.** An unconditional diagnostic 500
+  masked `validate-jwt`'s tampered-signature 401. Preserving native status passed the fresh
+  seven-control signed-token gate in each cloud. The Responses utility template explicitly keeps
+  validator 401s while sanitizing other operational errors. A 5xx is not secure-rejection evidence.
+- **Classic-tier Anthropic metering is not established by accepting a limiter policy.** In the
+  approved mock test, OpenAI JSON/SSE controls throttled, but native Anthropic JSON/SSE did not.
+  No real model was called. The owner deferred Anthropic new auth, not its token-accounting
+  requirement; existing Anthropic configuration is unchanged. See the
+  [scope decision](authentication.md#anthropic-new-auth-deferral-2026-09-21).
+- **Response-owner keys are durable state, not per-deploy randomness.** Preserve the current key
+  and any required previous key in secure deployment inputs. Ownership lookup uses separately
+  authenticated backend metadata reads; denied operations can still have these verification
+  reads. Gateway-only metadata stamping and live cross-user/stateful tests remain prerequisites.
+- **Current duplicate-header acceptance is `single-credential-v1` (owner-approved 2026-09-21).**
+  Single-credential and security requirements remain strict. Only raw duplicate Authorization
+  cases allow 400/401 rejection, or full validation of a platform-normalized identical token.
+  Keep receipt audits tied to the observed allowed outcome: rejection requires zero backend
+  receipts; success still requires exactly one stripped receipt and validated identity. Do not
+  relabel historical strict-parity failures, relax unrelated cases or add deduplication. Microsoft
+  alignment is now optional follow-up; see the [decision](authentication.md#approved-compatibility-exception-2026-09-21).
+- **Separate gateway parsing from policy accessors when diagnosing headers.** The inert
+  `HeaderParityGate` uses blind, array and joined-accessor operations with fixed marked 401s,
+  no inheritance, no JWT and no backend. Government returned unmarked 400 for differing lines
+  even at the blind stage; Commercial reached it and preserved two values. Identical lines
+  appeared as one value in Government and two in Commercial. This isolates platform request
+  handling but does not identify a Microsoft component/build or establish auth acceptance.
+- **An accepted DELETE is not verified cleanup.** The Commercial diagnostic API remained visible
+  on the immediate GET after DELETE. A later paginated read-only inventory found zero owned
+  diagnostic APIs; no second DELETE was needed. Record the pending readback honestly and verify
+  absence and final settings before declaring success. Never widen deletion scope to compensate.
+- **Product/API associations use collection readback.** A direct GET of an individual product
+  association returned 405 during diagnostic rollback. Read `products/<product>/apis`, verify
+  each target's ownership, delete the exact associations, then verify the collection is empty.
+  ARM resource-type casing is not stable in returned IDs; compare those segments without case
+  sensitivity while retaining exact diagnostic name/ownership checks.
+- **APIM can create a subscription with a new native product.** Its generated name need not
+  match the diagnostic prefix. Product cleanup must verify every remaining subscription is
+  scoped exactly to the owned product, then use the supported product deletion with subscription
+  removal. Never apply that cleanup to a pre-existing product or use a broad prefix-only delete.
+  Omit `approvalRequired` from an open, subscription-free JWT product.
+- **A mock gate needs independent transport evidence.** The governance fixture's .NET web client
+  timed out before its first measured case while strict raw-TLS controls continued to work.
+  Direct .NET requests also failed without a proxy; the cause is not established. The bounded
+  mock harness uses the existing raw TLS path with revocation enabled and tested UTF-8/chunked
+  framing. This does not prove the .NET/customer client path works, and no networking was relaxed.
 - **APIM rejects `--` inside an XML comment.** Easy to introduce with an em-dash-style aside.
 - **`resp.Body.As<JObject>()` CONSUMES the body.** If more than one expression reads the same
   response variable, every read must pass `preserveContent`: `As<JObject>(true)`. Otherwise the

@@ -52,11 +52,15 @@ try {
   Ok "$buildVm"
 
   Info "== 3/6 Install nginx + prep =="
+  $installerPath=Join-Path $PSScriptRoot '../../../../infra/runner-image/install-nginx-njs.sh'
+  $installer=(Get-Content -LiteralPath $installerPath -Raw).Replace("`r`n","`n")
+  $installerEncoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($installer))
   # IMPORTANT: single-line script. A multi-line PowerShell here-string carries CRLF line endings,
   # which break bash on the VM (`set -e\r` etc.), so the install silently no-ops. Keep it one line.
   # Generalization prep uses cloud-init clean (NOT `waagent -deprovision`, which hangs the channel);
   # cloud-init regenerates SSH host keys + hostname on first boot.
-  $prep = 'set -e; export DEBIAN_FRONTEND=noninteractive; sudo apt-get update -qq >/dev/null 2>&1; sudo apt-get install -y -qq nginx >/dev/null 2>&1; sudo rm -f /etc/nginx/sites-enabled/default; sudo rm -f /etc/nginx/conf.d/byok-proxy.conf; sudo systemctl enable nginx >/dev/null 2>&1; sudo cloud-init clean --logs >/dev/null 2>&1 || true; sudo rm -f /home/builder/.ssh/authorized_keys || true; echo INSTALLED=$(command -v nginx)'
+  $prep = "printf '%s' '$installerEncoded' | base64 --decode | sudo bash; "
+  $prep = 'set -e; ' + $prep + 'sudo rm -f /etc/nginx/sites-enabled/default; sudo rm -f /etc/nginx/conf.d/byok-proxy.conf; sudo systemctl enable nginx >/dev/null 2>&1; sudo cloud-init clean --logs >/dev/null 2>&1 || true; sudo rm -f /home/builder/.ssh/authorized_keys || true; echo INSTALLED=$(command -v nginx)'
   $msg = az vm run-command invoke -g $BuildResourceGroup -n $buildVm --command-id RunShellScript --scripts $prep --query "value[0].message" -o tsv
   # az returns the multi-line message as a string[]; join before matching (-notlike on an array filters).
   if (($msg -join "`n") -notlike '*INSTALLED=/usr/sbin/nginx*') { Write-Host $msg; Fail 'nginx install failed (not present in image).' }

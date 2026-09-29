@@ -11,6 +11,8 @@
 //   - a custom role definition (subscription/product management only),
 //   - a role assignment of that custom role to the UAMI, scoped to the APIM service.
 
+import { registerRoleAssignmentReference } from './apim-register-role-assignment.bicep'
+
 @description('Short prefix used in all resource names. Lowercase, alpha-only.')
 param namePrefix string
 
@@ -28,6 +30,14 @@ param apimName string
 
 @description('Tags applied to every resource the module creates.')
 param tags object = {}
+
+@description('Read-only verified existing assignment binding. Empty creates a principal-bound assignment; a recreated identity cannot reuse the old principal binding.')
+param existingRoleAssignment registerRoleAssignmentReference = {
+  name: ''
+  principalId: ''
+  scope: ''
+  roleDefinitionId: ''
+}
 
 var uamiName = take('id-${namePrefix}-register-${envName}-${suffix}', 64)
 
@@ -79,13 +89,13 @@ resource roleDef 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
   }
 }
 
-resource registerToApim 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  scope: apim
-  name: guid(apim.id, uami.id, roleDefName)
-  properties: {
+module registerToApim 'apim-register-role-assignment.bicep' = {
+  name: 'register-apim-assignment'
+  params: {
+    apimName: apim.name
     principalId: uami.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: roleDef.id
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDef.name)
+    existingRoleAssignment: existingRoleAssignment
   }
 }
 

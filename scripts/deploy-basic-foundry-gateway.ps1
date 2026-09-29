@@ -79,6 +79,13 @@ function Write-Step { param([string]$m) Write-Host "==> $m" -ForegroundColor Cya
 function Write-Info { param([string]$m) Write-Host "    $m" }
 function Write-Warn { param([string]$m) Write-Host "!!  $m" -ForegroundColor Yellow }
 
+function Assert-LegacyCallerUpgradeSafe {
+    param([string]$Policy,[object[]]$Products)
+    if($Policy -match 'byok-authenticate|byokCallerAuthenticated' -or @($Products|Where-Object {$_.properties.subscriptionRequired -eq $false}).Count) {
+        throw 'This API uses shared or subscription-free admission. Use update-caller-auth.ps1; rollback must detach JWT product links before restoring legacy policies.'
+    }
+}
+
 function Invoke-Arm {
     param([string]$Method, [string]$Url, [string]$BodyJson)
     if ($DryRun) { Write-Info "DRY RUN would $Method $($Url -replace '\?.*$','')"; return $null }
@@ -107,6 +114,20 @@ switch ($cloud) {
     default             { throw "Unsupported cloud '$cloud'. Add its Cognitive Services audience above." }
 }
 Write-Info "managed-identity audience = $miAudience"
+
+$apisJson=az apim api list --resource-group $ResourceGroup --service-name $ApimName -o json --only-show-errors 2>$null
+if($LASTEXITCODE -ne 0){throw 'Could not inventory existing APIs; no changes were made.'}
+$existingApi=@(($apisJson|ConvertFrom-Json)|Where-Object {$_.name -ceq $ApiId})
+if($existingApi.Count) {
+    $existingPolicyJson=az rest --method get --url "$arm$($existingApi[0].id)/policies?api-version=$ApiVersion" -o json --only-show-errors 2>$null
+    if($LASTEXITCODE -ne 0){throw 'Could not read existing API policies; no changes were made.'}
+    $existingProductsJson=az rest --method get --url "$arm$($existingApi[0].id)/products?api-version=$ApiVersion" -o json --only-show-errors 2>$null
+    if($LASTEXITCODE -ne 0){throw 'Could not read existing API products; no changes were made.'}
+    $existingPolicies=$existingPolicyJson|ConvertFrom-Json
+    $existingProducts=$existingProductsJson|ConvertFrom-Json
+    if($existingPolicies.nextLink -or $existingProducts.nextLink){throw 'Incomplete admission inventory; no changes were made.'}
+    Assert-LegacyCallerUpgradeSafe -Policy ([string]($existingPolicies.value.properties.value -join "`n")) -Products @($existingProducts.value)
+}
 
 # --- backend -----------------------------------------------------------------
 Write-Step "Resolving Foundry endpoint for '$FoundryAccountName'"

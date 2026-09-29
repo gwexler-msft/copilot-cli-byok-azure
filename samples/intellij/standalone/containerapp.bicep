@@ -1,5 +1,36 @@
 targetScope = 'subscription'
 
+import { callerAuthPreparationConfig } from '../../../infra/main.bicep'
+import { callerJwtTieringConfig } from '../../../infra/modules/apim-caller-auth.bicep'
+
+param callerAuthPreparation callerAuthPreparationConfig = {
+  enabled: false
+  keyEnabled: true
+  entraEnabled: false
+  entraClientIds: []
+  oktaTrust: { enabled: false, issuer: '', openIdConfigUrl: '', audience: '', requiredScope: '', clientIds: [] }
+  jwtProductId: 'intellij-jwt'
+}
+@allowed(['legacy', 'shared', 'coexistence'])
+param callerAuthRollout string = 'legacy'
+param callerJwtTiering callerJwtTieringConfig = {
+  entra: { enabled: false, mappings: [] }
+  okta: { enabled: false, claimName: 'byok_tier', mappings: [] }
+}
+@description('Reviewed tier catalog from the existing gateway deployment. Tier activation requires configureApim=true and does not rewrite native product policies.')
+param productTiers array = []
+param entraTenantId string = ''
+param apiAudience string = ''
+param requiredScope string = 'cli.invoke'
+param existingBackendOrigin string = ''
+@secure()
+param responseOwnerKey string = ''
+@secure()
+param responseOwnerPreviousKey string = ''
+param jwtDefaultCallsPerMinute int = 120
+param jwtDefaultTokensPerMinute int = 200000
+param jwtDefaultMonthlyCallQuota int = 200000
+
 @description('Deployment location, matching the existing Container Apps environment.')
 param location string
 
@@ -78,6 +109,19 @@ module intellijApim 'modules/intellij-apim.bicep' = if (configureApim) {
   scope: resourceGroup(apimResourceGroup)
   params: {
     apimName: apimName
+    callerAuthPreparation: callerAuthPreparation
+    callerAuthRollout: callerAuthRollout
+    callerJwtTiering: callerJwtTiering
+    productTiers: productTiers
+    entraTenantId: entraTenantId
+    apiAudience: apiAudience
+    requiredScope: requiredScope
+    existingBackendOrigin: existingBackendOrigin
+    responseOwnerKey: responseOwnerKey
+    responseOwnerPreviousKey: responseOwnerPreviousKey
+    jwtDefaultCallsPerMinute: jwtDefaultCallsPerMinute
+    jwtDefaultTokensPerMinute: jwtDefaultTokensPerMinute
+    jwtDefaultMonthlyCallQuota: jwtDefaultMonthlyCallQuota
     existingBackendName: existingBackendName
     foundryApiKey: foundryApiKey
     foundryAuthMode: foundryAuthMode

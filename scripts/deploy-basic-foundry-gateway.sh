@@ -100,6 +100,15 @@ step() { printf '==> %s\n' "$1"; }
 info() { printf '    %s\n' "$1"; }
 warn() { printf '!!  %s\n' "$1" >&2; }
 
+assert_legacy_caller_upgrade_safe() {
+    local policies="$1" products="$2"
+    if ! jq -e '(.nextLink // "") == "" and ([.value[]?.properties.value // "" | test("byok-authenticate|byokCallerAuthenticated")] | any | not)' <<<"$policies" >/dev/null ||
+       ! jq -e '(.nextLink // "") == "" and ([.value[]? | select(.properties.subscriptionRequired == false)] | length == 0)' <<<"$products" >/dev/null; then
+        printf '%s\n' 'ERROR: shared or subscription-free admission, or incomplete inventory. Use update-caller-auth.sh; detach JWT product links before restoring legacy policies.' >&2
+        return 1
+    fi
+}
+
 arm_call() {
     local method="$1" url="$2" body_file="${3:-}"
     if [[ $DRY_RUN -eq 1 ]]; then
@@ -130,6 +139,14 @@ case "$CLOUD" in
     *) echo "ERROR: unsupported cloud '$CLOUD'. Add its Cognitive Services audience above." >&2; exit 1 ;;
 esac
 info "managed-identity audience = $MI_AUDIENCE"
+
+APIS_JSON="$(az apim api list --resource-group "$RESOURCE_GROUP" --service-name "$APIM_NAME" -o json --only-show-errors)"
+EXISTING_API_ID="$(jq -r --arg name "$API_ID" '.[] | select(.name == $name) | .id' <<<"$APIS_JSON")"
+if [[ -n "$EXISTING_API_ID" ]]; then
+    EXISTING_POLICIES="$(az rest --method get --url "$ARM$EXISTING_API_ID/policies?api-version=$API_VERSION" -o json --only-show-errors)"
+    EXISTING_PRODUCTS="$(az rest --method get --url "$ARM$EXISTING_API_ID/products?api-version=$API_VERSION" -o json --only-show-errors)"
+    assert_legacy_caller_upgrade_safe "$EXISTING_POLICIES" "$EXISTING_PRODUCTS"
+fi
 
 # --- backend -----------------------------------------------------------------
 step "Resolving Foundry endpoint for '$FOUNDRY_ACCOUNT'"

@@ -1,6 +1,6 @@
 # Caller authentication: subscription keys, Entra and Okta
 
-## Status and scope (2026-09-21)
+## Status and scope (2026-09-27)
 
 This document separates the implemented authentication modes from the planned migration.
 It is a design record, not a deployment procedure or a claim that Okta is enabled.
@@ -9,14 +9,19 @@ It is a design record, not a deployment procedure or a claim that Okta is enable
 |---|---|
 | APIM subscription-key authentication | Implemented; all four CI environment configurations select `authMode=subscriptionKey` |
 | Entra access-token authentication | Implemented as the alternative deployment mode `authMode=jwt` |
-| Key OR JWT on the same client-facing endpoint | Identical Authorization normalization accepted as a known platform limitation by the owner; remaining acceptance gates in #140 stay open. Production unchanged. |
-| Direct Okta access-token validation | Planned; not implemented |
-| CLI dynamic credential command | Opt-in implemented; Government VM CLI 1.0.85 passed both wire formats through private APIM with synthetic responses. Model inference and actual-expiry renewal remain untested. |
-| VS Code Custom Endpoint automatic JWT renewal | No documented credential-command mechanism in the checked configuration reference |
+| Key OR JWT on the same client-facing endpoint | Implemented and merged, default `legacy`. Both pilots completed approved native-key plus Entra JWT activation and control-plane readback on 2026-09-27; both dev environments subsequently passed provisioning and smoke. Shared auth passed 7/7, mock governance 175/175, and bounded real Foundry Responses ownership/rotation checks in each cloud. Actual client/package and release acceptance remain open. |
+| Direct Okta access-token validation | Shared validator/configuration and client equivalent are committed, default off; real APIM/Okta customer acceptance is pending |
+| Stateful Responses | Real Foundry persistence, owner/cross-caller access, continuation, streaming replay and diagnostic key rotation passed in both clouds. Active-job cancellation timing was inconclusive; broader integration/rollout gates remain. |
+| Anthropic new shared authentication | Deferred by owner decision after classic-tier native-usage metering failed. Existing Anthropic routes/authentication remain unchanged; no call-only quota waiver. |
+| CLI dynamic credential command | Government VM CLI 1.0.85 passed both formats' authentication and actual-expiry renewal. Real Responses inference and matching token ingestion passed. Use Responses for GPT-5.6 tools plus reasoning; Chat has a documented model limitation. |
+| Editor-hosted native Copilot CLI | Pinned launcher passed local HTTPS ACP same-session renewal and failed-helper rejection with the real CLI. Actual VS Code/IntelliJ launch, expiry and recovery acceptance remains open. |
+| Native VS Code Custom Endpoint / IntelliJ AI Assistant | Approved support boundary uses per-user APIM subscription keys, not static JWTs or a new renewal adapter. Ordinary Agent mode using those providers has the same boundary. |
 
 Deployment-mode entries reflect source/configuration findings, not a fresh production inventory.
 The wrapper scripts support static Entra tokens or opt-in per-request token acquisition through
-the CLI credential command. No Okta helper is implemented.
+the CLI credential command. The opt-in [Okta public-client helper](../scripts/okta/README.md)
+adds PKCE, pinned user claims, encrypted refresh storage and command-mode renewal; its fixture
+tests and Windows keystore test passed, not real customer Okta acceptance.
 
 ### Delivery and tracking
 
@@ -27,8 +32,8 @@ the Okta equivalent with local/fixture tests. Full Okta validation must wait for
 customer environment and is tracked separately in
 #146.
 
-Okta remains planned today. After implementation, label it **implemented, pending customer
-validation** and keep it disabled by default until the customer gate passes. Entra success
+The complete Okta feature remains unfinished. After consumer/client implementation, label it
+**implemented, pending customer validation** and keep it disabled by default until the customer gate passes. Entra success
 or synthetic Okta tokens do not prove real Okta compatibility. This deferred gate does not
 block an accepted Entra release, but the overall epic remains open unless explicitly rescoped.
 
@@ -45,7 +50,76 @@ Keep existing client-facing inference and discovery URLs. A request presents ONE
 This is **key OR Entra JWT OR Okta JWT**, not key AND JWT. Key-only clients must keep
 working. Supporting a new issuer does not make an arbitrary token valid.
 
-### Approved special case: identical Authorization normalization
+### Approved compatibility exception (2026-09-21)
+
+**Decision: accept the documented duplicate-Authorization differences and continue customer
+delivery without waiting for Microsoft.** The owner explicitly approved this change. It
+supersedes the 2026-09-19 requirement for identical duplicate-header outcomes across clouds,
+not the requirement for identical supported single-credential behavior or secure rejection.
+The acceptance contract is `single-credential-v1`.
+
+> Clients must send exactly one credential in one supported header (or the existing native
+> key-query form where supported). Repeated Authorization fields are outside the supported
+> portable client contract. Identical repeated Bearer values may be rejected with HTTP 400/401,
+> or normalized by the platform to one effective credential, which must fully validate before
+> one request is authorized. Different credentials must be rejected before any backend access;
+> HTTP 400 versus 401 and the rejecting platform/policy layer may differ.
+
+| Request class | Required acceptance behavior in both clouds |
+|---|---|
+| One supported valid credential | Same authentication, identity, authorization and accounting semantics; no compatibility waiver |
+| One invalid/missing/expired/tampered credential | Existing negative controls stay strict; no backend request |
+| Separate Authorization lines with the exact same valid token | 400/401 with no backend access, or one fully validated identity and exactly one credential-stripped backend request |
+| Separate Authorization lines with different values, including two valid users | 400/401, no chosen identity and no backend request, in either order |
+| Repeated invalid/expired/tampered Bearer value | 400/401 and no backend request; repetition never makes a token valid |
+| Mixed credential sources, comma-combined credential values, duplicate keys/query keys or duplicate JWT claims | Remain unsupported and rejected; not covered by a success exception |
+
+**Unchanged security requirements:** exact issuer and gateway audience, signature and lifetime,
+required scope, permitted user/client, immutable caller identity, native key scope/state,
+quota isolation and credential stripping. No anonymous fallback, first-value selection,
+custom deduplication, new ingress or URL migration is authorized. A transport error, 5xx,
+missing validation evidence or unexpected backend receipt is not an acceptable rejection.
+Accepted normalized duplicates represent one request and one accounting event, never two.
+
+**Known residual limitation:** a client/intermediary emitting identical lines can work in
+Government and fail in Commercial. Original multiplicity is not observable after Government
+normalization, so exact wire-line auditing is not promised. Clients must not depend on either
+cloud's recovery behavior. Fix duplicate emission in the SDK/proxy configuration; do not
+automatically retry a duplicate-header failure unchanged or treat every 401 as token expiry.
+
+**Customer handover:** JWT-capable client/edge applications remain supported when their route
+is enabled and they send one gateway-audience access token. Prefer one
+`Authorization: Bearer <ACCESS_TOKEN>` field; use one `api-key` or `x-api-key` field instead
+only where the configured JWT route supports that client contract. Never send both. Renew
+the token before expiry, retain private-gateway network access, and verify the actual customer
+SDK/intermediary chain emits one credential. The implemented token profile is delegated-user
+authentication; this decision does not add app-only/client-credentials or direct Okta readiness.
+
+**Release effect:** Microsoft alignment is no longer a prerequisite for #140 or #147. Keep the
+support case as an optional platform follow-up, not a delivery dependency. Existing historical
+failure totals remain unchanged: they were measured against the earlier contract. Revised
+tests must record `single-credential-v1`, actual status/context and a final backend-receipt audit;
+old results are not silently relabeled as fresh passes.
+
+The probe's revised evaluator has 35 local acceptance checks. The future live matrix includes
+independent raw single-token controls for both users, conflicting valid-user tokens in both
+orders, mixed-case identical lines and HTTP/2 counterparts where enabled. Rejected duplicates
+must have zero backend receipts; accepted normalized duplicates still require validated context,
+stripping and exactly one receipt. The final audit now follows the permitted rejection/success
+outcome instead of assuming all identical duplicates must reach the backend. The isolated
+shared-validator run passed seven signed-token controls per cloud, including identical
+duplicates, but the revised native-admission/backend-receipt matrix has not been run yet.
+
+Remaining gates are integrated policies and native accounting, JWKS rollover/outage behavior,
+the two-distinct-valid-user duplicate case, stored-response authorization, supported client
+acquisition/renewal and transport coverage, key regressions and rollback. Current pilots stay
+key-only; shared-auth preparation does not activate JWT coexistence. This exception is neither
+a claim that integration is finished nor authorization to commit, push or deploy.
+
+### Historical identical-Authorization decision (2026-09-18)
+
+The following chronology records earlier expectations. The approved compatibility exception
+above controls current acceptance; historical failures and probe observations remain evidence.
 
 **Owner decision (2026-09-18): accept this known platform limitation and continue acceptance
 work.** This supersedes the earlier strict wire-level rejection decision recorded below.
@@ -66,18 +140,137 @@ credentials stripped; full identity/accounting and multi-user tests remain requi
 cannot reliably log original duplicate multiplicity once APIM has removed it.
 
 Known behavior is established on the Government HTTP/1.1 path, not assumed for Commercial or
-HTTP/2. The probes now expect acceptance for the exact-same-token case while keeping conflict
+HTTP/2. The probes at that checkpoint expected acceptance for the exact-same-token case while keeping conflict
 rejections. Historical failing runs are not retroactively relabeled as passing. The strict
 duplicate blocker is waived only for this special case; **#140 is still open, not signed off**.
-Microsoft clarification can proceed as a nonblocking follow-up; no support ticket has been
-submitted and no front proxy, hostname migration, or production coexistence rollout is approved.
+At that initial Government-only checkpoint, Microsoft clarification was nonblocking and no
+ticket existed. The subsequent cross-cloud decision below supersedes that status: a parity
+support ticket was later verified created and Open. No front proxy, hostname migration, or
+production coexistence rollout is approved.
 
-**Owner parity decision (2026-09-19): require identical behavior in both clouds.** After
+**Historical owner parity decision (2026-09-19), superseded on 2026-09-21:** require identical
+behavior in both clouds. After
 Commercial rejected duplicate Authorization lines that Government normalized or rejected with
-a different status, the owner declined cloud-specific acceptance expectations. Keep the existing
-same-token and conflicting-token expectations unchanged while investigating the rejecting layer.
+a different status, the owner initially declined cloud-specific acceptance expectations. That
+decision kept the same-token and conflicting-token expectations unchanged during investigation.
 The earlier Government exception does not authorize a divergent Commercial contract, custom
 first-value selection, or a new ingress deployment.
+
+### Current parity assessment (2026-09-21)
+
+This combines the earlier signed-token evidence below with a fresh, approved inert-header
+probe in both clouds. Issue #140
+remains open for acceptance work, but no longer waits on Microsoft under the exception above.
+The Microsoft ticket was previously verified created/Open on 2026-09-21;
+its status was not re-polled for this probe. A specific platform root-cause explanation or
+supported alignment has not been established.
+
+| HTTP/1.1 input | Government observation | Commercial observation |
+|---|---|---|
+| One valid Bearer line | Validated 200 | Validated 200, including raw-client controls |
+| Two separate lines containing the same valid JWT | One effective value, JWT validation, 200 and one stripped mock-backend receipt | Two effective values; our source guard returns 401; no backend receipt |
+| A valid JWT and `not-a-jwt` on separate lines, either order | 400 with no recorded probe marker/context or backend receipt | Two effective values; marked source-guard 401; no backend receipt |
+| Two distinct valid users' JWTs on separate lines | Not separately established by the recorded conflict fixtures | Not separately established by the recorded conflict fixtures |
+
+There were two failures of the earlier contract: **acceptance parity** for the identical-valid
+case and **rejection-status parity** for the conflicting case. Both observed conflicting paths
+fail closed. The evidence does not show invalid credentials being accepted, and it does not
+make the historical runs passes under that earlier requirement. The 2026-09-21 decision
+explicitly accepts these differences; the unwaived security gates still apply.
+
+The Commercial cause at policy level is established by a fixed rejection marker and effective
+header count. The [probe policy](../scripts/probe-jwt-auth.ps1) rejects a visible
+`Authorization` array whose length is not one; the new shared source guard does the same.
+Government's identical-line path presents one effective value, so validation can proceed.
+The new inert test below rules out JWT validation, subscription admission and our header
+accessors as necessary causes of Government's conflicting-line 400. The exact platform
+component that collapses identical lines or produces that 400 remains unproven. Absence of
+our marker is not sufficient to name a particular parser. Matching Developer/`stv2`/Internal
+ARM properties do not prove matching runtime builds.
+
+[APIM's documented header API](https://learn.microsoft.com/en-us/azure/api-management/api-management-policy-expressions#context-variable)
+exposes a string array; `GetValueOrDefault` returns a comma-joined view. Its comma flag cannot
+tell separate wire lines from one comma-combined line. The
+[raw probe serializer](../scripts/probe-jwt-auth-vm.ps1) preserves supplied lines, case and
+order. Eight offline checks now execute that exact function without importing the VM probe's
+side effects, opening a socket or using real credentials. They protect the harness, separately
+from the live observations below. The two-real-user rate/quota controls do not substitute for
+the untested two-valid-token duplicate case.
+
+#### Fresh inert-header isolation result (2026-09-21)
+
+The approved `-HeaderParityGate` ran from each existing in-VNet Windows VM over raw HTTP/1.1
+with strict certificate and revocation checking. No live caller credentials, JWT validator,
+model requests, backend, product associations or policy inheritance were used. Each temporary
+API had `subscriptionRequired=false` only for this diagnostic; it could return fixed responses
+but could not reach a backend. This is not evidence that optional admission is safe for a
+production key/JWT API.
+
+Each cloud recorded **24 observations**: eight inputs on three operations. `blind` never
+accessed request headers; `array` read the Authorization array count/equality; `joined` invoked
+`GetValueOrDefault` first and then measured the array. A marked **401 was the intentional
+diagnostic response**, not a failed JWT check or an authentication acceptance result.
+
+| Inert input | Government | Commercial |
+|---|---|---|
+| Missing header | Marked 401 at all stages; count 0 | Same |
+| Single value, including final control | Marked 401 at all stages; count 1 | Same |
+| Identical values on separate lines | Marked 401 at all stages; count 1; joined comma false | Marked 401 at all stages; count 2, equal true; joined comma true |
+| Identical values with mixed-case header names | Same normalization as identical lines | Same preservation as identical lines |
+| Different values on separate lines, both orders | Unmarked 400 at all stages, including `blind`; no expression-error marker | Marked 401 at all stages; count 2, equal false; joined comma true |
+| One comma-combined line | Marked 401 at all stages; count 1; joined comma true | Same |
+
+The differing-line rejection occurs without even invoking our header accessor, and the
+normalization difference persists without any token parsing or native key admission. Merely
+changing `GetValueOrDefault` to array access would not align the clouds. In Commercial, the
+joined helper does not collapse the array: the subsequent count remains 2. These observations
+narrow the issue to platform request handling before the diagnostic response, not a specific
+identified Microsoft runtime component. All single/missing controls completed, and no
+expression-error marker was returned.
+
+Both temporary APIs were removed. Government's running VM state was preserved. Commercial's
+VM was temporarily started and restored to deallocated. The first immediate Commercial GET
+still saw the API after DELETE, so that run reported cleanup unverified; a subsequent paginated
+read-only inventory found **zero diagnostic APIs**, with the gateway `Succeeded`, still Internal,
+HTTP/2 `False`, and the VM deallocated. No second DELETE was necessary. Government's immediate
+deletion/settings readback passed. No networking or HTTP/2 setting was changed in either cloud,
+and no production API/policy or shared-auth fragment was deployed.
+
+The reusable gate also has local checks for the three isolated policy variants, eight exact
+wire-serialization cases and six mocked lifecycle cases covering preflight failure, partial
+creation, matrix failure and changed ownership. The live result is completed evidence, not a
+parity acceptance pass. Two distinct valid user JWTs in one request and Government HTTP/2
+remain separate unverified gates.
+
+The later Commercial HTTP/2 window did run: **258/270 Foundry**, **170/182 Anthropic**, with
+**18/24 HTTP/2 cases per variant**. Each full matrix retained six HTTP/1.1 and six HTTP/2
+duplicate-header parity failures; neither passed acceptance. HTTP/2 was restored to `False`,
+the temporary CRL-egress rule was removed, and the VM was restored to deallocated. Government
+HTTP/2 acceptance remains unverified. Earlier entries saying the client was unavailable
+describe an earlier checkpoint, not the final Commercial transport evidence.
+
+HTTP does not promise portable acceptance of repeated Bearer credentials:
+[RFC 9110 section 5.3](https://www.rfc-editor.org/rfc/rfc9110.html#section-5.3) restricts repeated
+field lines to list-compatible fields, while
+[Authorization](https://www.rfc-editor.org/rfc/rfc9110.html#section-11.6.2) carries one
+credentials value, not a list of Bearer credentials. The identical-line exception is therefore
+an implementation recovery behavior, not a standards guarantee that Commercial must accept
+it. Clients must use the single-credential contract even where normalization is observed.
+
+An optional support follow-up can identify the managed parser/runtime versions and
+request-processing stages, state the supported normalization/rejection contract for both
+clouds and transports, and give a supported alignment or tracking reference. No undocumented
+setting, custom deduplication or first-value fallback is approved; only the documented
+duplicate-header acceptance difference is waived.
+
+The inert comparison above is now complete and is the smallest reproduction to discuss with
+support. Ask why the `blind` operation is reached in Commercial but not Government for
+conflicting lines, and which supported platform contract or mitigation can align the result.
+Any further correlated replay or guarded real-token matrix, including two distinct valid users
+in both orders, needs its own approved scope. Report only status, negotiated protocol, fixed
+stage markers, value counts/equality and backend-receipt booleans. Keep resource IDs and request
+correlations in the private support channel; never return header/token values. HTTP/2 toggles
+or CRL/network windows still require separate approval and verified cleanup.
 
 The caller credential is stripped before backend forwarding. APIM-to-Foundry/AOAI
 networking, backend selection and authentication remain unchanged: managed identity or
@@ -100,6 +293,17 @@ that preserves client URLs and isolates the key and JWT validation paths. No per
 ARM key lookup, copied key allowlist, anonymous fallback or synthetic shared subscription
 should be introduced as a shortcut.
 
+The local shared-auth implementation includes credential selection, fixed issuer dispatch,
+Entra/Okta validation, stable identity, credential stripping, JWT accounting and stateful
+Responses ownership. [The main template](../infra/main.bicep) has explicit
+`legacy`/`shared`/`coexistence` rollout stages, defaulting to `legacy`; no CI configuration
+enables the new path. Foundry/AOAI consumers and the guarded JWT product are wired locally.
+The actual shared Entra validator passed isolated checks in both clouds, but this is not an
+integrated deployment or security acceptance. No old variant has been removed, and standalone
+packages remain separate work. Legacy key policies also gain a deny guard against missing
+native subscriptions or stale open-product admission; valid key behavior still needs regression
+coverage. No production policy was changed by the diagnostic runs.
+
 After admission is resolved, use a shared authentication fragment with explicit inclusion
 in operations that omit `<base />`. The validation sequence must:
 
@@ -120,14 +324,767 @@ Entra `scp` is space-delimited; Okta commonly supplies an array. Test required-s
 membership for each issuer, including multiple scopes. ID tokens are not API credentials:
 require the API audience, access permissions and appropriate client/user claims.
 
+### Shared fragment contract (local implementation)
+
+| Source | Responsibility |
+|---|---|
+| [Credential source](../policies/fragments/byok-credential-source.xml) | Check enabled-method/trust configuration, then select one key or JWT source; reject conflicts and JWT query credentials |
+| [Authentication composition](../policies/fragments/byok-authenticate.xml) | Reject ambiguous raw JWTs, select a fixed issuer validator, retain native key identity, and produce validated principal outputs |
+| [Entra validation](../policies/fragments/byok-validate-entra.xml) | Signed, expiring v2 token; exact cloud/tenant issuer and API audience; delegated scope, user identity and client contract |
+| [Okta validation](../policies/fragments/byok-validate-okta.xml) | Signed custom-server access token; separate issuer/audience/scope; explicit client allowlist and user-bound immutable subject |
+| [Credential stripping](../policies/fragments/byok-strip-caller-credentials.xml) | Require authenticated context, remove caller headers/query credentials and clear the raw-token variable before backend access |
+| [Caller limits](../policies/fragments/byok-apply-caller-limits.xml) | Preserve native product accounting; apply JWT call/token/monthly limits exactly once using the validated principal |
+
+Source components are not one-to-one runtime includes. APIM does not support
+[nested policy fragments](https://learn.microsoft.com/en-us/azure/api-management/policy-fragments).
+Bicep expands the first four sources into one flat `byok-authenticate` fragment and deploys
+`byok-strip-caller-credentials` and `byok-apply-caller-limits` separately. Disabled issuer
+branches render rejecting stubs, not placeholder discovery calls. The three fragments wait for
+their named values; consumers must also order the existing Entra/backend settings first.
+The module's configuration output is a completeness check, with stricter executable trust
+checks in the gate and paired pre-provision validation for the preparation inputs. The module
+alone is not a complete validated deployment contract: direct ARM deployments can bypass the
+local hook, and integrated admission/ownership/standalone acceptance remains incomplete.
+
+The consuming policy supplies `byokCredentialHeader` as `api-key` or `x-api-key`, invokes
+authentication before inherited quota policies, and invokes stripping before any classifier
+or model call. A key-enabled deployment must retain actual native required-subscription
+admission; a named-value flag does not itself prove API scope validation. The guarded open
+product is linked only in explicit coexistence; rollback must detach it first. Operations that
+omit inbound base invoke authentication explicitly and must not run the inference body parser.
+
+| Output | Contract |
+|---|---|
+| `callerAuthMethod` | `subscriptionKey`, `entraJwt`, or `oktaJwt`, set only on the selected authenticated path |
+| `callerIssuer` | `apim` for a native subscription, otherwise the exact validated token issuer |
+| `callerSubject` | Subscription ID; normalized Entra tenant plus `oid`; or validated Okta `sub` |
+| `callerPrincipalKey` | Method plus length-prefixed issuer plus subject; intended for new JWT counters, not automatic rewriting of native key budgets |
+| `byokCallerAuthenticated` / `byokJwtValidated` | Completion guards; initialized false, never established by unverified token parsing |
+| `developerOid` / `developerUpn` | Compatibility telemetry values; display names are never authorization or quota keys |
+
+The current JWT profile is RS256 with required expiration and zero clock skew. Raw duplicate
+JSON members (including escaped names), ambiguous scalar identities and wrong issuer-specific
+scope types are rejected before signature validation. Unverified issuer parsing chooses only
+a statically configured branch; `validate-jwt` still verifies the signature, issuer, audience,
+lifetime and required claims. The post-validation gate requires immutable identity and rejects
+app-only/client-as-audience contracts; parsing tests do not prove those cryptographic checks.
+
+Entra retains the legacy permitted-delegated-client behavior when no explicit client allowlist
+is configured. Okta requires an explicit allowlist and, for this initial default-off profile,
+`sub` equal to the user-bound `uid`. A customer authorization server that puts a mutable login
+in `sub` must use an approved immutable-subject configuration; do not silently switch identity
+keys. Customer compatibility, token issuance and JWKS/renewal behavior remain #146 gates.
+
+[Shared-auth tests](../scripts/tests/caller-auth.Tests.ps1) execute 283 policy-expression and
+security cases, including credential/claim checks, accounting, ownership, request stamping,
+configured origins/stores and the guarded JWT product. The Bash entry point runs the same suite. CI also
+compares a fresh standalone Bicep build's embedded XML with source, verifies disabled-issuer
+stubs, flat composition and ordering, and enforces a conservative fragment-size budget.
+The actual Entra validator now has signed-token runtime evidence in both clouds, described
+below. These local checks do not prove native admission, live ownership, quota enforcement,
+JWKS rollover or Okta compatibility.
+
+### Preparation and staged rollout
+
+`callerAuthPreparation` is a sealed, typed object. Omitting it creates no new resources; the
+default candidate key/Entra flags follow legacy `authMode`, and Okta defaults off. Supplying
+the object requires all its fields, as shown in the disabled
+[Commercial example](../infra/main.parameters.commercial.example.json) and
+[Government example](../infra/main.parameters.gov.example.json).
+
+| Field | Preparation contract |
+|---|---|
+| `enabled` | Opt in to named values, flat auth fragments and an inactive guarded JWT product; alone does not change API authentication or add product links |
+| `keyEnabled`, `entraEnabled` | Methods used by explicit shared rollout; legacy `authMode` still controls APIs while rollout is `legacy`, and always controls the deferred Anthropic route |
+| `entraClientIds` | Optional explicit delegated-client GUID allowlist; an empty array retains the legacy permitted-client contract |
+| `oktaTrust` | Independent `enabled`, exact custom-server `issuer`, matching `openIdConfigUrl`, API `audience`, `requiredScope`, and explicit `clientIds` |
+| `jwtProductId` | Unpublished guarded JWT-product identifier; must not collide with a native tier; associations are added only in `coexistence` |
+
+Entra trust derives from `cloudEnv` and the existing `entraTenantId`, `apiAudience` and
+`requiredScope`; no caller token or new arbitrary metadata input selects the authority.
+Enabled preparation requires at least one method. Enabled Entra requires canonical lowercase,
+nonzero GUIDs; enabled Okta requires HTTPS custom-server metadata, a distinct API audience and
+explicit clients. Duplicate clients, placeholders, malformed scopes, unsafe audience syntax,
+unresolved required substitutions and contradictory types are rejected before provisioning.
+Nested `${VAR}` strings are resolved without printing their values. Flags remain JSON booleans.
+
+The existing [PowerShell guard](../scripts/check-provision-params.ps1) and
+[Bash guard](../scripts/check-provision-params.sh) validate this contract. Their optional explicit
+parameter-file input permits isolated checks without replacing the staged deployment file.
+`SKIP_PROVISION_PARAM_CHECK=true` bypasses only the legacy backend/advisory checks, never supplied
+shared-auth trust. Bash requires `jq`; neither guard calls Azure. Direct ARM callers must run
+the applicable guard themselves; Bicep compilation does not replace runtime or trust validation.
+
+The local suite covers 60 paired guard cases (120 helper executions, including both published
+examples), plus 13 paired staging cases and the 283 policy-expression/security cases. Active rollout requires
+valid preparation, at least one Foundry/AOAI route, a stable canonical 32-byte ownership key,
+and at most eight configured response stores. `coexistence` additionally requires native keys
+and at least one JWT issuer. These are local checks, not a deployment or rollout.
+
+#### CI inputs and durable keys
+
+The existing pilot and dev workflows now invoke the paired guard's explicit staging mode after
+copying the selected CI profile. With no caller-auth environment settings, the profile remains
+byte-for-byte unchanged and the rollout stays `legacy`. Both pilots and dev environments have
+approved enabled/coexistence settings and durable ownership secrets outside Git. The pilot
+transitions were finalized, and both dev environments passed full provisioning and smoke on
+the same source. These environment-specific settings are not copied by a fresh clone.
+
+| Environment setting | Kind | Contract |
+|---|---|---|
+| `BYOK_CALLER_AUTH_PREPARATION` | Variable | Complete JSON object matching the typed preparation contract; absent leaves the selected profile unchanged |
+| `BYOK_CALLER_AUTH_ROLLOUT` | Variable | Explicit `legacy`, `shared` or `coexistence`; absent preserves the selected profile |
+| `BYOK_RESPONSE_OWNER_KEY` | Secret | Stable random 32-byte key encoded as canonical base64; required for active shared rollout |
+| `BYOK_RESPONSE_OWNER_PREVIOUS_KEY` | Secret | Previous canonical key during rotation, or explicit `__none__` for no previous key; omission rejects active staging |
+
+The existing tenant/audience environment variables still supply Entra settings. Ownership keys
+are injected only into staging and provision/preview steps, never echoed or written to
+`GITHUB_ENV`. The staged parameter document stores environment references, not secret values;
+explicit `__none__` becomes an empty previous-key parameter. The helper validates before replacing
+the target and leaves its original contents intact on failure. PowerShell and Bash reject zero,
+noncanonical and repeated current/previous keys consistently. Ordinary pre-provision validation
+remains read-only; staging is opt-in via `-StageCallerAuth` or `--stage-caller-auth`.
+
+Generate an ownership key once in a secure operator environment and store it in the target
+GitHub environment's secret manager. Never generate it per deployment or paste it into chat.
+For approved rotation, retain the old current key as the previous key before supplying the new
+current key; validate old and new stored objects before removing the old key. Choosing `__none__`
+after rotation deliberately revokes access to objects signed only by the removed key. Key
+creation/rotation, environment activation and a live persistence/rollback rehearsal remain
+explicit operational gates. Missing CI secrets must not be treated as permission to erase state.
+
+| `callerAuthRollout` | Behavior |
+|---|---|
+| `legacy` (default) | Retain legacy mode selection. Preparation may install inactive resources; no JWT-product links are added. |
+| `shared` | Bind shared Foundry/AOAI consumers and response ownership. Add no new open-product links; with native keys enabled, JWT admission is not yet activated. |
+| `coexistence` | Require native subscription admission and attach the explicitly JWT-guarded product to Foundry/AOAI after their policies are installed. |
+
+**Rollback is detach-first.** Remove and verify the exact JWT-product/API links before
+restoring legacy policies. Incremental ARM does not delete omitted links or the new conditional
+AOAI Responses operations. Changing the rollout parameter to `legacy` alone is not a verified
+rollback. Retain ownership keys while stored responses may still be used; do not rotate or
+erase them as an incidental redeployment step. An approved CI rollout/rollback rehearsal and
+secure owner-key provisioning are still required before customer activation.
+
+#### Manual development transition
+
+The development workflow has isolated `caller_action` values `activate`, `rollback` and
+`finalize`. These actions target exactly one of `comm-dev`, `gov-dev`, `comm-pilot` or `gov-pilot`, require `smoke=false`,
+and cannot be combined with recovery or the older JWT-preview flags. They never run full-stack
+provisioning, self-heal, app builds, app registration, or smoke. Pilot targets require explicit
+manual caller actions; push/schedule deployment stays dev-only. Code and fixture validation do
+not prove a live transition or authorize one.
+
+The focused template defaults to protected `shared` mode. `activate` explicitly previews
+`coexistence`: all 49 expected APIM resources must be evaluated with no diagnostics or writes
+outside the allowlist. `rollback` previews 48 resources and separately declares removal of the
+JWT-product/Foundry association. Native subscription admission stays required in both modes.
+
+1. Merge reviewed lifecycle guards before any apply, then ensure no older lifecycle job is
+  active or queued for the target. A draft-branch preview is useful evidence, but its receipt
+  cannot authorize a main-branch apply. Keep the existing owner keys and staged trust settings.
+2. Dispatch the selected action with `preview_only=true`. Review the sanitized resource summary
+  and `callerPreviewDigest`. It binds the exact commit, compiled template, APIM target, caller
+  audience/scope/budgets, resolved inputs and ownership keys without disclosing those values.
+3. After explicit operational approval and deployment validation, dispatch the same action on
+  the same main commit with `preview_only=false` and the reviewed digest. A fresh preview must
+  still pass. Rerunning an applying GitHub job is refused; a retry needs fresh review.
+4. The action sets the non-secret `byokCallerTransition` resource-group tag before gateway
+  writes. Dev provisioning/teardown, pilot preview/provision and smoke fail closed while a hold
+  exists. Pilot previews and provision share the existing `dev-env-<environment>` lock with caller
+  transitions and smoke; the prefix is retained for compatibility. Jobs are never cancelled by
+  this path. A failed or successful apply
+  leaves this hold in place; no automatic rollback or hold expiry is assumed.
+5. For activation, review the readback, then an authorized operator sets the existing GitHub
+  environment preparation JSON to `enabled=true` and rollout to `coexistence`, preserving every
+  other trust field and both secrets. This workflow does not obtain a broader GitHub credential
+  or modify environment variables. For rollback, persist `enabled=true` and rollout `shared`.
+6. Preview `finalize` and review its digest and readback. The preview compares all expected
+  resource properties, association state and exact owner-key values without changing gateway
+  resources, settings or the hold. After settings are persisted, explicitly apply `finalize`.
+  It repeats the readback and checks persisted settings before removing only its matching hold
+  tag. A mismatch keeps the hold.
+
+If deployment succeeded but its verifier failed, do not repeat activation. A newer verifier may
+reconcile the original hold only when its artifact commit is an ancestor, the infrastructure,
+policy and parameter-validation sources are unchanged, and the original receipt is reproduced
+using the same compiled template, target, resolved trust settings and owner keys. The summary
+reports `callerArtifactSource` separately from `callerVerifierSource`. A successful read-only
+finalize preview is reconciliation evidence, not a retroactive success for the failed run or
+permission to apply finalization. Review the new verifier and explicitly approve finalization.
+
+Rollback first replaces the recognized JWT product guard with its denying form using the current
+ETag, deletes only its Foundry association, and verifies absence with APIM's bodyless `HEAD`
+contract plus the API product inventory. Only then does it apply protected `shared` consumers.
+It does not restore legacy Responses utilities, delete auth/ownership resources, regenerate keys,
+or remove native products/subscriptions. Retained responses remain caller-bound; JWT callers
+lose admission until coexistence is separately restored. Live retained-object acceptance remains
+required before claiming rollback is proven.
+
+A partial transition can intentionally keep dev infrastructure alive past nightly teardown.
+Reconcile it promptly and review the extra runtime cost; do not manually clear the hold to force
+a legacy deployment through. Unknown holds, changed keys, changed product guards, another API
+sharing the JWT product, or a changed source receipt require operator review. The hold is not an
+Azure resource lock and does not prevent an out-of-band administrator from changing resources.
+
+#### Pilot Test Rollout
+
+Both existing pilots completed the approved focused rollout on 2026-09-27, Government first,
+using main `95163d1`. Each activation and finalization verified all 49 caller resources; enabled
+coexistence settings were persisted, ownership secrets preserved and matching holds cleared.
+Native keys remain enabled and Okta disabled. This is deployed/control-plane-verified pilot
+testing, not a completed customer release. The separate Packer-image request remains deferred.
+The existing pilot VM can reach its own VNet; temporary pilot-to-dev peering is not a prerequisite.
+
+For a future explicitly approved transition, compare the target's issuer metadata, gateway audience,
+delegated scope, limits, native products and operation inventory against its own CI profile.
+Use its cloud-pinned sign-in and durable ownership secrets; never replace existing keys or copy
+another environment's trust. New targets stage disabled preparation first. These settings alone
+do not activate JWT, and the prior pilot approval does not authorize another apply.
+
+Resolve the APIM target from its exact successful `apim` deployment output, not a filtered resource
+list. Dev transitions require their completed-baseline marker; pilots require healthy existing
+groups and gateways. Read all collection pages using bounded same-service, same-path pagination,
+rejecting unknown versions, duplicate entries and cycles. A missing first-page setting is not
+permission to alter the live contract.
+
+Obtain a fresh main-source preview receipt and separate apply approval. Follow the activation,
+preserving-settings and matching-finalization sequence above. A retained caller hold blocks
+ordinary pilot lifecycle jobs; drain older jobs and exclude out-of-band provisioning. No network,
+backend, product-tier, native-key or model change is implied by this caller-only procedure.
+
+Protected Responses follow-ups reject legacy objects without ownership markers. Use fresh test
+conversations; do not disable ownership or exempt old objects to make a test pass. Retain the
+original owner key through rollback and test retained-object recovery separately. Failed actions
+do not authorize an automatic retry, key regeneration or rollback.
+
+Actual client tests use the VM's signed-in interactive user session. Explicit native Copilot CLI
+and IntelliJ custom CLI ACP use renewable JWT; native VS Code Custom Endpoint/ordinary Agent and
+IntelliJ AI Assistant remain per-user subscription-key clients. Agent/Background/Agent Host needs
+its own measured check. SYSTEM Run Command, copied caches and mock ACP fixtures do not establish
+editor acceptance. Connectivity and model/expiry test windows require their own bounded approval.
+All remaining package/security/accounting and retained-response gates stay open in #143-#147.
+
+#### Isolated Client-Access Validation
+
+The temporary VM-to-dev private-access design is test infrastructure for this engagement, not a
+required customer release topology. Release acceptance still needs a working private client path;
+customers may supply their own VPN, peering, ExpressRoute or in-VNet workstation. This helper is
+not referenced by normal main, standalone or wizard deployment entry points.
+
+`scripts/preview-private-client-access.ps1` and its Bash wrapper validate the existing VM, private
+gateway, NSGs, complete dev subnet coverage and DNS before proposing 12 new resources and five
+preserving subnet updates. They have no apply, cleanup, login or feature-registration operation.
+Only the PE subnet gains NSG endpoint-policy enforcement; other policy settings, subnet prefixes,
+delegations, NAT references and immutable outbound settings are preserved. Unsupported fields,
+existing peerings, conflicting DNS/rules, stale snapshots and intervening changes stop validation.
+
+From the repository root, with PowerShell 7.4+, standalone Bicep and an already authenticated cache:
+
+```powershell
+./scripts/preview-private-client-access.ps1 `
+  -VmResourceId '<VM_RESOURCE_ID>' -GatewayResourceId '<APIM_RESOURCE_ID>' `
+  -AzureConfigDirectory "$HOME/.azure-gov" -Cloud AzureUSGovernment
+```
+
+The default live path performs management-plane reads and local validation only. Add
+`-ProviderPreview` for ARM validate/what-if; temporary resolved parameters have restricted access
+and are removed afterward. Output contains counts, a bound digest and sanitized failure codes,
+not resource IDs, addresses or raw policy/configuration. `-SnapshotFile` supports offline fixtures;
+`scripts/tests/private-client-access.Tests.ps1` exercises that contract without Azure calls.
+
+Even a passing preview reports `canApply=false`. Merged lifecycle protection, delegated-service
+and effective-policy review, live isolation tests, a separate network-apply approval and subsequent
+request/token budgets remain gates. Do not deploy the preview templates directly or treat a passed
+snapshot as proof of client connectivity, renewal, production security or release acceptance.
+
+#### Guarded Private-Access Session
+
+[The session manager](../scripts/manage-private-client-access.ps1) and
+[Bash wrapper](../scripts/manage-private-client-access.sh) add explicit `Plan`, `Apply` and
+`Rollback` actions for the same-cloud pilot-VM to dev-gateway pair. They are isolated validation
+tooling, not part of customer provisioning. No live apply or rollback has been accepted yet.
+Local validation on 2026-09-27 passed 206 private-access cases, the existing 249 development-preview
+cases, and Checkov 3.3.19 with 27 passed checks, zero findings and zero parsing errors. The scanner
+checks a materialized 17-resource fixture; it does not establish effective network policy or
+runtime compatibility of the delegated services.
+
+Before applying, merge the reviewed guards in all four lifecycle workflows, require successful
+validation and the **Private access security scan** job on the exact current main commit, and
+drain older active or queued lifecycle jobs. Review effective NSG rules, routes and delegated-service
+compatibility. Use one designated operator, one private journal and an attended maintenance window:
+no parallel access sessions, old-branch dispatches, local azd provisioning, teardown, manual network
+changes or other out-of-band writers may run during the window. Tag PATCH is not an atomic lease;
+neither the local journal lock nor the tag prevents a second workstation or administrator writing.
+Do not apply unless this operational exclusion can be maintained.
+
+Create a fresh plan using the same checked-out source and pinned cache that will execute it:
+
+```powershell
+$stateFile = Join-Path $HOME 'byok-private-access/session.json'
+$reviewedCommit = '<FULL_REVIEWED_MAIN_COMMIT>'
+./scripts/manage-private-client-access.ps1 -Action Plan -StateFile $stateFile `
+  -VmResourceId '<VM_RESOURCE_ID>' -GatewayResourceId '<APIM_RESOURCE_ID>' `
+  -Cloud AzureUSGovernment -AzureConfigDirectory "$HOME/.azure-gov" `
+  -ReviewedCommit $reviewedCommit
+```
+
+`Plan` performs reads only and writes an owner-restricted recovery journal outside the repository.
+The digest binds the baseline, parameters, exact resource-write allowlist and execution sources.
+The journal contains private topology and ETags: never attach it to an issue, paste it into chat,
+include it in a VM bundle or edit it to bypass a mismatch. Keep it until rollback is verified.
+A changed snapshot or source requires a new plan and approval, not a repeated apply.
+
+After separate approval of that exact digest and the isolation review, the operator may run:
+
+```powershell
+$reviewedDigest = '<REVIEWED_PLAN_DIGEST>'
+./scripts/manage-private-client-access.ps1 -Action Apply -StateFile $stateFile `
+  -ReviewedDigest $reviewedDigest -ReviewedCommit $reviewedCommit `
+  -Repository '<OWNER>/<REPO>' -AzureConfigDirectory "$HOME/.azure-gov" `
+  -IsolationReviewConfirmed -ApproveNetworkChanges
+```
+
+Apply requires a fresh complete provider preview and a matching snapshot. It journals before
+writes, reserves `byokPrivateClientAccess` on both resource groups, checks lifecycle inactivity,
+installs and verifies isolation before either peering, then creates the exact DNS record. Existing
+caller-transition holds also block reservation. Each resource write uses an absence/ETag condition;
+an uncertain outcome stops without retries or automatic rollback. Runtime conditional-header and
+asynchronous behavior still require the first approved live acceptance window.
+
+Every guarded workflow blocks on any presence of the access tag, including an empty or malformed
+value; it never treats age as permission to continue. The hold can retain dev resources past
+scheduled teardown and incur additional runtime cost. **There is no automatic expiry or watchdog.**
+The 30-minute check only refuses delayed completion of peering creation. The operator must time
+the separately approved test window and explicitly close access afterward.
+
+Run rollback from the original reviewed checkout, using the same protected journal and receipt:
+
+```powershell
+./scripts/manage-private-client-access.ps1 -Action Rollback -StateFile $stateFile `
+  -ReviewedDigest $reviewedDigest -ReviewedCommit $reviewedCommit `
+  -Repository '<OWNER>/<REPO>' -AzureConfigDirectory "$HOME/.azure-gov" `
+  -ApproveNetworkChanges
+```
+
+Rollback disconnects verified owned peerings before removing DNS or restoring subnet settings;
+it releases only matching holds after all 17 resources are restored or absent. It does not require
+main to remain frozen, but does require the original execution files. Pending or externally changed
+resources are not adopted, overwritten or deleted. For example, pending DNS stops cleanup only
+after owned peerings are disconnected, retaining isolation and holds for review. If an uncertain
+peering or changed ownership blocks disconnection, stop all tests and obtain an explicitly reviewed
+network recovery action. Use exact ARM GETs and operation evidence to reconcile; do not relabel
+the journal, clear holds, blindly rerun apply or treat a matching-looking resource as ownership proof.
+
+#### VM Test Handoff
+
+Use the existing Government Windows VM's signed-in interactive user session in VS Code and
+IntelliJ. Run Command/SYSTEM, copied laptop token caches and fixture passes do not establish editor
+acceptance. A source-only archive is for local tests and client helpers; the network manager must
+run from the reviewed Git checkout with its original private journal. Do not package credentials,
+local azd state, resolved parameters or recovery journals.
+
+From the reviewed checkout or source archive, the offline preparation check is:
+
+```powershell
+pwsh -NoProfile -File ./scripts/tests/private-client-access.Tests.ps1
+```
+
+After the separately approved private path is applied, first verify normal DNS resolution and
+TLS to the exact dev gateway plus bounded negative connectivity checks to non-target addresses.
+No inference belongs in this transport-only stage. Stop on an unexpected allowed connection,
+certificate failure or delegated-service regression, and close the temporary path.
+
+Only after transport/isolation acceptance and a new request/token budget may actual client tests
+start. Record the source commit, VM interactive-session context, client/extension versions, bounded
+requests, expiry/renewal results and matching gateway accounting without recording tokens:
+
+- Explicit native Copilot CLI, including the VS Code terminal: renewable JWT and actual expiry.
+- IntelliJ custom native CLI ACP agent: actual IDE launch, continued-session renewal and recovery.
+- Native VS Code Custom Endpoint/ordinary Agent and IntelliJ AI Assistant: per-user subscription
+  keys, including regressions; they do not inherit CLI credential-command support.
+- Native VS Code Agent/Background/Agent Host: inspect the actual UI/runtime separately; do not
+  assume it invokes the configured CLI/helper.
+
+Main/standalone Bicep/Terraform, VM/ACI/ACA and wizard/manual package acceptance, native accounting,
+security negatives and retained-response rollback remain release gates. Customer Okta acceptance
+stays separate and disabled by default. Neither this handoff nor dev control-plane success approves
+pilot activation or claims a completed customer release.
+
+### Foundry/AOAI consumers (implemented, default off)
+
+[Foundry](../infra/modules/apim-foundry-api.bicep) and
+[AOAI](../infra/modules/apim-aoai-api.bicep) compose shared authentication ahead of native
+inherited accounting, then JWT-only limits and credential stripping before classifier/model
+access. The shared principal selects JWT counters; native key callers retain their product
+budgets. Model routing, backend credentials and native wire formats remain separate from
+caller authentication. Classifier token attribution is not automatic limiter enforcement.
+
+**Approved budget migration:** native subscription keys, Entra identities and Okta identities
+have independent budgets for the initial release. A person holding more than one credential
+can consume each applicable budget. There is no automatic cross-method or email-based linking;
+native product tiers are not inferred from JWT claims. Keep this explicit during onboarding
+and offboarding, and do not merge existing counters as an incidental deployment change.
+
+Foundry discovery invokes authentication/stripping explicitly without inference body parsing,
+limits or inbound base. All four Responses utilities also authenticate explicitly, verify
+ownership and pin the owning backend before retrieval, deletion, cancellation or input-items
+access. They preserve streaming and query parameters without inherited inference counters.
+The main rollout binds both module hooks; direct module callers must supply matching auth and
+ownership dependencies. Fresh compilation/structural tests are not full gateway acceptance.
+
+### Group-Assigned JWT Tiers (In Progress)
+
+#154 adds an explicit
+`callerJwtTiering` contract. Both issuers default off. The main-template implementation
+projects its limits from `productTiers`, so native product policies and JWT tiers have one catalog.
+This does not assign a JWT user an APIM subscription or combine key/Entra/Okta budgets.
+
+Entra uses a validated gateway-access-token `roles` claim populated by administrator-assigned
+app roles. Okta uses an administrator-controlled claim, `byok_tier` by default, in an access
+token from the configured custom authorization server. Okta accepts a string or string array;
+Entra roles must be an array. Neither path reads a caller-supplied header or performs Graph/ARM
+membership lookups. Signature, issuer/audience, scope, delegated-user and allowed-client checks
+still precede tier selection. Real Okta setup and acceptance remain customer-gated in #146.
+
+The configuration shape below is intentionally disabled and contains no customer assignments:
+
+```json
+{
+  "entra": {
+    "enabled": false,
+    "mappings": [
+      { "claimValue": "BYOK.Standard", "tier": "byok-standard" },
+      { "claimValue": "BYOK.Power", "tier": "byok-power" }
+    ]
+  },
+  "okta": {
+    "enabled": false,
+    "claimName": "byok_tier",
+    "mappings": []
+  }
+}
+```
+
+When an issuer is enabled, exactly one distinct mapped tier must resolve. Missing, malformed,
+duplicate or conflicting tier claims reject with 403; unrelated roles do not select a tier.
+Multiple distinct configured role values may select the same tier, but cannot stack allowances.
+Role values are case-sensitive; the Entra app role and `claimValue` must match exactly.
+Enabled main tiering requires an explicit reviewed catalog of one to eight tiers, enabled matching
+issuer trust and `shared`/`coexistence` rollout. The paired guards validate configuration before
+writing staged parameters and do not allow the legacy skip switch to bypass tier checks.
+Explicit staging accepts `BYOK_CALLER_JWT_TIERING`. The pilot and dev workflows bind this optional
+environment variable. Source defaults and committed CI profiles remain disabled; the two pilot
+environments were explicitly enabled for the approved single-account test on 2026-09-28. An absent
+value preserves the existing parameter file and flat JWT behavior.
+
+The renderer inlines selection into the existing caller-limits fragment and generates mutually
+exclusive literal limit branches. This is necessary because `quota-by-key` does not permit runtime
+expressions for its call ceiling. All branches preserve `callerPrincipalKey`, successful-call
+increment semantics, token estimation and the fixed 30-day quota window. A disabled issuer retains
+the flat JWT branch; with both disabled, the original caller-limits policy is byte-for-byte unchanged.
+
+These checks preserve counter identity in generated code; they do not prove live APIM usage survives
+tier changes or redeployment. That requires the separately approved two-cloud quota-continuity and
+rollback tests. Old tokens may retain old role claims until expiry. Do not use tiering as immediate
+revocation, a shared department pool, a global gateway counter or a financial spending guarantee.
+
+For an approved manual group-switching test, use the gateway API's assigned security groups,
+not the registration portal's native-key onboarding groups. Remove the account from its previous
+tier group and add it directly to the other; do not leave it in both. After membership propagation,
+acquire a newly issued gateway access token and verify the expected `roles` value locally without
+printing or sharing the token. A cached token keeps its old tier until replaced or expired. Restarting
+a client alone might reuse its token cache; verify the new role rather than assuming renewal occurred.
+
+The gateway chooses caps for the validated caller at request time. Group switching does not create
+an APIM subscription, alter native-key caps or require a policy redeployment. No tier or two distinct
+mapped tiers produce 403 when Entra tiering is enabled. The `x-byok-calls-remaining`,
+`x-byok-tokens-remaining` and `x-byok-tokens-consumed` headers can help observe applied inference
+limits, but are not a fresh allowance or proof of quota reset. Use a JWT-capable CLI surface for
+this test; ordinary native-key editor requests do not exercise the Entra role selector.
+
+Standalone VM/Container Apps Bicep and wizard upgrades accept the same `callerJwtTiering` and
+`productTiers` inputs. Terraform uses `caller_jwt_tiering` and `product_tiers` with the same nested
+mapping/catalog field names. Supply the existing gateway deployment's reviewed catalog; these
+bolt-ons do not overwrite native product policies. Regenerate the caller policy package from the
+same source before Terraform planning. Its versioned `tiering` capability exports the exact Bicep
+selector and branch templates; enabled tiering rejects an older package without that capability.
+
+Installer preflight and Terraform require classic Developer/Premium APIM for enabled tiering.
+Container Apps requires `configureApim=true` to change tier configuration; when reusing another
+deployment's API, omit tier settings and manage them through that API's owner. No v2 behavior is
+inferred from the classic counter contract.
+
+The focused caller workflow now validates and carries Entra tier mappings and the full reviewed
+catalog into its approval fingerprint. Role, tier, flag or ceiling changes invalidate the receipt.
+It retains the existing 49-resource coexistence / 48-resource protected-shared scope, exact policy
+readback, matching persisted-settings finalization and unchanged ownership keys. This workflow
+still permits only its existing Entra/native-key trust profile; it does not activate Okta.
+
+Numeric catalog changes that must also change native product policies need the owning full-stack
+deployment; a caller-only transition does not edit products. Disable or change JWT tiering only
+through a freshly reviewed receipt and persisted configuration. Removing a parameter is not proof
+of rollback or retained quota continuity. Publishing code is not approval to activate it.
+
+Two optional metrics expose tier-level behavior without raw group, role or identity claims:
+
+| Metric | Meaning | Dimensions |
+|---|---|---|
+| `copilot_byok_tier_admitted` | Request passed the selected tier's limit policies; not proof of backend success or a token-usage total | `auth_method`, `tier`, `operation` |
+| `copilot_byok_tier_throttled` | Selected-tier rejection from the gateway burst, token or call-quota policy; not a backend 429 | `auth_method`, `tier`, `operation`, `throttle` |
+
+Flat/disabled issuers emit neither tier metric. Existing per-caller metrics and their dimensions
+remain unchanged. The [throttle query](../monitoring/kql/throttle-hits-per-developer.kql) includes
+a separate workspace-based tier view. No tier metric ingestion or live KQL validation has run yet.
+
+**Pilot deployment verified (2026-09-28):** Entra tiering is installed and finalized in Government
+and Commercial on source `5b23eb3c45e3f9cd002c81fdd8765a81eefdc485`, with explicit exact-receipt
+approval. Government activation/finalization were 36469270763 / 36475108603; Commercial were
+36476074046 / 36478222484. Each activation, finalization preview and finalization passed the exact
+49-resource CI readback with zero diagnostics/omissions. Both transition holds are cleared.
+
+| Entra Role | Calls/Minute | Tokens/Minute | Calls/Fixed 30 Days |
+|---|---:|---:|---:|
+| `BYOK.Standard` | 60 | 100000 | 50000 |
+| `BYOK.Power` | 120 | 200000 | 200000 |
+
+The dedicated BYOK JWT Test Standard/Power security groups are assigned to these roles; the primary
+test account starts in Standard and Power is empty in each tenant. Government's primary account is
+licensed for Entra premium. Fresh gateway tokens were checked for the expected immutable identity,
+audience, scope and single Standard role without printing credentials. The second account was only
+removed from the dedicated Power group; its directory user was retained. Dev and pilot share the
+gateway API app registration within each cloud, but only pilot tier settings were enabled.
+
+Native-key product policies and backend resources were outside the apply scope, and CI verified
+native admission and existing ownership-key values. The additional independent local before/after
+hash comparison was unavailable after the observer terminal closed and local Government APIM read
+access failed; the owner explicitly approved finishing with the exact CI verification path. No
+assistant model traffic or live group-switching/limit test was run. Quota continuity, multi-user
+isolation, JSON/SSE limits, telemetry ingestion, retained-object rollback and actual client renewal
+remain acceptance gates. Okta remains disabled and customer-gated; #154's runtime acceptance is
+not complete.
+
+### Stateful Responses ownership
+
+The owner explicitly retained full stateful Responses rather than a stateless-only release.
+[The ownership module](../infra/modules/apim-response-ownership.bicep) deploys five flat
+fragments for owner context, request preparation, metadata lookup, verification and bounded
+store location. The implementation preserves `store`, background mode, streaming/resume,
+`previous_response_id`, and get/delete/cancel/input-items operations.
+
+- A stable secret `responseOwnerKey` signs the validated caller principal with HMAC-SHA256.
+  It is an APIM secret named value, never an output. `responseOwnerPreviousKey` permits a
+  controlled two-key rotation window; removing an old key makes its older objects inaccessible.
+- Creation overwrites reserved `metadata.byok_owner_v1`; clients may use up to **15 other
+  metadata entries**. Existing objects without a valid marker are not automatically adopted.
+- A follow-up or continuation searches at most eight configured concrete backend stores using
+  separate backend credentials. It verifies the exact response ID and owner marker, then pins
+  the operation to that backend. Model-family mismatch rejects instead of cross-account fallback.
+- Denied ownership prevents the requested operation or continuation, but verification itself
+  can read backend metadata using trusted credentials. Do not describe that as zero backend contact.
+- Non-null `conversation` references and `input` item-reference objects are rejected because
+  their separate ownership contracts are not implemented. They are not silently made stateless.
+- Gateway-only stamping is a deployment trust prerequisite: direct backend access and legacy
+  routes that can create or alter metadata must not bypass it. The HMAC marker is not a substitute
+  for that boundary. Live persistence, cross-user/key isolation, rotation and all stateful
+  operation tests remain release gates.
+
+### Fresh shared runtime evidence (2026-09-21)
+
+Approved isolated `SharedRuntimeGate` runs completed installation of all eight actual flattened
+auth/accounting/ownership fragments on classic internal APIM in **both clouds**. Fragment writes
+used completed ARM operations plus readback, not initial 200/201 acceptance. Only auth and
+credential stripping were executed by the signed-token API; creating other fragments does not
+prove their composed policy placement, quotas or ownership behavior.
+
+| Signed-token control | Government | Commercial |
+|---|---|---|
+| Missing / malformed / tampered / mixed-source credential | 401 for each | 401 for each |
+| One valid JWT in `api-key` / Bearer | 200, validated and stripped | 200, validated and stripped |
+| Exact-identical repeated Bearer | 200, validated and stripped | 401 |
+
+Each cloud passed **7/7** under `single-credential-v1`; no model/backend was called. Temporary
+APIs, fragments and token-transport certificates were removed with readback. Government's
+running VM was preserved; Commercial's VM was restored to deallocated. Earlier failed attempts
+remain failures: they exposed unfinished ARM writes, unsupported `System.UriKind`, and a
+diagnostic `on-error` block masking JWT 401 as 500. All were repaired before these fresh passes.
+
+The subsequent complete-policy compatibility gates imported the same Bicep templates
+used by deployment through [the local renderer](../scripts/tests/caller-policy-render.bicepparam).
+Foundry inference, AOAI inference, discovery and the shared Responses utility all installed and
+returned their mandatory first-statement diagnostic 403 (**4/4 in each cloud**). This proves
+composition acceptance, not feature execution. Government's earlier TCP-preflight failure
+remains failed history; the later completed compatibility run is separate fresh evidence.
+No NSG, HTTP/2 or production policy was changed.
+
+An owner-approved, no-model governance matrix now uses temporary native keys/products, two
+real delegated users, isolated counters and an APIM-subnet-only VM mock. Its lookup credential
+and destination are substituted solely for the diagnostic; production ownership logic is
+retained. This cannot prove real backend persistence or backend TLS. Early setup/transport
+failures and a duplicate-inheritance error in the explicit test operation were recorded, not
+counted as acceptance. Receipt audits distinguish metadata verification reads from requested
+operations. The completed Commercial result is recorded below; this does not replace full
+production integration or Government acceptance.
+
+### Commercial governance evidence (2026-09-22)
+
+The corrected `SharedGovernanceGate` passed **175/175 checks**, with zero failures and a
+passing final backend-receipt audit under `single-credential-v1`. This used actual shared
+authentication, accounting and ownership fragments on classic internal APIM, two real Entra
+delegated users, and temporary native subscriptions/products. All backend responses and stored
+objects were synthetic; no model was called.
+
+- Native key controls covered two subscriptions, secondary/API/all-API/rotated keys, rejected
+  old/suspended/wrong-scope/unlinked keys, and supported query-key admission.
+- Independent single-token positives passed for both users. Conflicting valid JWTs rejected
+  in both header orders without backend calls. Identical duplicates rejected with 401 in
+  Commercial, as the approved contract permits.
+- Native and JWT call/monthly budgets remained independent. Alias requests shared their
+  caller's counters; mixed credentials did not consume an allowance. JWT rate limits retain
+  APIM's deferred-increment behavior, not a promise of exact distributed request accounting.
+- Chat and Responses JSON/SSE TPM fixtures passed for each user: an initial 200 followed by
+  two 429s without backend execution. JSON reported 270 consumed tokens. Streaming response
+  headers reported early estimates (8 for Chat, 1 for Responses), not final usage totals;
+  these headers are not proof of complete streaming telemetry.
+- Four caller identities (two JWT users and two native subscriptions) created stamped
+  background responses with preserved tools/reasoning. Cross-owner get/delete/cancel/input-items
+  and continuation attempts rejected; owners could retrieve, resume, cancel, continue and delete.
+  Unstamped/deleted responses and a tampered utility token rejected. Lookup reads and actual
+  operations were audited separately, with caller credentials stripped.
+
+The preceding 23-case admission run had ten failures because the PowerShell harness collapsed
+a single credential-header array into a string and concatenated its correlation header onto the
+credential. That run remains failed evidence. The transport now preserves typed header arrays;
+15 local request-evaluator checks cover zero/single/multiple headers and receipt semantics.
+Fresh main/module builds, exact consumer rendering and compiled-package checks pass.
+
+The successful run removed all owned APIs/products/subscriptions/backends/fragments, listener,
+firewall rule and transport certificates with readback; the Commercial VM returned to deallocated.
+No production policy, NSG, HTTP/2 setting or CI deployment changed. Remaining gates include
+Government governance, real backend TLS/persistence and gateway-only stamping, owner-key
+rotation/lifecycle, full feature-policy execution, telemetry, remaining packages/clients and
+approved CI rollout/rollback. No issue or release is complete solely from this mock result.
+
+### Government governance checkpoint (2026-09-22)
+
+**Fresh corrected run: 175/175 PASS**, zero failures, final receipt audit true under
+`single-credential-v1`. All signed-auth controls (7/7) and deny-prefixed consumer compatibility
+checks (4/4) passed again. This is the same mock-backed native-key, two-user JWT, isolated quota,
+JSON/SSE TPM and four-caller stateful ownership matrix described for Commercial. Cancellation
+requests now carry explicit zero content length. No real model was called; real backend
+persistence, TLS and full feature-workflow acceptance are still separate gates.
+
+The owner-approved VM-only TCP80 revocation window kept strict TLS and certificate revocation
+enabled. All owned APIs, products, subscriptions, backend, fragments, listener, firewall rule
+and transport certificates were removed with readback. The exact temporary NSG rule was also
+removed and Government's original running VM state preserved. No window or test remains active.
+The successful run used a reusable per-run ARM web session and refreshed both users for the
+same explicit delegated scope after setup; the fifteen-minute token margin was not reduced.
+
+The failures below are historical attempts, not the result of this fresh run.
+
+Government completed the 175-case matrix with **159 passing checks and 16 cancellation failures**.
+The failed owner/cross-owner cancellation POSTs returned 411 before ownership lookup because
+the raw diagnostic client omitted `Content-Length: 0`. That is not an accepted authentication
+rejection. The serializer now explicitly frames empty POSTs, with a passing local regression;
+the historical matrix and failed final receipt audit are not relabeled as a pass.
+
+Two corrected reruns then stopped before the governance matrix: one consumer check returned no
+structured result; the next failed strict transport preflight before creating resources.
+Consumer failures now report a fixed transport-stage label instead of losing all observations.
+Interleaved read-only checks passed strict TLS/HTTP, showed DNS resolving to the expected private
+gateway address, and succeeded on direct private TCP. The observed connectivity interruption is
+intermittent; its cause is not established. The VM's VNet allow/Internet deny rules were only read,
+never changed. Do not infer durable reachability or final governance acceptance from a spot check.
+
+All created diagnostics from those attempts were removed and Government's original running
+VM state was preserved. The completed fresh run above now closes this mock-matrix rerun gate.
+
+Subsequent stage timing identified a concrete transport failure: DNS/TCP completed in milliseconds,
+while TLS took about 51 seconds and failed with `RevocationStatusUnknown, OfflineRevocation`.
+An explicitly owner-approved diagnostic window allowed outbound TCP 80 from only the Government
+VM `/32`, with strict TLS/revocation still enabled. The signed-auth/consumer checks passed inside
+that window, but a separate local ARM HTTPS connection failed during governance setup; no full
+matrix pass is claimed. All diagnostic resources and the exact temporary NSG rule were removed
+with readback, and the VM remained running. No window or test remains active. Durable client
+certificate-revocation egress is still a customer network-design requirement, not a permanent
+allow rule created by these tests.
+
+Fixture setup also outlived captured-token freshness and briefly lost existing PIM access.
+The owner refreshed existing access; a paginated inventory then confirmed zero leftovers.
+The harness now obtains a second-user `SecureString` after resource/certificate setup and requests
+the first-user token for the same explicit delegated scope used by the refresher, avoiding a
+different cached `/.default` token. The fifteen-minute minimum remains unchanged. Synthetic limiter
+variants inline the actual accounting fragment to avoid six redundant diagnostic resources;
+production packaging is unchanged. These corrections preceded the fresh 175/175 run above;
+earlier failed attempts retain their original outcomes.
+
+### Real Foundry acceptance (2026-09-22)
+
+The owner approved at most four Responses creation attempts per cloud, at most 256 output
+tokens each, using synthetic prompts and isolated policies. Both clouds completed the same
+four phases: initial checks (31 observations), key rotation (3), old-key retirement (3) and
+cleanup (3). All phases passed. One observation per cloud records cancellation timing as
+**inconclusive**, not proof of cancellation of an active job.
+
+The fixture consumed all four POST-attempt slots per cloud: three actual stored responses and
+one cross-owner continuation rejected with 404. No automatic inference retries or Chat calls
+were made. A session-local allowance prevents an unreviewed repeat, and the VM persists the
+response IDs/attempt state encrypted to its temporary certificate before sending creations.
+
+Verified with the existing Foundry backend and its managed-identity authentication:
+
+- Both real delegated users and a native subscription listed the selected Responses model;
+  missing/malformed credentials and missing diagnostic access were denied.
+- Background streaming and native-key responses persisted gateway-stamped metadata instead
+  of the client-supplied marker. Requests retained tools and nonzero reasoning effort.
+- Other users and the other authentication method could not get, delete, cancel, enumerate
+  input items or continue the owned object. Owners could read metadata/input items and replay
+  the stored background stream.
+- A diagnostic-only key rotation kept old objects readable using the previous key; an owner
+  continuation created under the new key received a new marker. Removing the previous key
+  denied old objects while the new object remained readable. Restoring the diagnostic previous
+  key allowed verified deletion of all three objects.
+- Backend HTTPS name/chain validation was not disabled. The Government VM used its approved,
+  temporary VM-only revocation window; strict client certificate checks remained enabled.
+
+The actual Bicep-rendered Foundry consumer was used with diagnostic admission/body limits,
+isolated counter/metric names and automatic inference retry removed to enforce the approved
+budget. Only Responses/discovery operations were registered. This does not prove AOAI-specific,
+regional-pool, cross-cloud backend, auto-classifier, manual/proxy package or all client behavior.
+No telemetry-ingestion assertion was performed by this run. The background job finished before
+cancellation, so its documented 400 was accepted only as an explicit timing limitation; mock
+owner/cross-owner cancellation policy checks passed separately.
+
+All six real stored responses across both clouds were deleted and subsequent reads returned
+404. Encrypted VM state, transport certificates and owned APIs/products/subscriptions/fragments
+were removed. Government's exact temporary NSG rule was deleted; Commercial returned to its
+original deallocated state and Government remained running. Production APIs, ownership keys,
+backend resources and CI environment settings were not changed. No live test remains running.
+
+### Anthropic new-auth deferral (2026-09-21)
+
+The owner approved deferral after a bounded Commercial mock-only test of classic APIM's
+`llm-token-limit`: OpenAI JSON/SSE controls enforced the limit, while native Anthropic JSON
+and SSE each allowed all three requests. The JSON counter reported zero; the streaming header
+reported eight despite declared native usage of 270. The older `azure-openai-token-limit`
+also failed the native JSON case. Earlier transport-incomplete attempts are not passing evidence.
+No real model was called; diagnostic APIs, mock listener and scoped Windows firewall rule were
+removed, and VM power was restored.
+
+Initial shared-auth delivery is **Foundry/AOAI**. Existing Anthropic route/authentication is
+unchanged and is not linked to the new JWT product. There is no call-only quota waiver or claim
+that native Anthropic TPM is enforced by these policies on classic tiers. Anthropic new auth
+requires a separately accepted native-usage accounting solution.
+
 ## Policy coverage
 
 | Surface | Current deployment relationship | Required coverage |
 |---|---|---|
 | Foundry inference | Default when Foundry is enabled | Authentication, identity and limits |
 | Foundry model discovery | Same API; operation skips API inbound | Explicit authentication before backend call |
-| Responses get/delete/cancel/input-items | Four operations sharing an operation policy; skip API inbound | Explicit authentication; verify cross-user stored-response authorization separately |
-| Anthropic messages | Optional; enabled in Commercial CI configurations | Same trust rules, `x-api-key` compatibility |
+| Responses get/delete/cancel/input-items | Shared owner-checked policies are opt-in; skip API inbound | Live cross-user ownership and stateful operation acceptance |
+| Anthropic messages | Existing route unchanged; new auth explicitly deferred | Separate accepted native-usage accounting before new-auth activation |
 | AOAI inference | Optional | Same trust rules when enabled |
 | IntelliJ main gateway proxy | Forwards to Foundry APIs, not a separate inference policy | Preserve/normalize either credential without treating a JWT as an authenticated subscription |
 | Standalone IntelliJ bolt-on | Separate inference and discovery policies | Both policies; Bicep and Terraform packaging parity; VM and Container Apps proxy paths |
@@ -137,8 +1094,59 @@ The main gateway's JWT policy variants are [Foundry inference](../policies/byok-
 [Responses follow-ups](../policies/byok-foundry-responses-item-policy.xml),
 [Anthropic](../policies/byok-anthropic-policy.xml) and [AOAI](../policies/byok-aoai-policy.xml).
 Existing key variants must retain their validation and accounting behavior during migration.
-Wizard/manual deployment samples must be documented as key-only until explicitly updated
-and tested; changes to the main deployment do not retrofit customer-installed policies.
+The standalone Bicep/Terraform and wizard/manual shared packages are now implemented locally.
+They have not been live-upgraded or accepted. Changes to the main deployment do not retrofit
+customer-installed policies. Keep legacy defaults until the relevant package gate passes.
+
+### Package Engineering Checkpoint (2026-09-23)
+
+- Fresh main, module and standalone Bicep builds pass: 36 templates, no warnings. Terraform
+  validation and ten isolated mock plans pass with the shared nginx installer; paired
+  standalone parameter validation has thirteen cases. The private topology/deployment helper
+  has 49 mocked cases. Namespaced auth/ownership policies share the canonical sources.
+- The wizard/manual overlay compiles and has 24 composition cases, eight operation-inventory
+  gates, a private temporary-parameter-directory test and full mocked preflight. The old BASIC
+  installer rejects shared-policy/open-product overwrite before mutations. The upgrade selects
+  a repository baseline, not an arbitrary customer policy merge; review customer feature changes
+  and operation overrides before adoption. All sixteen actual main/standalone/wizard policy
+  consumers were accepted by APIM in both clouds and returned their mandatory first-statement
+  diagnostic denial. This proves policy compatibility, not execution of those full feature paths
+  or a successful customer installer deployment.
+- A real stock-nginx matrix initially passed 52 cases. Expanded coverage then exposed empty
+  credential-header loss; that earlier pass is not acceptance. The new njs raw-header gate has
+  33 selector cases and 88 forwarding/TLS/conflict checks across four configurations per runtime.
+  No-push image tests passed for the actual main nginx 1.25.5 and standalone nginx 1.28.0 images,
+  plus the pinned nginx 1.30.5/njs 1.0.1 installer on Ubuntu 22.04 and the actual runner base.
+  The final installer tests include fail-closed VM bootstrap ordering. No image was published
+  or deployed; complete proxy-to-APIM, long-stream and customer installation gates remain.
+- Both clouds passed 175 mock-governance cases and 30 admission-rollback cases. Detaching the
+  JWT product rejected both JWT users while valid native key variants remained usable; restoring
+  the native-only guard retained the owner keys and four protected utility policies. Both legacy
+  and issuer-qualified throttle metrics ingested matching totals: burst 2, tokens 16, quota 4,
+  with two subjects and zero invalid identity rows in each bucket. Commercial's initial telemetry
+  harness failure was repaired and the already-emitted data queried without replaying traffic.
+  All resources owned by these operational runs were removed and VM power restored. This is not
+  a CI deployment rollback or a post-deployment retained-object recovery test.
+- The Okta helper uses maintained OAuth/OIDC and JOSE libraries, exact user/client/API binding,
+  browser PKCE, OS-keystore-protected encryption and serialized refresh rotation. Eight local
+  tests including a disposable Windows keystore entry passed; both CLI launcher suites passed.
+  No real Okta request was made. All fifteen native CLI wire tests passed, including the pinned
+  editor launcher over strict HTTPS; actual editor UI acceptance is not implied by ACP tests.
+- CI gates are wired, but the runner image needs its newer Bicep compiler and nginx njs module.
+  The first PR checks exposed Bicep 0.30.23, Node setup after its first consumer, and runner
+  2.335.1's service cutoff on 2026-09-24. The initial published candidates are retired from adoption.
+  Commercial access was restored without infrastructure recreation. Supported runner 2.337.0
+  replacements from source `c6aa05730fe4` built in both clouds with verified digests; `latest`
+  was unchanged. Node setup now precedes credential tests. Both exact job snapshots passed the
+  required deployment validation and image-only previews with existing AcrPull and no new roles.
+  Commercial adoption succeeded while idle, with full raw configuration equality except the image
+  and an encrypted rollback snapshot. Government then passed the same adoption checks. Fresh
+  executions in both clouds verified runner 2.337.0. The approved PAT rotation also completed for
+  the repository and both private pilot vault/job copies, with fresh pings and no network/RBAC
+  changes. The remaining package CI failure was a leaked expected-negative exit code; its explicit
+  success-exit fix passed local success/failure checks and awaits the required CI rerun.
+  Source is published on an isolated branch. PR merge is approved only after required CI, scoped
+  review and baseline deployment validation pass; pilot API activation remains unapproved.
 
 ## Entra and Okta choices
 
@@ -151,7 +1159,7 @@ contract and are not supported by that delegated-scope check unchanged.
 access token. The gateway continues validating Entra; users still need their Entra identity
 and gateway permissions. Federation, MFA and cloud support must be validated for the tenant.
 
-**Direct Okta access tokens (planned):** configure an Okta custom authorization server for
+**Direct Okta access tokens (opt-in, pending customer validation):** configure an Okta custom authorization server for
 this API, an API audience, scopes, authorized client applications and user access policies.
 Okta org authorization-server access tokens are for Okta APIs, not this gateway. Confirm
 production API Access Management licensing. Add opt-in deployment settings for the exact
@@ -187,14 +1195,22 @@ egress controls and the customer's Okta service/compliance requirements explicit
 
 | Client | Existing key users | JWT migration |
 |---|---|---|
-| Copilot CLI | No change | Opt in with `-AuthMode jwt -RefreshToken` or `AUTH_MODE=jwt REFRESH_TOKEN=1`; live VM expiry acceptance is pending |
-| VS Code Custom Endpoint | No change | Replace stored API key with access token; renewal needs a supported provider/helper integration |
-| IntelliJ | No change | Replace credential and validate proxy/header path; renewal depends on client/provider/helper |
+| Copilot CLI | No change | Opt in with `-AuthMode jwt -RefreshToken` or `AUTH_MODE=jwt REFRESH_TOKEN=1`; Government expiry renewal and real Responses inference passed; use Responses for GPT-5.6 tools plus reasoning; Commercial coverage remains open |
+| VS Code running the configured native Copilot CLI | No change to other providers | Use the pinned CLI launcher and renewable credential command; actual editor launch/session acceptance is required, and native background/Agent Host bridges are not assumed equivalent |
+| IntelliJ custom Copilot CLI ACP agent | No change to other providers | Use the pinned CLI launcher in ACP mode; actual IDE launch/session acceptance is required, not the built-in language-server-backed Copilot entry |
+| VS Code Custom Endpoint, including Agent mode using it | Keep per-user APIM subscription key | JWT renewal is outside the approved native-provider support boundary |
+| IntelliJ AI Assistant model provider | Keep per-user APIM subscription key and existing proxy path where required | JWT renewal is outside the approved native-provider support boundary |
 
 CLI 1.0.85 documents command output as `api-key` for `azure`, Bearer for `openai`, and
 `x-api-key` for `anthropic`. Use the provider that preserves the required URL/wire format.
 The command should print only the access token to stdout; caching, expiry handling and
-interactive reauthentication belong to the helper. No Okta helper ships in this repository.
+interactive reauthentication belong to the helper. The opt-in Okta helper remains disabled until
+customer validation. The [pinned editor launcher](../scripts/start-copilot-agent.ps1) binds the
+native executable, workspace, endpoint and user/cloud/cache without putting tokens in editor
+configuration. Its local real-CLI test verifies one ACP session, renewed credentials and no provider
+request after helper failure, but does not certify either editor's integration.
+The owner requires both VS Code's CLI terminal and native Agent/Background experience, plus
+IntelliJ's custom ACP agent, to pass separately in the Government VM's interactive user session.
 Test inference, utility requests, discovery and long-running sessions, not just provider help.
 
 The paired token helpers now use the existing Azure CLI cache for each request, pinned to the
@@ -205,15 +1221,253 @@ and Chat Completions through a disposable private APIM fixture with CLI 1.0.85: 
 exited 0, invoked the pinned helper once, and received its unique synthetic response proof.
 Missing/invalid credentials returned 401, and API, local-file and CRL-rule cleanup all passed.
 
-This verifies the real CLI/helper/gateway path, not model inference or renewal across actual
-expiry within one continuing CLI session. Perform those remaining checks in the in-VNet VM's
-user session; Run Command's SYSTEM account cannot substitute for that user's sign-in.
+The subsequent long-running Government test also passed both wire formats after actual token
+expiry in unchanged CLI processes/sessions, with renewed-token and fresh-response evidence.
+The CRL allowance was closed while idle; all final cleanup passed. This verifies the real
+CLI/helper/gateway path and same-session renewal. Model-inference evidence comes from the
+separate user-session run below; Run Command's SYSTEM account cannot substitute for that
+user's sign-in.
 See the [client validation evidence](feature-request-byok-credential-refresh.md#validation-evidence).
-The suite now contains nine passing CLI loopback checks, including persistent ACP sessions and
-simulated expiry/failure controls. The bounded real-expiry VM gate is prepared, not yet passed.
-Production APIs and the duplicate-header parity release gate are unchanged.
+The loopback suite covers persistent ACP sessions, simulated expiry/failure controls, and
+backend-error reporting. In the separate bounded real-model VM gate, Responses passed with
+10,491 input and 9 output tokens; persisted model/frontend 200 records and token metrics match.
+Chat failed with CLI exit 1 and a correlated model-backend 400. Missing usage does not prove
+the backend was not called. The approved one-request diagnostic then captured HTTP 400 with
+`invalid_request_error` naming `reasoning_effort`; all cleanup passed. This matches
+[Microsoft's documented GPT-5.6 restriction](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning#tool-calling-with-reasoning-models):
+Chat requests with function tools require `reasoning_effort=none`, whereas Responses supports
+tools with reasoning. The CLI's local wire characterization contained tools and `medium` effort.
+The owner chose Responses and stopped further Chat attempts, rather than silently disabling
+reasoning. Chat without reasoning has not been tested. The model limitation is separate from
+the passed authentication and renewal checks, and the failed Chat model call remains negative
+evidence. No API-version change or production normalization was made; the loopback capture was
+temporary diagnostic equipment, not a production proxy.
+Production APIs were unchanged by that client test. The later owner-approved compatibility
+exception supersedes the duplicate-header parity release gate, not the remaining security gates.
 
-Current Foundry/AOAI JWT policies (including discovery and Responses follow-ups) require
+#### Start JWT Mode In A Clean Shell
+
+**Windows JWT CLI handoff: two scripts, one entry point.** Your operator supplies matching copies
+of these files in the **same folder**; a full repository clone is not required:
+
+- [copilot-cli-byok.ps1](../scripts/copilot-cli-byok.ps1): the launcher. This is the only script
+  the developer runs directly.
+- [get-byok-token.ps1](../scripts/get-byok-token.ps1): the credential helper. The launcher invokes
+  it for preflight and configures Copilot to invoke it for subsequent requests. Do not run it
+  manually; its stdout contains the access token.
+
+The launcher sets `COPILOT_PROVIDER_*` and `COPILOT_MODEL` in the current shell from the supplied
+settings. Neither the portal's [Use-Byok.ps1](../app/register/src/Installers/Use-Byok.ps1) nor
+[Use-Cloud.ps1](../scripts/Use-Cloud.ps1) is required for this JWT CLI path. If also using the portal
+installer for VS Code's subscription-key setup, use its `-SkipCliEnv` switch so it does not write
+persistent key-based CLI settings. The two-script handoff does not include the Azure CLI and
+Copilot CLI executables; their prerequisite setup is described below.
+
+JWT mode requires Azure CLI and a delegated-user sign-in; the launcher now guides first-run
+authentication instead of requiring manual cloud and login commands. The
+[PowerShell launcher](../scripts/copilot-cli-byok.ps1) first looks for `az` on PATH and in the
+standard Windows MSI and launcher-managed per-user installation locations. It verifies version
+2.54.0 or newer, which provides the token-expiration field used by the credential helper. Existing
+installations are reused, not silently upgraded or overwritten.
+
+On 64-bit Windows, add `-InstallDeps` to the existing JWT launcher command to install Azure CLI
+when missing, or approve the interactive `[y/N]` prompt. Noninteractive execution requires the
+switch. The installer uses Microsoft's version-pinned x64 ZIP distribution (currently **preview**),
+extracts it under `%LOCALAPPDATA%/Microsoft/AzureCLI-BYOK/<version>`, and adds its `bin` directory to
+the current process PATH. It does not require WinGet or elevation and does not change the persistent
+user/machine PATH. Later launcher runs rediscover that installation. Temporary download/extraction
+files are cleaned up; existing installation directories are never overwritten. Broken or outdated
+installations require explicit repair/upgrade.
+
+This download needs approved HTTPS access to `azcliprod.blob.core.windows.net`; the launcher does
+not change firewall/proxy rules. Managed or offline machines can have Azure CLI preinstalled using
+an approved method instead. See [Microsoft's Windows installation options](https://learn.microsoft.com/cli/azure/install-azure-cli-windows).
+The [Bash counterpart](../scripts/copilot-cli-byok.sh) continues to require platform-specific
+dependency installation outside the launcher, including Azure CLI and `jq` for JWT setup. Azure CLI
+is not required by either launcher's native subscription-key or Okta mode.
+
+**First sign-in:** obtain the gateway URL, application client ID, directory tenant ID and model
+from your operator. For a tier-enabled gateway, the operator must also assign your account to
+exactly one mapped tier through the gateway API's groups/roles, not the registration portal's
+native-key onboarding groups. The pilot groups are `BYOK JWT Test Standard` and
+`BYOK JWT Test Power` in the matching tenant.
+
+Run this from the folder containing the two scripts in a new Government-only terminal on the client
+machine. If using a repository clone, enter its `scripts` directory first. For Commercial,
+use the operator's `.azure-api.net` URL and Commercial tenant/application IDs in a separate terminal.
+The splatted settings avoid fragile trailing backticks and contain no credentials:
+
+```powershell
+$byok = @{
+  AuthMode = 'jwt'
+  RefreshToken = $true
+  AppId = '<CLIENT_ID>'
+  TenantId = '<TENANT_ID>'
+  ApimBaseUrl = 'https://<apim-name>.azure-api.us/openai'
+  Model = 'gpt-5.6-sol'
+  WireApi = 'responses'
+}
+./copilot-cli-byok.ps1 @byok -Login -UseDeviceCode -InstallDeps
+```
+
+Complete the device-code sign-in as the intended Entra user. Only after the launcher succeeds,
+run `copilot` in that configured terminal. If the launcher opens PowerShell 7, run Copilot there.
+If setup fails or sign-in is cancelled, stop and resolve that error instead of starting Copilot
+with an older configuration.
+
+The setup sequence is:
+
+1. Infer `AzureUSGovernment` from an exact `.azure-api.us` hostname or `AzureCloud` from
+  `.azure-api.net`. Custom hostnames require `-Cloud` or an interactive choice. HTTPS is required;
+  conflicting cloud overrides, URL credentials, query parameters and fragments are rejected.
+2. Reuse an explicit `AZURE_CONFIG_DIR`, or select the current user's `.azure-byok-government` /
+  `.azure-byok-commercial` directory. The default `.azure` cache is not selected implicitly.
+  An existing cache must already match the inferred cloud; it is never switched to another cloud.
+3. Reuse a matching delegated user, or ask permission to sign in and prompt for the gateway
+  directory tenant GUID. Supply `-TenantId '<TENANT_ID>'` to avoid that prompt. The hostname and
+  application client ID cannot identify the tenant. A conflicting cached tenant or application
+  identity is rejected instead of silently replaced.
+4. Install missing dependencies when approved, initialize the cloud only in a newly created
+  cache, and run Azure CLI login for the exact tenant and gateway scope. `-UseDeviceCode` displays
+  instructions for a browser on another machine; omit it for Azure CLI's browser/broker default.
+5. Verify the resulting cloud, tenant and delegated user, preflight the gateway token helper,
+  and configure Copilot in the same shell. Failed/cancelled setup does not replace existing
+  provider credentials. New caches are prepared in temporary directories and published only after
+  cloud initialization succeeds. Failed preparation cleans up only directories created by that
+  attempt, so an installation/cloud-setup failure can be retried. Existing caches are not deleted
+  or overwritten. A successfully initialized cache remains after cancelled sign-in for an explicit retry.
+
+`-Login` explicitly starts sign-in without the launcher's confirmation prompt, even for an
+already-cached account. It is recommended in the first-run command above, but is not a mandatory
+one-time-only flag: an interactive first run can instead prompt for sign-in approval, and `-Login`
+is also used for deliberate reauthentication. Without it, noninteractive runs never start login.
+`-InstallDeps` is only installation consent, not sign-in consent. A requested sign-in still requires
+the user to complete Entra authentication. Enter device codes/passwords directly in the browser,
+never in chat. The gateway app registration, delegated permission/consent and intended tier
+assignments must already exist; the launcher does not create or grant them.
+
+For Bash, from the repository root use `AUTH_MODE=jwt REFRESH_TOKEN=1 source ./scripts/copilot-cli-byok.sh <APIM_URL> <MODEL>
+<CLIENT_ID>` in an interactive terminal. Optional settings are `BYOK_AZURE_CLOUD`, `BYOK_TENANT_ID`,
+`BYOK_LOGIN=1` and `BYOK_USE_DEVICE_CODE=1`, with the same inference, approval and cache boundaries.
+Do not copy a laptop's cache to a VM or use another operating-system user's cache. A terminal/cache
+remains pinned to one cloud; open a separate terminal for the other cloud.
+
+Sign-in and renewal need approved outbound HTTPS to `login.microsoftonline.us` (Government) or
+`login.microsoftonline.com` (Commercial), plus applicable sign-in dependencies; they do not flow
+through private APIM. A setup failure before token preflight is not a tier-enforcement result.
+A clean shell may have no `COPILOT_PROVIDER_BASE_URL` or `COPILOT_MODEL`, so use explicit inputs as
+above. The per-request helper still never signs in or changes cloud/account/cache. It can return a
+cached JWT: per-request acquisition is not forced reissuance, and group changes do not rewrite
+an existing token's roles.
+
+#### Routine JWT Launches
+
+After successful setup, run `copilot` directly while still in the configured terminal. In a new
+terminal, open the folder containing the two scripts, recreate the same `$byok` settings above,
+and rerun the launcher **without `-Login`**:
+
+```powershell
+./copilot-cli-byok.ps1 @byok
+```
+
+Then run `copilot` after the launcher succeeds. Keep `RefreshToken = $true`: the credential command
+reuses a usable access token and requests renewal when needed. Ordinary access-token expiry does
+not require another interactive login while the refresh grant remains usable and Entra is reachable.
+If sign-in/MFA is required again, exit Copilot and use the first-sign-in command without
+`-InstallDeps` unless software is missing. Do not add `-Login` to every normal launch.
+
+The matching cloud-specific cache persists across terminals, but `$byok` and the provider environment
+variables do not necessarily do so. An explicit `AZURE_CONFIG_DIR` must still point to that same
+cloud's cache. For Bash, leave `BYOK_LOGIN` unset or `0` on normal launches and keep `REFRESH_TOKEN=1`.
+
+#### Understand JWT Access Messages
+
+**403 after a group change:** Copilot's generic `Authentication failed ... HTTP 403` may indicate
+missing/conflicting tier claims or a token cached before membership was assigned. It does not prove
+the account is unassigned or that login expired. Follow these steps:
+
+1. Exit Copilot. Have the administrator verify the intended Entra account has direct membership in
+  exactly one group assigned to the gateway API's mapped tier role, in the correct tenant. Neither
+  group or conflicting tier roles causes inference rejection when tiering is enabled; there is no
+  default-tier fallback. Portal native-key groups are not JWT tier assignments.
+2. After the administrator fixes or changes membership, allow Entra propagation. Reuse the same
+  `$byok` settings and cloud-specific cache, and explicitly request sign-in again:
+
+```powershell
+./copilot-cli-byok.ps1 @byok -Login -UseDeviceCode
+```
+
+3. Complete the browser sign-in, wait for the launcher to succeed, then start `copilot` in that
+  same configured terminal. This requests authentication for the gateway scope; it does not
+  guarantee immediate directory propagation. No cache deletion, APIM redeployment or new
+  subscription is needed. Restarting Copilot alone does not replace a cached JWT.
+4. If 403 persists, inspect only safe token metadata (mapped tier roles, issuance and expiry times)
+  and the actual gateway error code. `CallerTierInvalid` identifies tier selection failure. Missing
+  roles require checking freshness/assignment; an expected single role with continued rejection
+  requires gateway investigation. Do not repeatedly log in or share raw tokens to diagnose it.
+
+**Waiting instead:** with `-RefreshToken` configured, the helper can pick up changed roles when it
+next obtains a newly issued access token after propagation, normally when the cached token needs
+renewal. Requests may continue to receive 403 until then. A valid old token can also retain access
+after group removal until replaced or expired. There is no fixed propagation/expiry wait that
+guarantees a role change, and automatic renewal cannot bypass a required interactive sign-in.
+Use the explicit sign-in step above when you want to test changed membership sooner.
+
+The launcher distinguishes **token acquired** from **gateway access granted**. Before configuring
+Copilot, it inspects the token already acquired for preflight and warns if its app-role claim is
+missing or empty. For a tier-enabled gateway, that token cannot select a tier: allow group changes
+to propagate, then rerun the same launcher with `-Login` (and `-UseDeviceCode` on a remote VM).
+For Bash, use `BYOK_LOGIN=1` and optionally `BYOK_USE_DEVICE_CODE=1`. If access remains denied,
+ask the administrator to verify exactly one mapped gateway tier assignment.
+
+This is an advisory metadata check, not signature validation or proof of current group membership.
+It prints neither tokens nor raw claims, makes no additional token or gateway request, and does not
+block role-less tokens for gateways where tiering is disabled. It cannot validate custom role-to-tier
+mappings. Having app roles does not establish authorization; APIM remains authoritative.
+
+If the credential helper cannot obtain a usable token, it emits no credential and gives the
+re-login command plus cloud/account/cache/connectivity guidance. The helper never starts interactive
+login itself. Copilot CLI owns the generic runtime `Authentication failed ... HTTP 403` banner;
+the launcher cannot replace it. A 403 alone does not mean sign-in expired. Missing/conflicting tier
+claims are one cause, reported by APIM as `CallerTierInvalid`; inspect the actual gateway error when
+fresh sign-in does not restore access. Gateway denial status and policy enforcement are unchanged.
+
+#### Observe Renewal In The VM Session
+
+The Entra token helpers support an optional `BYOK_TOKEN_TRACE_FILE` path. It is disabled by default
+and appends only `event`, `observedUtc` and `expiresUtc` JSON fields, never tokens, claims, account
+names or identifiers. Credential stdout and authentication behavior are unchanged. Trace writes
+are best-effort; a trace-file error is reported on stderr without turning a valid token into a failure.
+
+Use the updated helper on the VM, in the same terminal already configured for renewable JWT.
+Before starting one new CLI session, set a fresh trace path:
+
+```powershell
+$env:BYOK_TOKEN_TRACE_FILE = Join-Path $env:TEMP ('byok-renewal-' + [guid]::NewGuid().ToString('N') + '.log')
+$env:BYOK_TOKEN_TRACE_FILE
+copilot
+```
+
+In a second VM terminal, follow that printed path after the first helper invocation creates it:
+
+```powershell
+Get-Content -LiteralPath '<TRACE_FILE>' -Tail 10 -Wait
+```
+
+Repeated `token-acquired` records with the same `expiresUtc` mean the same expiry is being reused;
+they do not mean a new token was issued on each request. A later expiry shows a newer credential
+was returned. To prove the actual client renewal path, keep that CLI session running past the first
+expiry and observe a successful normal request plus a new expiry, without manually calling the helper,
+`az account get-access-token`, or signing in during the test. Launcher preflight can also create an
+initial trace row; it is not itself a Copilot request. `acquisition-failed` has no expiry and does not
+establish successful renewal. No rows alone do not prove failure; confirm the configured helper path
+and stderr. A variable set in another terminal cannot enable tracing in an already-running process.
+
+These diagnostics cannot reconstruct earlier renewals or observe a VM from a separate laptop cache.
+Disable tracing before a subsequent session with `$env:BYOK_TOKEN_TRACE_FILE = $null`. For Bash,
+export the same variable before launch and use `tail -f` to follow the selected file.
+
+Legacy Foundry/AOAI JWT policies (including discovery and Responses follow-ups) require
 the token in `api-key`; Anthropic JWT accepts Bearer or `x-api-key`. A static bearer-token
 setting does not by itself change these policies or refresh a token.
 
@@ -221,7 +1475,9 @@ VS Code's current documentation permits `requestHeaders` values containing the l
 `${apiKey}` to use secret storage. This is header interpolation, not OAuth renewal. The
 built-in Azure provider has Entra authentication for the Cognitive Services scope, which
 does not satisfy this gateway's custom audience. Preserve the existing URL marker when
-using today's JWT-in-`api-key` path; Bearer-only support on that path is still planned.
+using legacy JWT-in-`api-key` paths. Shared authentication adds validated Bearer admission on the
+same URLs only after its explicit rollout gates. Native Custom Endpoint remains key-based under
+the approved support boundary; its UI mode does not select the independently configured CLI.
 
 The current IntelliJ nginx proxy extracts Bearer into `api-key` and clears Authorization.
 This rewrite does not validate or renew a JWT. Test or adapt it as part of dual-auth admission;
@@ -700,7 +1956,7 @@ keys, raw credential-bearing traces or CMS payloads. Coordinate a fresh isolated
 if Microsoft requires trace correlation. The observed test was Government HTTP/1.1; Commercial
 and HTTP/2 have not reproduced this gate. **This draft has not been submitted to Microsoft.**
 
-##### Current cross-cloud parity request draft (2026-09-19, not submitted)
+##### Cross-cloud parity support handoff (submitted; verified 2026-09-21)
 
 **Subject:** Align policy-visible duplicate Authorization handling across Commercial and
 Government classic managed gateways without changing client URLs.
@@ -717,7 +1973,7 @@ The same certificate-validating raw HTTP/1.1 probe and isolated admission policy
 |---|---|---|
 | Single valid Bearer | 200 after validation | 200 after validation, including raw-client control |
 | Two identical valid Bearer lines | One policy-visible value, validated 200, one stripped backend receipt | Two policy-visible values, source guard 401, no backend receipt |
-| Two different Bearer values, either order | 400 with no probe context or backend receipt | Two policy-visible values, source guard 401, no backend receipt |
+| Valid JWT plus `not-a-jwt`, either order | 400 with no probe context or backend receipt | Two policy-visible values, source guard 401, no backend receipt |
 
 The Commercial rejecting branch explicitly returned a fixed `credential-source-guard` marker
 and count `2` for all six inherited/explicit parity failures. Its comma flag describes the
@@ -737,7 +1993,9 @@ passing. Its final receipt audit failed because repeated-valid acceptance was re
 Provide identifiers, UTC reproduction windows, and correlations only through an approved private
 support channel; do not attach live credentials or credential-bearing traces. Do not set
 undocumented service properties or migrate gateway platforms based on this draft.
-**No support request has been submitted and no mitigation has been approved.**
+**The cross-cloud support ticket was verified created and Open on 2026-09-21.** No duplicate
+submission or approved mitigation followed. The earlier strict-rejection draft above remains
+historical; ticket identifiers/contact details are intentionally excluded from the repository.
 
 #### Strict ingress candidate and remaining gates
 

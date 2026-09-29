@@ -1,12 +1,12 @@
 # ---- Named values the policies read via {{...}} -------------------------------------------------
 resource "azurerm_api_management_named_value" "nv" {
-  for_each            = local.named_values
+  for_each            = nonsensitive(toset(keys(local.named_values)))
   name                = each.key
   resource_group_name = var.apim_resource_group
   api_management_name = var.apim_name
   display_name        = each.key
-  value               = each.value.value
-  secret              = each.value.secret
+  value               = local.named_values[each.key].value
+  secret              = local.named_values[each.key].secret
 }
 
 # ---- The dedicated API --------------------------------------------------------------------------
@@ -18,12 +18,13 @@ resource "azurerm_api_management_api" "intellij" {
   display_name          = "IntelliJ BYOK -> Foundry"
   path                  = var.intellij_api_path
   protocols             = ["https"]
-  subscription_required = true
+  subscription_required = local.caller_key_required
 
   subscription_key_parameter_names {
     header = "api-key"
     query  = "api-key"
   }
+  depends_on = [terraform_data.caller_contract]
 }
 
 # ---- Operations ---------------------------------------------------------------------------------
@@ -36,6 +37,15 @@ resource "azurerm_api_management_api_operation" "op" {
   display_name        = each.value.display
   method              = each.value.method
   url_template        = each.value.url
+
+  dynamic "template_parameter" {
+    for_each = strcontains(each.value.url, "{response_id}") ? ["response_id"] : []
+    content {
+      name     = template_parameter.value
+      type     = "string"
+      required = true
+    }
+  }
 
   response {
     status_code = 200
@@ -50,9 +60,9 @@ resource "azurerm_api_management_api_operation_policy" "models" {
   api_management_name = var.apim_name
   resource_group_name = var.apim_resource_group
   operation_id        = azurerm_api_management_api_operation.op["list-models"].operation_id
-  xml_content         = file("${path.module}/../policies/intellij-models.xml")
+  xml_content         = replace(local.models_caller_policy, local.backend_auth_marker, local.backend_auth_policy)
 
-  depends_on = [azurerm_api_management_named_value.nv]
+  depends_on = [azurerm_api_management_named_value.nv, azapi_resource.caller_fragment]
 }
 
 # API-scoped inference policy (chat/completions/embeddings/responses).
@@ -60,11 +70,12 @@ resource "azurerm_api_management_api_policy" "inference" {
   api_name            = azurerm_api_management_api.intellij.name
   api_management_name = var.apim_name
   resource_group_name = var.apim_resource_group
-  xml_content         = file("${path.module}/../policies/intellij-inference.xml")
+  xml_content         = replace(local.inference_caller_policy, local.backend_auth_marker, local.backend_auth_policy)
 
   depends_on = [
     azurerm_api_management_named_value.nv,
     azurerm_api_management_api_operation.op,
+    azapi_resource.caller_fragment,
   ]
 }
 
