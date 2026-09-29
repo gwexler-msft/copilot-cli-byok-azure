@@ -18,7 +18,7 @@
 param(
   [string]$ParametersFile = "$PSScriptRoot/main.parameters.json",
   [string]$Location,
-  [string]$FoundryApiKey,
+  [string]$FoundryApiKey = $env:FOUNDRY_API_KEY,
   [switch]$WhatIf
 )
 
@@ -48,17 +48,36 @@ if (-not $acct) { Fail "Not signed in. Run: az login" }
 Ok "Signed in: $($acct.name)  (sub $($acct.id))"
 $sub = $acct.id
 $armBase = (az cloud show --query endpoints.resourceManager -o tsv).TrimEnd('/')
+$callerRollout = Get-ParameterValue -Name 'callerAuthRollout'
+if (-not $callerRollout) { $callerRollout = 'legacy' }
+if ($callerRollout -cnotin @('legacy','shared','coexistence')) { Fail 'callerAuthRollout must be legacy, shared or coexistence.' }
+$sharedCaller = $callerRollout -cne 'legacy'
+$tiering = Get-ParameterValue -Name 'callerJwtTiering'
+if ($sharedCaller -or (Get-ParameterValue -Name 'callerAuthPreparation') -or $params.PSObject.Properties.Name -ccontains 'callerJwtTiering') {
+  $cloudName = (az cloud show --query name -o tsv --only-show-errors).Trim()
+  $previousBackendKey = $env:FOUNDRY_API_KEY
+  try {
+    if ($FoundryApiKey) { $env:FOUNDRY_API_KEY = $FoundryApiKey }
+    $null = & "$PSScriptRoot/../../../scripts/check-provision-params.ps1" -ParameterFile $ParametersFile -StandaloneCloud $cloudName
+    if ($LASTEXITCODE -ne 0) { Fail 'Standalone caller-auth preflight failed; no deployment started.' }
+  } finally { $env:FOUNDRY_API_KEY = $previousBackendKey }
+}
 
 $apimRg = Get-ParameterValue -Name 'apimResourceGroup'
 $apim = Get-ParameterValue -Name 'apimName'
 az apim show -g $apimRg -n $apim -o none 2>$null
 if ($LASTEXITCODE -ne 0) { Fail "APIM '$apim' not found in resource group '$apimRg'." }
+if ($tiering.entra.enabled -or $tiering.okta.enabled) {
+  $sku = az apim show -g $apimRg -n $apim --query sku.name -o tsv --only-show-errors 2>$null
+  if ($LASTEXITCODE -ne 0 -or ([string]$sku).Trim() -cnotin @('Developer','Premium')) { Fail 'JWT tiers currently require classic Developer or Premium APIM.' }
+}
 Ok "APIM found: $apim"
 
 $be = Get-ParameterValue -Name 'existingBackendName'
 $beUrl = "$armBase/subscriptions/$sub/resourceGroups/$apimRg/providers/Microsoft.ApiManagement/service/$apim/backends/$be?api-version=2024-05-01"
-az rest --method get --url $beUrl -o none 2>$null
-if ($LASTEXITCODE -eq 0) { Ok "Foundry backend found: $be" } else { Warn "Backend '$be' not found on APIM — double-check existingBackendName." }
+$backend = az rest --method get --url $beUrl -o json 2>$null | ConvertFrom-Json
+if ($LASTEXITCODE -eq 0) { Ok "Foundry backend found: $be" } elseif ($sharedCaller) { Fail 'Shared caller mode requires a readable existing backend.' } else { Warn "Backend '$be' not found on APIM — double-check existingBackendName." }
+if ($sharedCaller -and ([uri]$backend.properties.url).GetLeftPart([UriPartial]::Authority) -ine (Get-ParameterValue -Name 'existingBackendOrigin')) { Fail 'existingBackendOrigin must match the selected backend HTTPS origin.' }
 
 $products = @()
 $prod = Get-ParameterValue -Name 'existingProductName'
@@ -147,6 +166,10 @@ Info "`n== Deploy =="
 $template = "$PSScriptRoot/main.bicep"
 $common = @('--location', $loc, '--template-file', $template, '--parameters', "@$ParametersFile")
 if ($FoundryApiKey) { $common += @('--parameters', "foundryApiKey=$FoundryApiKey") }
+if ($sharedCaller) {
+  $previous = if ($env:BYOK_RESPONSE_OWNER_PREVIOUS_KEY -ceq '__none__') { '' } else { $env:BYOK_RESPONSE_OWNER_PREVIOUS_KEY }
+  $common += @('--parameters', "responseOwnerKey=$env:BYOK_RESPONSE_OWNER_KEY", "responseOwnerPreviousKey=$previous")
+}
 
 if ($WhatIf) {
   az deployment sub what-if @common

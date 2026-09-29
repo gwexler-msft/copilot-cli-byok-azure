@@ -4,7 +4,15 @@ $helper = Join-Path $PSScriptRoot '../deploy-containerapp.ps1'
 $passed = 0
 $mockState = @{}
 $previousKey = $env:FOUNDRY_API_KEY
+$previousOwnerKey = $env:BYOK_RESPONSE_OWNER_KEY
+$previousOwnerPreviousKey = $env:BYOK_RESPONSE_OWNER_PREVIOUS_KEY
 $previousExitCode = $global:LASTEXITCODE
+
+function Test-Path {
+  param([string]$LiteralPath)
+  if ($LiteralPath -eq 'mock-parameters.json') { return $true }
+  return Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath
+}
 
 function Get-Content {
   param([string]$LiteralPath, [switch]$Raw)
@@ -28,7 +36,9 @@ function az {
     'apim api show *' { return ($mockState.api | ConvertTo-Json -Depth 10) }
     'apim product show *' { return '{}' }
     'apim show *' { return ($mockState.apim | ConvertTo-Json -Depth 10) }
-    'cloud show *' { return '{"endpoints":{"resourceManager":"https://management.example.test/"}}' }
+    'cloud show *' { return '{"name":"AzureUSGovernment","endpoints":{"resourceManager":"https://management.example.test/"}}' }
+    'rest --method get *policies/policy*' { return (@{properties=@{value=$mockState.callerPolicy}}|ConvertTo-Json -Depth 5) }
+    'rest --method get *backends/*' { return '{"properties":{"url":"https://backend.example.test/"}}' }
     'rest --method get *' { return '{}' }
     'deployment sub what-if *' { return '{}' }
     'deployment sub create *' { return 'https://proxy.example.test/intellij/v1' }
@@ -61,6 +71,7 @@ function Invoke-Case {
   }
   $script:apim = @{
     id = '/mock/apim'
+    sku = @{name='Developer'}
     virtualNetworkType = 'Internal'
     privateIpAddresses = @('192.0.2.1')
     gatewayUrl = 'https://gateway.example.test'
@@ -68,6 +79,7 @@ function Invoke-Case {
   }
   $script:api = @{ path = 'intellij'; subscriptionRequired = $true; subscriptionKeyParameterNames = @{ header = 'api-key' } }
   $script:failCommand = ''
+  $script:callerPolicy = '<policies><inbound><include-fragment fragment-id="intellij-byok-authenticate" /><include-fragment fragment-id="intellij-byok-apply-caller-limits" /></inbound></policies>'
   $script:commands = [System.Collections.Generic.List[string]]::new()
   & $Arrange
   $mockState.fixture = $script:fixture
@@ -75,6 +87,7 @@ function Invoke-Case {
   $mockState.apim = $script:apim
   $mockState.api = $script:api
   $mockState.failCommand = $script:failCommand
+  $mockState.callerPolicy = $script:callerPolicy
   $mockState.commands = $script:commands
   $caught = ''
   $switches = @{}
@@ -106,8 +119,33 @@ function Set-PrivateEndpointFixture {
   })
 }
 
+function Set-SharedCallerFixture {
+  $script:fixture.parameters.callerAuthRollout = @{value='coexistence'}
+  $script:fixture.parameters.existingBackendOrigin = @{value='https://backend.example.test'}
+  $script:fixture.parameters.foundryAuthMode = @{value='managedIdentity'}
+  $script:fixture.parameters.entraTenantId = @{value=[guid]::NewGuid().ToString()}
+  $script:fixture.parameters.apiAudience = @{value=[guid]::NewGuid().ToString()}
+  $script:fixture.parameters.callerAuthPreparation = @{value=@{
+    enabled=$true;keyEnabled=$true;entraEnabled=$true;entraClientIds=@();jwtProductId='intellij-jwt'
+    oktaTrust=@{enabled=$false;issuer='';openIdConfigUrl='';audience='';requiredScope='';clientIds=@()}
+  }}
+}
+
+function Set-TierCallerFixture {
+  Set-SharedCallerFixture
+  $script:fixture.parameters.configureApim.value=$true
+  foreach($name in @('existingBackendName','appInsightsName','appInsightsResourceGroup')){$script:fixture.parameters[$name]=@{value='test'}}
+  $script:fixture.parameters.callerJwtTiering=@{value=@{
+    entra=@{enabled=$true;mappings=@(@{claimValue='Byok.Standard';tier='byok-standard'})}
+    okta=@{enabled=$false;claimName='byok_tier';mappings=@()}
+  }}
+  $script:fixture.parameters.productTiers=@{value=@(@{name='byok-standard';callsPerMinute=60;tokensPerMinute=100000;monthlyCallQuota=50000})}
+}
+
 try {
   $env:FOUNDRY_API_KEY = ''
+  $env:BYOK_RESPONSE_OWNER_KEY = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+  $env:BYOK_RESPONSE_OWNER_PREVIOUS_KEY = '__none__'
   Invoke-Case 'valid private topology'
   Invoke-Case 'valid private endpoint topology' { Set-PrivateEndpointFixture }
   Invoke-Case 'private endpoint requires explicit mode' { Set-PrivateEndpointFixture; $script:fixture.parameters.Remove('environmentIngressMode') } -ExpectedError 'INTERNAL VNet-integrated'
@@ -164,8 +202,38 @@ try {
     throw 'Backend preflight did not use the active cloud ARM endpoint.'
   }
   if (@($script:commands | Where-Object { $_ -like 'apim product show *' }).Count -ne 2) { throw 'Product reads must be deduplicated.' }
+  Invoke-Case 'shared coexistence existing API' { Set-SharedCallerFixture }
+  Invoke-Case 'shared JWT-only existing API' {
+    Set-SharedCallerFixture
+    $script:fixture.parameters.callerAuthRollout.value='shared'
+    $script:fixture.parameters.callerAuthPreparation.value.keyEnabled=$false
+    $script:api.subscriptionRequired=$false
+  }
+  Invoke-Case 'shared missing policy rejected' { Set-SharedCallerFixture; $script:callerPolicy='<policies />' } -ExpectedError 'already contain'
+  Invoke-Case 'shared wrong native admission rejected' { Set-SharedCallerFixture; $script:api.subscriptionRequired=$false } -ExpectedError 'native api-key'
+  Invoke-Case 'shared colliding JWT product rejected' { Set-SharedCallerFixture; $script:fixture.parameters.existingProductName=@{value='intellij-jwt'} } -ExpectedError 'caller-auth preflight failed'
+  Invoke-Case 'shared owner key in file rejected' { Set-SharedCallerFixture; $script:fixture.parameters.responseOwnerKey=@{value='forbidden'} } -ExpectedError 'caller-auth preflight failed'
+  Invoke-Case 'shared backend credential missing rejected' { Set-SharedCallerFixture; $script:fixture.parameters.foundryAuthMode.value='apiKey' } -ExpectedError 'caller-auth preflight failed'
+  Invoke-Case 'shared backend origin mismatch rejected' {
+    Set-SharedCallerFixture
+    $script:fixture.parameters.configureApim.value=$true
+    foreach($name in @('existingBackendName','appInsightsName','appInsightsResourceGroup')){$script:fixture.parameters[$name]=@{value='test'}}
+    $script:fixture.parameters.existingBackendOrigin.value='https://other.example.test'
+  } -ExpectedError 'must match the selected backend'
+  Invoke-Case 'shared prepared installation validates' {
+    Set-SharedCallerFixture
+    $script:fixture.parameters.configureApim.value=$true
+    foreach($name in @('existingBackendName','appInsightsName','appInsightsResourceGroup')){$script:fixture.parameters[$name]=@{value='test'}}
+  }
+  Invoke-Case 'tiered prepared installation validates' { Set-TierCallerFixture }
+  Invoke-Case 'tiered v2 target rejected' { Set-TierCallerFixture; $script:apim.sku.name='StandardV2' } -ExpectedError 'classic Developer or Premium'
+  Invoke-Case 'tiered reuse without configuration rejected' { Set-TierCallerFixture; $script:fixture.parameters.configureApim.value=$false } -ExpectedError 'caller-auth preflight failed'
+  Invoke-Case 'tier-only legacy input rejected' { Set-TierCallerFixture; $script:fixture.parameters.Remove('callerAuthPreparation'); $script:fixture.parameters.Remove('callerAuthRollout') } -ExpectedError 'caller-auth preflight failed'
+  Invoke-Case 'tiered catalog missing rejected' { Set-TierCallerFixture; $script:fixture.parameters.Remove('productTiers') } -ExpectedError 'caller-auth preflight failed'
   Write-Output "$passed deployment guard tests passed; Azure commands were mocked."
 } finally {
   $env:FOUNDRY_API_KEY = $previousKey
+  $env:BYOK_RESPONSE_OWNER_KEY = $previousOwnerKey
+  $env:BYOK_RESPONSE_OWNER_PREVIOUS_KEY = $previousOwnerPreviousKey
   $global:LASTEXITCODE = $previousExitCode
 }

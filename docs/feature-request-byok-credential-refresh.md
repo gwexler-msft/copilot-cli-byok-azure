@@ -1,6 +1,6 @@
 # BYOK credential refresh: current status and original request
 
-## Current status (2026-09-21)
+## Current status (2026-09-23)
 
 The request was filed as [github/copilot-cli#3682](https://github.com/github/copilot-cli/issues/3682).
 Its issue state was still open when checked on 2026-09-16, but CLI **1.0.85** provider help
@@ -8,17 +8,57 @@ documents `COPILOT_PROVIDER_API_KEY_COMMAND`, a command that prints a credential
 The paired wrappers now support opt-in per-request Azure CLI token acquisition. Local helper,
 wrapper, and real CLI loopback tests passed. An interactive Government VM user also passed
 both Responses and Chat Completions through private APIM using CLI 1.0.85 and the pinned token
-helper against an isolated synthetic fixture. **Model inference and actual-expiry renewal
-testing remain pending**.
+helper against an isolated synthetic fixture. A subsequent continuing-session test passed
+renewal across actual token expiry for both wire formats. Real Responses inference also passed
+with matching persisted token metrics. **Use Responses for GPT-5.6 coding with tools and
+reasoning.** The captured Chat 400 matches Microsoft's documented restriction on that
+combination; the owner selected Responses rather than disabling reasoning for Chat.
 The installed 1.0.75 help did not expose that command. Do not infer capabilities solely from
 issue closure or the bundled CLI version.
 
 | Client | Current evidence | Remaining work for this gateway |
 |---|---|---|
-| CLI 1.0.85 | Government VM Responses/Chat CLI calls passed private APIM with the token helper and synthetic response proofs; local retry and fail-closed tests pass | Real model inference, same-session renewal across actual expiry, utility/discovery requests, MFA and renewal failure |
-| VS Code Custom Endpoint | Static secret-backed `apiKey`; `${apiKey}` interpolation in custom headers | No documented command-based renewal; see [#325811](https://github.com/microsoft/vscode/issues/325811), open when checked |
+| CLI 1.0.85 | Government VM authentication and actual-expiry renewal passed for both formats; real Responses inference and matching persisted token metrics passed; GPT-5.6 tools plus reasoning uses Responses | Utility/discovery requests, MFA and live renewal-failure coverage, Commercial acceptance |
+| CLI Okta credential equivalent | Opt-in PKCE helper, locally signed JWT/refresh/callback fixtures, encrypted cache, Windows keystore round-trip and paired launcher tests | Real Okta policy/MFA/rotation and customer end-to-end acceptance; no live Okta request was made |
+| VS Code CLI-backed agent | Pinned launcher passed local real-CLI HTTPS ACP renewal and failed-helper rejection | Verify the actual editor launch path, private gateway routing, same-session expiry and failure/recovery; ordinary Agent mode and native background/Agent Host bridges are not proof of the configured CLI path |
+| IntelliJ custom Copilot CLI ACP agent | CLI ACP actual-expiry evidence and pinned-launcher HTTPS fixture evidence exist independently of the IDE | Verify IntelliJ launches the intended CLI/version with the pinned credential helper and handles renewal failures |
+| VS Code Custom Endpoint | Static secret-backed `apiKey`; `${apiKey}` interpolation in custom headers | Supported native experience remains per-user APIM subscription keys; native JWT renewal is outside the approved delivery boundary |
 | VS Code built-in Azure provider | Microsoft authentication session obtained per request for Cognitive Services | This scope does not satisfy our custom gateway audience; not a drop-in renewal solution |
-| IntelliJ AI Assistant / other providers | Header and renewal capabilities depend on the provider | Verify token renewal and the proxy's Bearer-to-`api-key` rewrite |
+| IntelliJ native AI Assistant provider | Per-user APIM subscription key through the private Bearer-to-`api-key` proxy | Verify key/proxy regression; native JWT renewal is outside the approved delivery boundary |
+
+### Approved Client Boundary (2026-09-23)
+
+Renewable JWT access is delivered through the configured **GitHub Copilot CLI agent**, including
+its editor integrations. VS Code Custom Endpoint and IntelliJ's native AI Assistant provider remain
+optional **per-user APIM subscription-key** experiences. No new native-provider refresh extension
+or token-injecting adapter is required for this delivery. The underlying model/credential path,
+not the label Chat or Agent in the UI, determines which contract applies.
+
+This is a support decision, not an IDE acceptance pass. Each editor must demonstrably run the
+intended CLI/version and credential command against the private gateway, survive token expiry in
+one continuing session, and fail closed with clear recovery when renewal or reauthentication fails.
+The CLI's independent ACP/expiry results are reusable evidence but do not prove editor launch
+configuration. Gateway package, telemetry, network, rollback and rollout gates remain unchanged.
+The owner explicitly selected **both** VS Code's configured CLI terminal and native Agent/Background
+experience for acceptance, plus IntelliJ custom ACP, using the existing Government VM interactive
+user session. Passing only the terminal is not sufficient for the native UI gate.
+
+The [pinned launcher](../scripts/start-copilot-agent.ps1) and Bash entry point use a nonsecret
+profile with an absolute native executable, workspace, HTTPS gateway and fixed identity/cache.
+They select Responses, clear static provider credentials, disable remote/export and CLI logging,
+and keep ACP stdout protocol-only. On 2026-09-23 all fifteen native CLI wire tests passed,
+including the launcher with strict HTTPS, a mocked Azure CLI and the real CLI 1.0.85: one ACP
+session renewed its credential, then a failed helper produced no provider traffic. Ten profile
+validation cases also passed. No IDE settings were changed and no editor UI acceptance was claimed.
+
+The current [VS Code model documentation](https://code.visualstudio.com/docs/agent-customization/language-models#_bring-your-own-language-model-key)
+enables Agent Host BYOK through `chat.agentHost.byokModels.enabled`, using editor-configured models.
+The inspected [upstream session launcher](https://github.com/microsoft/vscode/blob/b448f61ee36701890853135d7343e98968c26dfd/src/vs/platform/agentHost/node/copilot/copilotSessionLauncher.ts)
+constructs loopback Responses providers from the editor's model bridge, authenticated with a
+session-scoped bridge token. That is not the gateway's Entra access token and does not establish
+use of `COPILOT_PROVIDER_API_KEY_COMMAND`. This source evidence is not a test of the VM's installed
+version. Native Agent/Background JWT renewal remains an explicit gate; no unsupported setting,
+token injection or replacement provider adapter is assumed.
 
 CLI custom headers also ship as `COPILOT_PROVIDER_HEADERS`, despite
 [#3399](https://github.com/github/copilot-cli/issues/3399) still being open when checked.
@@ -28,9 +68,10 @@ was closed; [#320727](https://github.com/microsoft/vscode/issues/320727) remaine
 Current [VS Code documentation](https://code.visualstudio.com/docs/agent-customization/language-models)
 supports `${apiKey}` in `requestHeaders`; the older plaintext-only guidance is superseded.
 
-The gateway still selects key-only or Entra-JWT-only mode per deployment. **Same-endpoint
-key OR Entra JWT OR Okta JWT is planned, not shipped.** Okta requires its own token helper
-and issuer validation; changing IdP does not remove renewal requirements. See
+Current deployments still select key-only or Entra-JWT-only mode. **Same-endpoint key OR Entra
+JWT OR Okta JWT is implemented locally, not shipped.** The opt-in
+[Okta helper](../scripts/okta/README.md) now supplies its own PKCE/secure-refresh implementation;
+it does not enable gateway trust or make static-only IDE providers renewable. See
 [the authentication design](authentication.md) for the full contract, coverage and test gates.
 
 ## Opt-in CLI renewal
@@ -92,10 +133,12 @@ route marker. The test API, local CLI files, and temporary CRL rule were removed
 The TLS-revocation preflight remained enabled and no certificate-validation bypass was added.
 
 This establishes the CLI/helper/private-gateway path for both wire formats in Government.
-Each format used a separate short-lived CLI process and no model backend. It does not prove
-renewal within one continuing CLI session, distinct token issuance, actual expiry, or automatic
-401 recovery. Those gates, model inference, and cross-cloud coexistence acceptance remain open;
-production authentication was not changed.
+Each format initially used a separate short-lived CLI process and no model backend. That first
+check did not prove renewal within one continuing session, actual expiry, or automatic 401
+recovery. The subsequent real-expiry gate below closes the continuing-session renewal check;
+the real-model results are recorded separately below. Automatic 401 recovery and cross-cloud
+coexistence acceptance remain open.
+Production authentication was not changed.
 
 The no-Azure PowerShell and Bash regression suites cover context changes, token failures and
 expiry, stdout hygiene, command quoting, unsupported CLI versions, and credential-source
@@ -111,7 +154,8 @@ node --test scripts/tests/copilot-credential-wire.test.mjs
 ```
 
 The Node suite uses CLI 1.0.85, an isolated configuration directory, offline mode, a loopback
-provider, synthetic rotating credentials, and no available tools. Both Responses and Chat
+provider, synthetic rotating credentials, and tool-denial flags. These flags do not prove that
+the API request contains no tool schemas. Both Responses and Chat
 Completions acquired a new synthetic credential for each HTTP attempt after a 503, and a
 credential-command failure produced zero provider requests. These are mechanism tests, not
 real Entra expiry, automatic 401 recovery, or APIM acceptance. Discovery and every utility
@@ -127,7 +171,7 @@ uses offline mode and a native executable/npm launcher to avoid that downgrade. 
 outer PowerShell launcher did not preserve the CLI's failure exit status; invoke a native
 launcher for automation and use `COPILOT_TEST_EXECUTABLE` when explicit selection is needed.
 
-### Real-expiry gate prepared
+### Real-expiry gate passed
 
 The [persistent session driver](../scripts/copilot-credential-session.mjs) uses ACP to keep one
 CLI 1.0.85 process and session alive for each wire format. The isolated-home, offline local test
@@ -153,8 +197,116 @@ exit, or cleanup failure cannot count as success.
 
 All nine real-CLI loopback tests pass, including simulated-time expiry success, early resume,
 stale metadata, renewal failure and cancellation. The timestamped policies also passed
-Government create/readback/delete validation. These preparation checks are **not live expiry
-acceptance**; the real VM run remains pending.
+Government create/readback/delete validation. These preparation checks alone were not live
+expiry acceptance.
+
+The user subsequently completed the real Government VM run on 2026-09-21. Both wire formats
+passed before expiry, waited 3,579 seconds, and passed after expiry with unchanged processes
+and sessions, one helper call each, renewed-token evidence, and fresh gateway response proofs.
+The CRL allowance was closed while idle and reopened for the final checks. The final summary
+reported `actualExpiryTested=true`, with successful API, local-file, and CRL-rule removal.
+This is live same-session renewal evidence for Government; no model backend was called.
+
+### Bounded inference results
+
+The owner approved small billable model calls through a disposable JWT-only API. Read-only
+Government inventory matched the existing native managed-identity backend and ready
+`gpt-5.6-sol` deployment to both surfaces in the gateway's configured model map. No model
+deployment, production API, backend identity, named value, or network baseline was changed.
+
+The VM checker's separate `-TestInference` mode requires `-TestCopilot` and the approved CRL
+window; it cannot be combined with `-TestExpiry`. It pins the validated caller and model,
+expires after 20 minutes, limits each wire format to one admitted request, caps request bodies
+at 65,536 characters and output at 512 tokens, and disables backend retries. It reuses the JWT
+validator, production body normalization, native routing, and per-user accounting patterns,
+with fixture-specific counters. Automatic model selection and cross-cloud routing are excluded.
+
+Both CLI runs must return the expected short response and report one model request with
+nonzero input/output token counts. Existing Application Insights logging is enabled only for
+the disposable API, with header/body capture and client-IP logging disabled. Successful CLI
+usage evidence is not proof of durable metric ingestion: `telemetryVerified` remains false
+until a separate in-VNet query succeeds. The fixture, local files, and CRL rule are removed
+on both success and failure.
+
+The bounded policies and diagnostic settings passed Government create/readback/delete checks
+without model calls. Real-CLI loopback tests verified the marker header and usage-file fields
+for both wire formats. The interactive Government VM run then produced these results:
+
+| Surface | CLI evidence | Persisted evidence |
+|---|---|---|
+| Responses | Exit 0, one helper invocation, expected response, one model request, 10,491 input and 9 output tokens | Model dependency and frontend 200; token metrics exactly match: 10,491 prompt, 9 completion, 10,500 total |
+| Chat Completions | Exit 1, one helper invocation, no successful model usage reported | Model Chat dependency and frontend 400; request metric present, no token usage metric |
+
+The API, local files, and temporary CRL rule were removed successfully. An in-VNet aggregate
+query selected the most recent CLI fixture in the preceding four hours through the same
+diagnostic-bound Application Insights logger. The operator's query token was CMS-encrypted
+to a temporary VM certificate; the certificate and local transport file were removed. The
+query returned no raw URLs, identities, credentials, request bodies, or response bodies.
+
+The failed Chat row originally reported `backendCalled=false` because usage was absent. That
+inference was wrong: the correlated model dependency proves a backend request returned 400.
+The checker now reports unknown backend contact when no successful usage evidence exists and
+exposes only allowlisted HTTP statuses, error codes, and parameter names. Persisted telemetry
+did not retain the rejection body, so it did not identify the offending field. The later
+response capture below supplied that evidence. No production normalization was changed.
+
+The staged `-InferenceWireApi completions` mode limits a diagnostic retry to the failed wire
+format; it does not repeat Responses. Forty-eight local checker checks pass, including selected
+wire scope, unknown backend contact, diagnostic sanitization, and cleanup. Focused actual-CLI
+loopback tests also prove that a synthetic backend 400 surfaces its parameter name without a
+retry. Local request-shape inspection is mechanism evidence only, not the cause of the live 400.
+**Responses inference and matching token ingestion passed; the failed Chat call is retained
+as negative evidence, not relabeled as a pass.**
+
+The next direct Chat-only attempt still exited 1 with one helper invocation and no classified
+CLI error, while all cleanup passed. Its latest telemetry could not be retrieved through the
+operator's intermittently unavailable management reads, so the earlier confirmed backend 400
+must not be assumed to describe every later attempt. That run did capture a fresh-route
+404 followed by the marked 401 readiness response.
+
+The owner explicitly approved one additional Chat-only diagnostic using the temporary
+[loopback response capture](../scripts/copilot-inference-diagnostic.mjs). The VM checker enables
+it only with `-CaptureInferenceResponse -TestInference -InferenceWireApi completions` and the
+existing explicit Copilot/CRL switches. The listener binds to loopback, forwards at most one
+request to the verified HTTPS fixture without rewriting the body or credential, rejects
+redirects, and emits only allowlisted status/error metadata. Captured bodies and credentials
+are not written to disk or returned in diagnostics. Normal fixture/rule cleanup still applies.
+
+This changes the local client transport for diagnosis only; it is not a production proxy,
+duplicate-header normalization, or a change to production URLs or authentication. Results
+are labeled `routeMode=loopback-diagnostic` and cannot count as direct CLI inference acceptance.
+Fifty local checker checks and focused real-CLI tests for error capture, one-request forwarding,
+redirect rejection and sanitization passed. The completed VM capture forwarded one request and
+received HTTP 400 with `invalid_request_error`, parameter `reasoning_effort`, and an
+unsupported-request classification. All fixture, local-file, and CRL-rule cleanup passed.
+
+### Model limitation and decision
+
+[Microsoft's reasoning-model guidance](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning#tool-calling-with-reasoning-models)
+documents that GPT-5.6 Chat Completions cannot combine function tools with reasoning. Requests
+with tools require `reasoning_effort=none`; omitting the parameter is not a fix because the
+model defaults to `medium`. Responses supports tools with reasoning and is the recommended
+surface for that workflow.
+
+The local CLI request characterization showed tool schemas and `reasoning_effort=medium`,
+matching the captured rejected parameter and the documented restriction. Tool-denial flags
+control execution; they must not be treated as proof that the outgoing `tools` field is empty.
+The live dated backend API version was `2025-04-01-preview`, not an older version predating
+reasoning support. Switching to v1 alone would not remove the documented model restriction.
+
+On 2026-09-21, the owner selected **use Responses and record the Chat limitation**, with no
+further billable Chat attempts. Preserve reasoning and tools; do not silently strip
+`reasoning_effort`, force `none`, remove tools, or deploy a wire-format conversion. No production
+URL, policy, API-version setting, or authentication mode was changed. Chat without reasoning
+was not tested or accepted. Its failed model request does not invalidate the separate successful
+JWT acquisition/renewal checks for both wire formats.
+
+Government Responses inference, matching token ingestion, and same-session renewal remain
+passed within the documented fixture scope. Commercial coverage, utility/discovery paths,
+live renewal-failure/MFA cases and integrated security acceptance remain separate. The owner
+approved a [duplicate-header compatibility exception](authentication.md#approved-compatibility-exception-2026-09-21)
+on 2026-09-21: Microsoft parity is no longer a delivery dependency, but customer clients must
+send exactly one credential and must not rely on duplicate normalization or blindly retry a 401.
 
 ## Historical request and June findings
 

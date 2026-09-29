@@ -1,0 +1,33 @@
+<fragment>
+  <set-variable name="byokResponseOwnerMarkers" value="@{
+    try {
+      if (!context.Variables.ContainsKey(&quot;byokCallerAuthenticated&quot;) || !(bool)context.Variables[&quot;byokCallerAuthenticated&quot;]
+          || !context.Variables.ContainsKey(&quot;callerPrincipalKey&quot;)) { return &quot;&quot;; }
+      var principal = (string)context.Variables[&quot;callerPrincipalKey&quot;];
+      if (string.IsNullOrWhiteSpace(principal)) { return &quot;&quot;; }
+      var keys = new[] { &quot;{{caller-response-owner-key}}&quot;, &quot;{{caller-response-owner-key-previous}}&quot; };
+      var markers = new System.Collections.Generic.List&lt;string&gt;();
+      for (var keyIndex = 0; keyIndex &lt; keys.Length; keyIndex++) {
+        if (keyIndex == 1 &amp;&amp; keys[keyIndex] == &quot;__none__&quot;) { continue; }
+        if (!System.Text.RegularExpressions.Regex.IsMatch(keys[keyIndex], @&quot;\A[A-Za-z0-9+/]{43}=\z&quot;)) { return &quot;&quot;; }
+        var key = Convert.FromBase64String(keys[keyIndex]);
+        if (key.Length != 32 || Convert.ToBase64String(key) != keys[keyIndex]) { return &quot;&quot;; }
+        using (var hmac = new System.Security.Cryptography.HMACSHA256(key)) {
+          var input = System.Text.Encoding.UTF8.GetBytes(&quot;byok-response-owner:v1:&quot; + principal);
+          markers.Add(&quot;v1.&quot; + BitConverter.ToString(hmac.ComputeHash(input)).Replace(&quot;-&quot;, &quot;&quot;).ToLowerInvariant());
+        }
+      }
+      return string.Join(&quot;,&quot;, markers);
+    } catch { return &quot;&quot;; }
+  }" />
+  <choose>
+    <when condition="@(string.IsNullOrEmpty((string)context.Variables[&quot;byokResponseOwnerMarkers&quot;]))">
+      <return-response>
+        <set-status code="503" reason="Response ownership is not configured" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":{"code":"ResponseOwnershipUnavailable","message":"Stored response ownership validation is unavailable."}}</set-body>
+      </return-response>
+    </when>
+  </choose>
+  <set-variable name="byokResponseOwnerMarker" value="@(((string)context.Variables[&quot;byokResponseOwnerMarkers&quot;]).Split(',')[0])" />
+</fragment>

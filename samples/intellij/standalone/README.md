@@ -20,20 +20,82 @@ and records usage under that subscription. Use distinct subscription keys per de
 individual attribution. In Bicep, `foundryAuthMode=managedIdentity` opts into **APIM-to-Foundry**
 managed identity; the default remains `apiKey`. The APIM identity and its Foundry data-plane RBAC
 must already exist. This option creates no proxy identity and does not enable Foundry key auth.
-The Terraform entry point currently supports backend key authentication only.
+Terraform also supports the same explicit backend key or managed-identity selection. Neither path
+grants backend access automatically.
 
-## Caller Authentication Roadmap
+## Shared Caller Authentication
 
-Current standalone inference and discovery require APIM subscription keys. **Same-endpoint
-key OR Entra JWT OR Okta JWT is planned, not implemented**; one credential per request,
-not both. See [the shared authentication design](../../../docs/authentication.md).
+The default remains native APIM subscription keys. Opt-in shared inference, discovery and all four
+stored Responses operations are implemented for Bicep and Terraform; **standalone live acceptance
+is still pending**. See [the shared authentication design](../../../docs/authentication.md) for the
+one-credential contract, independent budgets and rollout gates. Main-gateway evidence does not
+certify this package.
 
-Both standalone policies must gain explicit validation, including discovery which skips
-API inbound. Changes must cover Bicep and Terraform packaging and both VM and Container
-Apps proxy paths. The current Bearer-to-`api-key` proxy does not validate or renew tokens.
-JWT clients need a verified header/renewal mechanism; existing key clients must be unchanged.
-Direct Okta requires custom-authorization-server trust and issuer-qualified user identity.
-APIM-to-Foundry backend key/managed-identity selection remains independent and unchanged.
+Use the same complete `callerAuthPreparation` shape as the main gateway, with a distinct
+`jwtProductId` such as `intellij-jwt`. `enabled=false` and `callerAuthRollout=legacy` are defaults.
+`shared` installs explicit caller/ownership policies; native-key APIs admit JWTs only at the reviewed
+`coexistence` stage, which links a guarded subscription-free product without disabling native key
+validation. Resource names are isolated under `intellij-`. Do not share that namespace across
+different API owners.
+
+Shared mode requires an exact HTTPS account origin in `existingBackendOrigin`, explicit
+`foundryAuthMode=apiKey|managedIdentity`, and stable owner-key inputs from `BYOK_RESPONSE_OWNER_KEY`
+and `BYOK_RESPONSE_OWNER_PREVIOUS_KEY`. Use the explicit previous-key value `__none__` for first
+activation, not a missing setting; retain old keys during rotation while stored objects depend on
+them. Keys must be nonzero canonical base64 for 32 random bytes. Set `FOUNDRY_API_KEY` securely for
+backend key mode. Do not put these values in parameter files, chat or shell history. The paired
+installers validate trust and secret inputs before deployment; current/previous keys are separate
+from caller credentials.
+
+### Group-Assigned JWT Tiers
+
+The default-off [tiering extension](../../../docs/authentication.md#group-assigned-jwt-tiers-in-progress)
+is implemented in source for the Bicep VM/Container Apps, Terraform and wizard packages; live
+acceptance is still pending. It selects per-user limits from validated Entra app roles or an
+administrator-controlled Okta access-token claim, not from APIM portal-group membership.
+
+Bicep and wizard inputs are `callerJwtTiering` plus `productTiers`; Terraform uses
+`caller_jwt_tiering` plus `product_tiers`, with matching nested field names. Reuse the reviewed
+catalog from the existing gateway's owning deployment. This bolt-on does not rewrite the native
+products, assign users or groups, or pool allowances across members. Counters and stored-response
+ownership retain the same stable caller identities.
+
+Regenerate `caller-policies.json` from `caller-policies.bicepparam` before Terraform planning.
+Enabled tiers require a package with `tiering.version=1`, matching issuer trust, shared rollout
+and classic Developer/Premium APIM. Container Apps must use `configureApim=true` to own such a
+change; for `configureApim=false`, manage tier settings through the existing API owner instead.
+Malformed settings and missing catalog/role mappings fail before deployment. Both issuers off
+preserves the prior flat JWT limiter exactly.
+
+Changing the tier does not create a new user counter. Actual quota continuity, stale-token role
+behavior, metric ingestion and rollback require separate live validation and approval. No customer
+Okta or editor acceptance is implied by local mock-provider or compile results.
+
+The proxy now requires nginx's **njs module** to reject raw empty, mixed, duplicate and encoded
+credential sources before Bearer-to-`api-key` translation. It does not authenticate or renew JWTs;
+APIM remains the validator. New VM and pre-baked-image builds use the shared
+[nginx installer](../../../infra/runner-image/install-nginx-njs.sh), pinned to nginx 1.30.5 and
+njs 1.0.1 from nginx's signed HTTPS package repository. Build networks need that repository and
+the distribution package feeds. Do not run this image/bootstrap installer against an existing
+proxy; rebuild air-gapped images before use. Container images need
+`/usr/lib/nginx/modules/ngx_http_js_module.so` and the system CA bundle. Missing dependencies
+fail startup, with no weaker fallback. Standard VM bootstrap stages its proxy configuration until
+the module is installed and stops on any failure before enabling/restarting nginx.
+
+On 2026-09-23, no-push Linux image tests passed 33 selector cases and 88 forwarding/TLS/conflict
+checks across all four configurations per runtime. Tested runtimes were the main nginx 1.25.5
+image, the standalone nginx 1.28.0 image, and the pinned installer on Ubuntu 22.04 and the actual
+runner base. The final installer tests also verify VM bootstrap ordering. No image or proxy was
+published or upgraded. These tests do not replace full proxy-to-APIM, installer or long-stream
+acceptance. The earlier stock-nginx pass did not cover the subsequently discovered empty-header gap.
+
+[Okta credential tooling](../../../scripts/okta/README.md) is implemented with fixture tests and
+Windows keystore verification. Real Okta, actual IntelliJ custom CLI ACP agent renewal, long streams
+and deployment rollback still require acceptance. Native IntelliJ AI Assistant keeps per-user
+subscription keys; the renewable JWT route uses the configured native CLI agent, not this proxy
+as a renewal service. Existing native-key workflows remain available. Before rollback, detach
+JWT product links, retain ownership keys/policies for retained Responses, and review Terraform
+deletes or Bicep's retained conditional operations explicitly.
 
 > **Status: BUILT — end-to-end validated against a pilot (2026-07-08).** Agreed design (**Option A**).
 > The APIM pack + Foundry path is proven (`/v1/models` and `/v1/chat/completions` return `200` through
@@ -41,8 +103,8 @@ APIM-to-Foundry backend key/managed-identity selection remains independent and u
 
 A self-contained deployment an operator runs against a **customer tenant** to add **JetBrains
 AI Assistant (IntelliJ)** BYOK support to an **existing Internal APIM that already fronts Foundry**.
-It carries **none** of the main repo's stack (no runner, register app, VPN, gov/comm harness, jwt,
-managed identity, private DNS, reconciler).
+It does not deploy the main stack's runner, register app, VPN, backend identity, private DNS or
+reconciler. Shared caller policies are an explicit optional dependency, not a second gateway stack.
 
 **Design in one line:** one small **Linux VM running nginx on a static private IP** + a **dedicated
 `/intellij` API + policy** added to the existing APIM. Nothing else.

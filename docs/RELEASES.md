@@ -13,9 +13,73 @@ Version history for the Copilot BYOK → private Azure OpenAI/Foundry gateway. F
 > the foundational work (285 commits from 2026-05-30). Per-commit detail lives in `git log`.
 > From `1.1.0` onward, each change is recorded under its version as it lands.
 
+## Customer Preview — 2026-09-29
+
+This is an engineering evaluation snapshot, not a production-readiness, compliance or support
+certification. Private development history, live identifiers, internal release tooling and
+unfinished local changes are not part of the public package. Internal issue numbers in older
+entries are historical references, not links to a public issue tracker.
+
+### Included And Verified
+
+- Improved paired PowerShell/Bash CLI onboarding, tenant/cloud validation, explicit login recovery
+  and the implemented per-request credential helper. Offline tests cover cache isolation and
+  acquisition/refresh failures without logging tokens.
+- Azure CLI OIDC refresh before five long-running deployment boundaries. Development jobs have
+  a 70-minute limit; the verified runner lifetime was 75 minutes. A single phase exceeding the
+  access-token lifetime is not covered by boundary refresh alone.
+- Initial deployment and scheduled redeployment succeeded in controlled Commercial and Government
+  development environments. Each run passed 33 smoke checks with zero failures: 16 Government,
+  17 Commercial. Optional commercial-only routing was skipped in both environments; the undeployed
+  Anthropic route was also skipped in Government.
+- Both runs passed registration/auth/RBAC, provisioning roundtrip, two-key chat, Responses
+  operations, token limiting, classifier routing, and ordinary/streamed token metrics. Current
+  readiness markers and scoped managed-identity role assignments were verified afterward.
+- The deployed code passed all seven source CI jobs. Subsequent source changes were documentation
+  and example client settings only; the sanitized public package has its own local validation.
+
+### Acceptance Limits
+
+- Successful dev smoke tests do not certify production sizing, customer topology, Government
+  compliance, every optional provider/model, or desktop/editor integration.
+- End-to-end long-running client renewal, two-user JWT tier isolation and quota continuity,
+  group changes across refreshed tokens, and retained-object rollback remain separate live tests.
+- Okta customer acceptance is pending. Do not present fixture/unit tests as a customer-tenant
+  interoperability result or enable an issuer without explicit trust review.
+- Full-stack ARM what-if was incomplete: nested deployments were short-circuited and two diagnostics
+  remained unclassified. A documented, specifically approved CI-only recovery used unchanged
+  infrastructure inputs plus live health/RBAC checks; this is not a general preview bypass.
+- Internal plans, release tooling, unfinished JWT-tier runner work and both new leadership Word
+  documents are excluded. The Word documents require sharing/metadata review; no sensitivity label
+  was removed to create this package.
+- Example client settings are reviewable starting values, not a guaranteed fleet-enforcement
+  policy. Preserve existing organizational controls and verify effective settings on supported
+  client versions. This snapshot does not introduce a new software license.
+
 ## [Unreleased]
 
+### Added
+- Optional Entra renewal tracing through `BYOK_TOKEN_TRACE_FILE` in the paired credential helpers.
+  Records only event and UTC observation/expiry timestamps; never tokens, claims or caller identity.
+  PowerShell and Bash regressions cover reuse, newer expiry, acquisition failure and trace-write
+  failure without changing credential stdout. Actual VM/client acceptance remains separate.
+- Isolated private-client access preview and guarded session tooling, with lifecycle hold checks,
+  private recovery journals, reviewed resource-write receipts and conditional disconnect-first
+  rollback. Includes offline interruption regressions and a pinned ARM security-scan CI job.
+  This is optional validation infrastructure, not a required customer topology. Live network,
+  editor/client, package and customer release acceptance remain pending.
+
 ### Fixed
+- Correct APIM caller-rollout verification for omitted fragment format, write-only API type and
+  raw C# policy expressions. Read-only, original-artifact-bound reconciliation can verify an
+  already-applied deployment before matching finalization, without repeating activation. The
+  repair passed 249 CI cases and control-plane verification in both dev clouds
+  (#151). The later guarded
+  manual pilot path passed 337 cases and both approved pilot rollouts completed; actual client,
+  package and retained-object rollback acceptance remain separate gates
+  (#153).
+- Reconcile customer authentication guidance with committed credential-command support, completed
+  pilot control-plane rollout, safe key-only defaults and separately supplied customer trust/secrets.
 - Strip Copilot's top-level `snippy` service extension before forwarding Chat Completions or
   Responses requests to native Azure OpenAI / Foundry endpoints, which reject it as an
   unrecognized argument. The Responses auto-route smoke probe now exercises this client shape.

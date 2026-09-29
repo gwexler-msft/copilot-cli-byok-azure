@@ -30,12 +30,12 @@
 # Must be recent enough for GitHub's message-broker (broker.actions.githubusercontent.com):
 # older runners (e.g. 2.319.1) get HTTP 403 from the broker after BrokerMigration and exit
 # before receiving a job, so keep this at/near the latest release.
-ARG RUNNER_VERSION=2.335.1
+ARG RUNNER_VERSION=2.337.0
 FROM ghcr.io/actions/actions-runner:${RUNNER_VERSION}
 
 # Tool versions — pinned for deterministic rebuilds. Bump to patch.
 ARG DOTNET_CHANNEL=10.0
-ARG BICEP_VERSION=v0.30.23
+ARG BICEP_VERSION=v0.44.1
 ARG GH_VERSION=2.95.0
 
 # The base image runs as the unprivileged `runner` user; switch to root to install the
@@ -55,6 +55,11 @@ RUN apt-get update \
       apt-transport-https \
       gnupg \
       lsb-release \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY install-nginx-njs.sh /tmp/install-nginx-njs.sh
+RUN bash /tmp/install-nginx-njs.sh \
+ && rm -f /tmp/install-nginx-njs.sh \
  && rm -rf /var/lib/apt/lists/*
 
 # Azure CLI (system-wide, /opt/az + /usr/bin/az). Pulled from packages.microsoft.com.

@@ -1,0 +1,42 @@
+<fragment>
+  <set-variable name="byokPreparedResponseRequest" value="@{
+    try {
+      if (!context.Variables.ContainsKey(&quot;byokCallerAuthenticated&quot;) || !(bool)context.Variables[&quot;byokCallerAuthenticated&quot;]
+          || !context.Variables.ContainsKey(&quot;byokResponseOwnerMarker&quot;)) { return &quot;&quot;; }
+      var marker = (string)context.Variables[&quot;byokResponseOwnerMarker&quot;];
+      if (!System.Text.RegularExpressions.Regex.IsMatch(marker, @&quot;\Av1\.[0-9a-f]{64}\z&quot;)) { return &quot;&quot;; }
+      var body = context.Request.Body?.As&lt;Newtonsoft.Json.Linq.JObject&gt;(preserveContent: true);
+      if (body == null) { return &quot;&quot;; }
+      var previous = body[&quot;previous_response_id&quot;];
+      if (previous != null &amp;&amp; previous.Type != Newtonsoft.Json.Linq.JTokenType.Null
+          &amp;&amp; (previous.Type != Newtonsoft.Json.Linq.JTokenType.String
+          || !System.Text.RegularExpressions.Regex.IsMatch((string)previous, @&quot;\Aresp_[A-Za-z0-9_-]{1,128}\z&quot;))) { return &quot;&quot;; }
+      var conversation = body[&quot;conversation&quot;];
+      if (conversation != null &amp;&amp; conversation.Type != Newtonsoft.Json.Linq.JTokenType.Null) { return &quot;&quot;; }
+      var input = body[&quot;input&quot;] as Newtonsoft.Json.Linq.JArray;
+      if (input != null &amp;&amp; input.OfType&lt;Newtonsoft.Json.Linq.JObject&gt;().Any(item =&gt; (string)item[&quot;type&quot;] == &quot;item_reference&quot;)) { return &quot;&quot;; }
+      var metadataValue = body[&quot;metadata&quot;];
+      var metadata = metadataValue as Newtonsoft.Json.Linq.JObject;
+      if (metadataValue != null &amp;&amp; metadataValue.Type != Newtonsoft.Json.Linq.JTokenType.Null &amp;&amp; metadata == null) { return &quot;&quot;; }
+      if (metadata == null) { metadata = new Newtonsoft.Json.Linq.JObject(); }
+      metadata.Remove(&quot;byok_owner_v1&quot;);
+      if (metadata.Count &gt; 15 || metadata.Properties().Any(property =&gt; property.Name.Length &gt; 64
+          || property.Value.Type != Newtonsoft.Json.Linq.JTokenType.String || ((string)property.Value).Length &gt; 512)) { return &quot;&quot;; }
+      metadata[&quot;byok_owner_v1&quot;] = marker;
+      body[&quot;metadata&quot;] = metadata;
+      return body.ToString(Newtonsoft.Json.Formatting.None);
+    } catch { return &quot;&quot;; }
+  }" />
+  <choose>
+    <when condition="@(string.IsNullOrEmpty((string)context.Variables[&quot;byokPreparedResponseRequest&quot;]))">
+      <return-response>
+        <set-status code="400" reason="Invalid stored response request" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":{"code":"ResponseOwnershipInputInvalid","message":"Use a response ID owned by this caller and at most 15 custom metadata entries. Conversation and standalone item references require separate ownership support."}}</set-body>
+      </return-response>
+    </when>
+  </choose>
+  <set-variable name="byokResponseReference" value="@((string)Newtonsoft.Json.Linq.JObject.Parse((string)context.Variables[&quot;byokPreparedResponseRequest&quot;])[&quot;previous_response_id&quot;] ?? &quot;&quot;)" />
+  <set-body>@((string)context.Variables["byokPreparedResponseRequest"])</set-body>
+  <set-variable name="byokPreparedResponseRequest" value="" />
+</fragment>

@@ -1,5 +1,8 @@
 targetScope = 'subscription'
 
+import { callerJwtTieringConfig } from './modules/apim-caller-auth.bicep'
+import { registerRoleAssignmentReference } from './modules/apim-register-role-assignment.bicep'
+
 @description('Short prefix used in all resource names. Lowercase, alpha-only.')
 param namePrefix string = 'copilot-byok'
 
@@ -247,6 +250,66 @@ param autoRouteClassifierEnabled bool = false
 ])
 param authMode string = 'subscriptionKey'
 
+@sealed()
+type callerOktaTrustConfig = {
+  enabled: bool
+  issuer: string
+  openIdConfigUrl: string
+  audience: string
+  requiredScope: string
+  clientIds: string[]
+}
+
+@sealed()
+@export()
+type callerAuthPreparationConfig = {
+  enabled: bool
+  keyEnabled: bool
+  entraEnabled: bool
+  entraClientIds: string[]
+  oktaTrust: callerOktaTrustConfig
+  jwtProductId: string
+}
+
+@description('Preparation only: create shared caller-auth named values and fragments without binding them to APIs or changing legacy authMode admission/accounting. Disabled by default. Enabled Entra reuses the cloud, tenant, audience and scope below; Okta is independently opt-in. Requires the pre-provision trust checks. Consumer integration and guarded JWT product association are separate rollout gates.')
+param callerAuthPreparation callerAuthPreparationConfig = {
+  enabled: false
+  keyEnabled: authMode == 'subscriptionKey'
+  entraEnabled: authMode == 'jwt'
+  entraClientIds: []
+  oktaTrust: {
+    enabled: false
+    issuer: ''
+    openIdConfigUrl: ''
+    audience: ''
+    requiredScope: ''
+    clientIds: []
+  }
+  jwtProductId: 'byok-jwt'
+}
+
+@description('Explicit rollout state. legacy preserves existing authentication. shared binds auth/accounting/owned Responses without adding open-product links. coexistence additionally links the guarded JWT product after consumer policies. Anthropic remains on legacy authMode. Rollback must detach JWT product links before reverting policies.')
+@allowed(['legacy', 'shared', 'coexistence'])
+param callerAuthRollout string = 'legacy'
+
+@description('Opt-in per-user JWT tiers selected after issuer validation. Both providers default off. Enabled tiering requires shared rollout, matching issuer trust and an explicit reviewed productTiers catalog; group/role assignments are separate administrator operations.')
+param callerJwtTiering callerJwtTieringConfig = {
+  entra: { enabled: false, mappings: [] }
+  okta: { enabled: false, claimName: 'byok_tier', mappings: [] }
+}
+
+@description('Stable base64 32-byte response-ownership key. Required for shared/coexistence rollout. Supply through CI secrets or a secure parameter reference, never source control or chat.')
+@secure()
+param responseOwnerKey string = ''
+
+@description('Previous response ownership key retained during rotation; empty when no previous key exists.')
+@secure()
+param responseOwnerPreviousKey string = ''
+
+var sharedCallerAuth = callerAuthRollout != 'legacy'
+var effectiveOpenAiAuthMode = sharedCallerAuth ? (callerAuthPreparation.keyEnabled ? 'subscriptionKey' : 'jwt') : authMode
+var nativeKeysAccepted = effectiveOpenAiAuthMode == 'subscriptionKey' || (deployAnthropicRoute && authMode == 'subscriptionKey')
+
 @description('Entra tenant ID that issues developer JWTs.')
 param entraTenantId string
 
@@ -274,7 +337,7 @@ param testSubscriptions array = [
   }
 ]
 
-@description('Rate-limit product tiers (subscriptionKey mode). Each becomes a published APIM product with a product-scope throttle policy: callsPerMinute (burst), tokensPerMinute (the AI-cost guard), monthlyCallQuota (hard 30-day call ceiling). Group developers by assigning their subscription to a tier.')
+@description('Shared tier catalog. Native product policies and explicitly enabled JWT tier selection use these same callsPerMinute, tokensPerMinute and monthlyCallQuota values. Native key users select a tier through product-scoped subscriptions; JWT users require a validated configured entitlement. Counters remain per individual, not pooled per tier.')
 param productTiers array = [
   {
     name: 'byok-standard'
@@ -294,13 +357,20 @@ param productTiers array = [
   }
 ]
 
-@description('jwt mode: the SINGLE flat per-developer burst limit (calls/min), keyed on Entra oid. Applies only when authMode=jwt; subscriptionKey mode uses productTiers instead.')
+var callerTierCatalog = callerJwtTiering.entra.enabled || callerJwtTiering.okta.enabled ? map(productTiers, tier => {
+  name: tier.name
+  callsPerMinute: tier.callsPerMinute
+  tokensPerMinute: tier.tokensPerMinute
+  monthlyCallQuota: tier.monthlyCallQuota
+}) : []
+
+@description('Flat per-user JWT burst limit when issuer tiering is disabled. Native subscription callers retain product limits.')
 param jwtDefaultCallsPerMinute int = 120
 
-@description('jwt mode: the SINGLE flat per-developer token-per-minute limit (prompt+completion), keyed on Entra oid. The real AI-cost guard. Applies only when authMode=jwt. Sized to match byok-power so a single VS Code Copilot Chat request with full codebase context (typically 30-80k tokens) fits inside one minute.')
+@description('Flat per-user JWT prompt/completion TPM ceiling when issuer tiering is disabled. Enabled tiers use the shared productTiers catalog; this is a ceiling, not a backend capacity reservation.')
 param jwtDefaultTokensPerMinute int = 200000
 
-@description('jwt mode: the SINGLE flat per-developer hard monthly call ceiling (calls per 30 days), keyed on Entra oid. Applies only when authMode=jwt.')
+@description('Flat per-user JWT call ceiling per fixed 30-day period when issuer tiering is disabled. Tier selection must preserve the existing principal counter and quota window.')
 param jwtDefaultMonthlyCallQuota int = 200000
 
 @description('Content-filter (responsible-AI) policy name applied to model deployments. byok-coding = the shipped default (severityThreshold=Low on all four harm categories + Jailbreak in annotate-only mode + Protected Material Text; authored automatically from scripts/content-filter.byok-coding.json). byok-strict swaps Jailbreak to blocking and is the right choice for stricter clients whose prompts do not trip Prompt Shields (authored from scripts/content-filter.byok-strict.json). Set to a built-in Microsoft.* name (e.g. Microsoft.DefaultV2) to use the platform default with no custom policy — note that Microsoft.DefaultV2 has blocking Jailbreak and will reject VS Code Copilot system prompts with 400 content_filter.')
@@ -454,6 +524,14 @@ param ghMaxRunners int = 5
 
 @description('Deploy the self-serve register app stack (UAMI + custom APIM-subscription role + external ACA env + Container App + optional Easy Auth). Default false. Set true to add it idempotently.')
 param deployRegisterApp bool = false
+
+@description('Existing register assignment resolved by the read-only pre-provision hook. Keep its verified principal/scope/role binding together; an empty reference creates a principal-bound assignment.')
+param existingRegisterRoleAssignment registerRoleAssignmentReference = {
+  name: ''
+  principalId: ''
+  scope: ''
+  roleDefinitionId: ''
+}
 
 @description('Container image the register app runs. Empty (default) uses the .NET ASP.NET sample (listens on 8080) so the first provision yields a healthy revision before the Blazor image is built. CI re-supplies the tag `azd deploy` produced on the follow-up provision, otherwise that provision would revert the app to the sample.')
 param registerAppImage string = ''
@@ -865,6 +943,40 @@ module apimNamedValues 'modules/apim-named-values.bicep' = {
   }
 }
 
+module apimCallerAuth 'modules/apim-caller-auth.bicep' = if (callerAuthPreparation.enabled) {
+  name: 'apim-caller-auth'
+  scope: rg
+  params: {
+    apimName: apim.outputs.apimName
+    keyEnabled: callerAuthPreparation.keyEnabled
+    entraLoginHost: v.entraLoginHost
+    entraTrust: {
+      enabled: callerAuthPreparation.entraEnabled
+      tenantId: entraTenantId
+      issuer: 'https://${v.entraLoginHost}/${entraTenantId}/v2.0'
+      clientIds: callerAuthPreparation.entraClientIds
+    }
+    oktaTrust: callerAuthPreparation.oktaTrust
+    jwtProductId: callerAuthPreparation.jwtProductId
+    namedValueIds: apimNamedValues.outputs.namedValueIds
+    jwtTiering: callerJwtTiering
+    tierCatalog: callerTierCatalog
+  }
+}
+
+module apimResponseOwnership 'modules/apim-response-ownership.bicep' = if (sharedCallerAuth) {
+  name: 'apim-response-ownership'
+  scope: rg
+  params: {
+    apimName: apim.outputs.apimName
+    responseOwnerKey: responseOwnerKey
+    responseOwnerPreviousKey: responseOwnerPreviousKey
+    backendOrigins: map(apimBackends.outputs.responseStores, store => store.origin)
+    responseStores: apimBackends.outputs.responseStores
+    callerAuthFragmentIds: apimCallerAuth.?outputs.fragmentIds ?? []
+  }
+}
+
 module apimFoundryApi 'modules/apim-foundry-api.bicep' = if (deployFoundry) {
   name: 'apim-foundry-api'
   scope: rg
@@ -872,14 +984,19 @@ module apimFoundryApi 'modules/apim-foundry-api.bicep' = if (deployFoundry) {
     apimName: apim.outputs.apimName
     #disable-next-line BCP318 // guarded by the module's own if (deployFoundry)
     foundryPrivateBaseUrl: deployFoundry ? foundry.outputs.foundryPrivateBaseUrl : ''
-    authMode: authMode
+    authMode: effectiveOpenAiAuthMode
     namedValueIds: apimNamedValues.outputs.namedValueIds
+    sharedDiscoveryAuth: sharedCallerAuth
+    sharedInferenceAuth: sharedCallerAuth
+    callerAuthFragmentIds: sharedCallerAuth ? (apimCallerAuth.?outputs.fragmentIds ?? []) : []
+    responseOwnershipFragmentIds: apimResponseOwnership.?outputs.fragmentIds ?? []
   }
   // The Foundry API uses path 'openai'. On environments upgraded from an earlier layout the
   // AOAI API may still occupy 'openai' before it is re-pathed to 'aoai'; deploy AOAI first so
   // 'openai' is free, avoiding "Cannot create API ... with the same Path" collisions.
   dependsOn: [
     apimAoaiApi
+    #disable-next-line no-unnecessary-dependson
     apimBackends
   ]
 }
@@ -915,10 +1032,14 @@ module apimAoaiApi 'modules/apim-aoai-api.bicep' = if (deployAoai) {
     apimName: apim.outputs.apimName
     #disable-next-line BCP318 // guarded by the module's own if (deployAoai)
     aoaiPrivateBaseUrl: deployAoai ? aoai.outputs.aoaiPrivateBaseUrl : ''
-    authMode: authMode
+    authMode: effectiveOpenAiAuthMode
     namedValueIds: apimNamedValues.outputs.namedValueIds
+    sharedInferenceAuth: sharedCallerAuth
+    callerAuthFragmentIds: sharedCallerAuth ? (apimCallerAuth.?outputs.fragmentIds ?? []) : []
+    responseOwnershipFragmentIds: apimResponseOwnership.?outputs.fragmentIds ?? []
   }
   dependsOn: [
+    #disable-next-line no-unnecessary-dependson
     apimBackends
   ]
 }
@@ -928,7 +1049,7 @@ module apimAoaiApi 'modules/apim-aoai-api.bicep' = if (deployAoai) {
 // apim-foundry-api.bicep + policies/byok-foundry-models-policy*.xml. The former dedicated
 // 'copilot-byok-discovery' API + 'byok-discovery' product were consolidated away (they
 // duplicated the same list); the CI smoke runner asserts /openai/v1/models with a tier key.
-module apimProducts 'modules/apim-products.bicep' = if (authMode == 'subscriptionKey' && deployTestSubscriptions) {
+module apimProducts 'modules/apim-products.bicep' = if (nativeKeysAccepted && deployTestSubscriptions) {
   name: 'apim-products'
   scope: rg
   params: {
@@ -950,7 +1071,7 @@ module apimProducts 'modules/apim-products.bicep' = if (authMode == 'subscriptio
   ]
 }
 
-module apimSubscriptions 'modules/apim-subscriptions.bicep' = if (authMode == 'subscriptionKey' && deployTestSubscriptions) {
+module apimSubscriptions 'modules/apim-subscriptions.bicep' = if (nativeKeysAccepted && deployTestSubscriptions) {
   name: 'apim-subscriptions'
   scope: rg
   params: {
@@ -961,6 +1082,18 @@ module apimSubscriptions 'modules/apim-subscriptions.bicep' = if (authMode == 's
   dependsOn: [
     apimProducts
   ]
+}
+
+module apimJwtProduct 'modules/apim-jwt-product.bicep' = if (callerAuthPreparation.enabled) {
+  name: 'apim-jwt-product'
+  scope: rg
+  params: {
+    apimName: apim.outputs.apimName
+    productId: callerAuthPreparation.jwtProductId
+    active: callerAuthRollout == 'coexistence' && callerAuthPreparation.keyEnabled && (callerAuthPreparation.entraEnabled || callerAuthPreparation.oktaTrust.enabled)
+    apiNames: concat(deployFoundry ? ['copilot-byok-foundry'] : [], deployAoai ? ['copilot-byok-aoai'] : [])
+    consumerPolicyIds: concat(apimFoundryApi.?outputs.callerPolicyIds ?? [], apimAoaiApi.?outputs.callerPolicyIds ?? [])
+  }
 }
 
 // The APIM managed identity needs the OpenAI User role on EVERY backend account it calls.
@@ -1168,6 +1301,7 @@ module registerRole 'modules/apim-register-role.bicep' = if (deployRegisterApp) 
     suffix: suffix
     location: location
     apimName: apim.outputs.apimName
+    existingRoleAssignment: existingRegisterRoleAssignment
   }
 }
 
@@ -1366,7 +1500,7 @@ output AZURE_CONTAINER_REGISTRY_ENDPOINT string = deployRegisterApp ? registerAc
 
 @description('Test APIM subscription IDs created in subscriptionKey mode. Fetch each key: az apim subscription show -g <rg> --service-name <apim> --sid <id> --query primaryKey -o tsv')
 #disable-next-line BCP318 // guarded by the same condition as the module's if()
-output testSubscriptionIds array = (authMode == 'subscriptionKey' && deployTestSubscriptions) ? apimSubscriptions.outputs.subscriptionIds : []
+output testSubscriptionIds array = (nativeKeysAccepted && deployTestSubscriptions) ? apimSubscriptions.outputs.subscriptionIds : []
 
 @description('Self-hosted GitHub Actions runner UAMI name (empty when deployGhRunner=false). Used by phase 2 (#53) to attach federated credentials.')
 #disable-next-line BCP318 // guarded by deployGhRunner

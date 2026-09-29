@@ -1,0 +1,42 @@
+<fragment>
+  <set-variable name="byokCallerAccountingMode" value="@{
+    if (!context.Variables.ContainsKey(&quot;byokCallerAuthenticated&quot;) || !(bool)context.Variables[&quot;byokCallerAuthenticated&quot;]
+        || (context.Variables.ContainsKey(&quot;byokCallerAccountingApplied&quot;) &amp;&amp; (bool)context.Variables[&quot;byokCallerAccountingApplied&quot;])) { return &quot;invalid&quot;; }
+    foreach (var name in new[] { &quot;callerAuthMethod&quot;, &quot;callerIssuer&quot;, &quot;callerSubject&quot;, &quot;callerPrincipalKey&quot; }) {
+      if (!context.Variables.ContainsKey(name) || string.IsNullOrWhiteSpace((string)context.Variables[name])) { return &quot;invalid&quot;; }
+    }
+    var method = (string)context.Variables[&quot;callerAuthMethod&quot;];
+    var issuer = (string)context.Variables[&quot;callerIssuer&quot;];
+    var subject = (string)context.Variables[&quot;callerSubject&quot;];
+    var expectedPrincipal = method + &quot;:&quot; + issuer.Length + &quot;:&quot; + issuer + &quot;:&quot; + subject;
+    if ((string)context.Variables[&quot;callerPrincipalKey&quot;] != expectedPrincipal) { return &quot;invalid&quot;; }
+    if (method == &quot;subscriptionKey&quot;) {
+      return issuer == &quot;apim&quot; &amp;&amp; context.Subscription != null &amp;&amp; subject == context.Subscription.Id ? &quot;native&quot; : &quot;invalid&quot;;
+    }
+    return (method == &quot;entraJwt&quot; || method == &quot;oktaJwt&quot;)
+        &amp;&amp; context.Variables.ContainsKey(&quot;byokJwtValidated&quot;) &amp;&amp; (bool)context.Variables[&quot;byokJwtValidated&quot;] ? &quot;jwt&quot; : &quot;invalid&quot;;
+  }" />
+  <choose>
+    <when condition="@((string)context.Variables[&quot;byokCallerAccountingMode&quot;] == &quot;invalid&quot;)">
+      <return-response>
+        <set-status code="401" reason="Validated caller accounting required" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":{"code":"CallerAccountingInvalid","message":"Caller authentication must establish one accounting identity."}}</set-body>
+      </return-response>
+    </when>
+    <when condition="@((string)context.Variables[&quot;byokCallerAccountingMode&quot;] == &quot;jwt&quot;)">
+      <rate-limit-by-key calls="{{jwt-calls-per-minute}}" renewal-period="60"
+                         counter-key="@((string)context.Variables[&quot;callerPrincipalKey&quot;])"
+                         increment-condition="@(context.Response.StatusCode == 200)"
+                         remaining-calls-header-name="x-byok-calls-remaining" />
+      <azure-openai-token-limit tokens-per-minute="{{jwt-tokens-per-minute}}"
+                                counter-key="@((string)context.Variables[&quot;callerPrincipalKey&quot;])"
+                                estimate-prompt-tokens="true"
+                                remaining-tokens-header-name="x-byok-tokens-remaining"
+                                tokens-consumed-header-name="x-byok-tokens-consumed" />
+      <quota-by-key calls="{{jwt-monthly-call-quota}}" renewal-period="2592000"
+                    counter-key="@((string)context.Variables[&quot;callerPrincipalKey&quot;])" />
+    </when>
+  </choose>
+  <set-variable name="byokCallerAccountingApplied" value="@(true)" />
+</fragment>

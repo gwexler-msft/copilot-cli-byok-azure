@@ -160,3 +160,13 @@ output aoaiBackendId string = aoaiEnabled ? (aoaiPooled ? 'aoai-pool' : 'aoai') 
 
 @description('Backend-id the Commercial Foundry API policy + the default /openai commercialModels branch target. The backend is always created (placeholder URL when off), so this is always populated.')
 output foundryCommercialBackendId string = 'foundry-commercial'
+
+func endpointOrigin(endpoint string) string => take(uri(endpoint, '/'), length(uri(endpoint, '/')) - 1)
+
+var foundryResponseStores = [for (url, index) in foundryBaseUrls: { origin: endpointOrigin(url), backendId: index == 0 ? 'foundry' : 'foundry-r${index}', kind: 'foundry' }]
+var aoaiResponseStores = [for (url, index) in aoaiBaseUrls: { origin: endpointOrigin(url), backendId: index == 0 ? 'aoai' : 'aoai-r${index}', kind: 'aoai' }]
+output responseStores array = concat(
+  foundryResponseStores,
+  aoaiResponseStores,
+  empty(foundryCommercialUrl) ? [] : [{ origin: endpointOrigin(foundryCommercialUrl), backendId: 'foundry-commercial', kind: 'commercial' }]
+)

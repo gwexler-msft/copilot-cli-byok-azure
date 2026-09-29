@@ -13,7 +13,7 @@ param environmentName string
 @description('Resource group of the existing environment, in this subscription.')
 param environmentResourceGroup string
 
-@description('Approved nginx image with /etc/nginx/conf.d and the system CA bundle. Must be anonymously pullable from the environment.')
+@description('Approved nginx image with ngx_http_js_module.so, /etc/nginx/conf.d and the system CA bundle. Must be anonymously pullable from the environment.')
 param proxyImage string
 
 param apimPrivateIp string
@@ -30,6 +30,7 @@ resource environment 'Microsoft.App/managedEnvironments@2024-03-01' existing = {
 }
 
 var nginxConf = replace(replace(replace(loadTextContent('../nginx.containerapp.conf'), '__APIM_PRIVATE_IP__', apimPrivateIp), '__APIM_GATEWAY_HOST__', apimGatewayHost), '__INTELLIJ_API_PATH__', intellijApiPath)
+var credentialGuard = loadTextContent('../nginx-credentials.mjs')
 
 resource proxy 'Microsoft.App/containerApps@2024-03-01' = {
   name: proxyAppName
@@ -41,6 +42,8 @@ resource proxy 'Microsoft.App/containerApps@2024-03-01' = {
       secrets: [
         #disable-next-line use-secure-value-for-secure-inputs
         { name: 'nginx-config', value: nginxConf }
+        #disable-next-line use-secure-value-for-secure-inputs
+        { name: 'nginx-credentials', value: credentialGuard }
       ]
       ingress: {
         external: privateEnvironmentValidated
@@ -54,8 +57,10 @@ resource proxy 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'nginx'
           image: proxyImage
+          command: ['nginx']
+          args: ['-g', 'load_module /usr/lib/nginx/modules/ngx_http_js_module.so; daemon off;']
           env: [
-            { name: 'NGINX_CONFIG_VERSION', value: uniqueString(nginxConf) }
+            { name: 'NGINX_CONFIG_VERSION', value: uniqueString(nginxConf, credentialGuard) }
           ]
           resources: {
             cpu: json('0.25')
@@ -84,6 +89,7 @@ resource proxy 'Microsoft.App/containerApps@2024-03-01' = {
           storageType: 'Secret'
           secrets: [
             { secretRef: 'nginx-config', path: 'default.conf' }
+            { secretRef: 'nginx-credentials', path: 'nginx-credentials.mjs' }
           ]
         }
       ]

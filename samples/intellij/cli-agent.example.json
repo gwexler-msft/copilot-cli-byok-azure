@@ -1,0 +1,12 @@
+{
+  "cliExecutable": "<ABSOLUTE_NATIVE_COPILOT_EXECUTABLE>",
+  "gatewayUrl": "https://<GATEWAY_HOST>/openai",
+  "model": "<MODEL_DEPLOYMENT>",
+  "authMode": "jwt",
+  "appId": "<CLIENT_ID>",
+  "cloud": "AzureUSGovernment",
+  "tenantId": "<TENANT_ID>",
+  "accountName": "<EXPECTED_SIGNED_IN_ACCOUNT>",
+  "azureConfigDirectory": "<ABSOLUTE_PINNED_AZURE_CONFIG_DIRECTORY>",
+  "workspace": "<ABSOLUTE_WORKSPACE_PATH>"
+}

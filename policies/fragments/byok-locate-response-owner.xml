@@ -1,0 +1,54 @@
+<fragment>
+  <set-variable name="byokResponseStores" value="{{caller-response-stores}}" />
+  <set-variable name="byokResponseStoresValid" value="@{
+    try {
+      var stores = Newtonsoft.Json.Linq.JArray.Parse((string)context.Variables[&quot;byokResponseStores&quot;]);
+      if (stores.Count == 0 || stores.Count &gt; 8) { return false; }
+      var identifiers = new System.Collections.Generic.HashSet&lt;string&gt;(StringComparer.OrdinalIgnoreCase);
+      var origins = new System.Collections.Generic.HashSet&lt;string&gt;(StringComparer.OrdinalIgnoreCase);
+      foreach (var entry in stores) {
+        if (entry.Type != Newtonsoft.Json.Linq.JTokenType.Object || entry[&quot;origin&quot;]?.Type != Newtonsoft.Json.Linq.JTokenType.String
+            || entry[&quot;backendId&quot;]?.Type != Newtonsoft.Json.Linq.JTokenType.String || entry[&quot;kind&quot;]?.Type != Newtonsoft.Json.Linq.JTokenType.String
+            || !System.Text.RegularExpressions.Regex.IsMatch((string)entry[&quot;backendId&quot;], @&quot;\A[A-Za-z0-9_-]{1,80}\z&quot;)
+            || !new[] { &quot;foundry&quot;, &quot;aoai&quot;, &quot;commercial&quot; }.Contains((string)entry[&quot;kind&quot;])) { return false; }
+          var origin = new Uri((string)entry[&quot;origin&quot;]);
+          if (origin.Scheme != &quot;https&quot; || origin.Port != 443
+            || origin.IsLoopback || origin.Host.EndsWith(&quot;.invalid&quot;, StringComparison.OrdinalIgnoreCase)
+            || !string.IsNullOrEmpty(origin.UserInfo) || !string.IsNullOrEmpty(origin.Query) || !string.IsNullOrEmpty(origin.Fragment)
+            || origin.AbsolutePath != &quot;/&quot; || !identifiers.Add((string)entry[&quot;backendId&quot;])
+            || !origins.Add(origin.Scheme + &quot;://&quot; + origin.Authority)) { return false; }
+      }
+      return true;
+    } catch { return false; }
+  }" />
+  <choose>
+    <when condition="@(!(bool)context.Variables[&quot;byokResponseStoresValid&quot;])">
+      <return-response>
+        <set-status code="503" reason="Response stores unavailable" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":{"code":"ResponseOwnershipUnavailable","message":"Stored response ownership validation is unavailable."}}</set-body>
+      </return-response>
+    </when>
+  </choose>
+  <set-variable name="byokResponseStoreIndex" value="@(-1)" />
+  <set-variable name="byokResponseOwnerAuthorized" value="@(false)" />
+  <set-variable name="byokResponseLookupFailed" value="@(false)" />
+  <retry condition="@(!(bool)context.Variables[&quot;byokResponseOwnerAuthorized&quot;] &amp;&amp; (int)context.Variables[&quot;byokResponseStoreIndex&quot;] + 1 &lt; Newtonsoft.Json.Linq.JArray.Parse((string)context.Variables[&quot;byokResponseStores&quot;]).Count)" count="7" interval="0" first-fast-retry="true">
+    <set-variable name="byokResponseStoreIndex" value="@((int)context.Variables[&quot;byokResponseStoreIndex&quot;] + 1)" />
+    <set-variable name="byokResponseBackendUrl" value="@((string)Newtonsoft.Json.Linq.JArray.Parse((string)context.Variables[&quot;byokResponseStores&quot;])[(int)context.Variables[&quot;byokResponseStoreIndex&quot;]][&quot;origin&quot;])" />
+    <set-variable name="byokResponseBackendKind" value="@((string)Newtonsoft.Json.Linq.JArray.Parse((string)context.Variables[&quot;byokResponseStores&quot;])[(int)context.Variables[&quot;byokResponseStoreIndex&quot;]][&quot;kind&quot;])" />
+    <set-variable name="byokResponseBackendId" value="@((string)Newtonsoft.Json.Linq.JArray.Parse((string)context.Variables[&quot;byokResponseStores&quot;])[(int)context.Variables[&quot;byokResponseStoreIndex&quot;]][&quot;backendId&quot;])" />
+    <include-fragment fragment-id="byok-response-backend-credential" />
+    <include-fragment fragment-id="byok-read-response-owner" />
+    <include-fragment fragment-id="byok-evaluate-response-owner" />
+  </retry>
+  <choose>
+    <when condition="@(!(bool)context.Variables[&quot;byokResponseOwnerAuthorized&quot;])">
+      <return-response>
+        <set-status code="@((bool)context.Variables[&quot;byokResponseLookupFailed&quot;] ? 503 : 404)" reason="Response unavailable" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":{"code":"ResponseUnavailable","message":"The requested response is unavailable for this caller."}}</set-body>
+      </return-response>
+    </when>
+  </choose>
+</fragment>

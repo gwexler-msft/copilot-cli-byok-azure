@@ -22,9 +22,27 @@
 ## 1. Developer quickstart
 
 > **Authentication scope:** This portal remains Entra-based and issues APIM subscription
-> keys. Planned [key OR Entra JWT OR Okta JWT gateway support](authentication.md) does not
+> keys. The [key OR Entra JWT OR Okta JWT gateway contract](authentication.md) does not
 > add Okta portal login, group synchronization or automatic key revocation on IdP offboarding.
 > Existing key onboarding remains unchanged; JWT token acquisition/renewal is separate.
+
+> **Windows Copilot CLI with Entra JWT:** obtain matching copies of
+> [copilot-cli-byok.ps1](../scripts/copilot-cli-byok.ps1) and
+> [get-byok-token.ps1](../scripts/get-byok-token.ps1) from your operator and keep them in the same
+> folder. Run only the launcher, then `copilot` in that configured terminal. The helper is called
+> automatically; do not run it manually because it prints the access token. The portal installer
+> and [Use-Cloud.ps1](../scripts/Use-Cloud.ps1) are not prerequisites for this JWT CLI path.
+> The launcher sets the initial CLI variables; Azure CLI and Copilot CLI remain prerequisites,
+> with supported Windows dependency installation available through `-InstallDeps`.
+>
+> Follow the [first-sign-in steps](authentication.md#start-jwt-mode-in-a-clean-shell),
+> then [routine launches](authentication.md#routine-jwt-launches). Use `-Login` for first setup or
+> deliberate reauthentication, not every launch; keep `-RefreshToken` enabled. A 403 can reflect a
+> missing/stale tier assignment, but is not conclusive. After a membership fix, follow the
+> [403 recovery steps](authentication.md#understand-jwt-access-messages) to sign in again after
+> propagation, or wait for normal token renewal. The subscription-key steps below do not assign JWT tiers.
+> If also running the portal installer for VS Code, pass `-SkipCliEnv` to avoid writing persistent
+> key-based CLI settings.
 
 > You need: a workstation that can resolve the **APIM gateway** host to its private IP
 > (in-VNet, or off-VNet over the P2S VPN), a tenant account that is a member of the BYOK
@@ -85,6 +103,16 @@
 ---
 
 ## 2. Admin prerequisites
+
+Registration deployments now require PowerShell 7.4+ on both Windows and the Bash/azd path for
+read-only role-assignment resolution. Existing assignments are preserved by their verified
+principal/scope/role binding; a recreated managed identity receives a new principal-bound name.
+The azd pre-provision hook stages this reference automatically. For a direct ARM deployment or
+local preview, run [resolve-register-role-assignment.ps1](../scripts/resolve-register-role-assignment.ps1)
+or its [Bash wrapper](../scripts/resolve-register-role-assignment.sh) with
+`-ParameterFile <LOCAL_PARAMETER_FILE> -Stage` first, using the selected subscription and pinned
+cloud cache. This helper does not delete old grants or apply infrastructure. See
+[Registration Identity Recreation](operations-lessons.md#registration-identity-recreation).
 
 Before the register app is usable, four things must be true. The first two are **org/tenant**
 prerequisites; the last two are handled by the deploy (called out so you can verify them).

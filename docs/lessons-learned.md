@@ -19,9 +19,10 @@ visible from the code alone.
    or `…commercial.example.json`, fill the `<PLACEHOLDER>` values. Cloud-specific endpoints
    (login authority, DNS zones, Cognitive Services audience) are already parameterized — don't
    hand-edit policies for the cloud.
-2. **Choose the auth mode up front.** `subscriptionKey` (long-lived APIM key) vs `jwt` (Entra
-   token). For an **unattended fleet** (e.g. 150–200 machines), prefer `subscriptionKey` — see
-   §3. For true per-user identity, use `jwt` and accept the token-refresh constraint (§3).
+2. **Choose the caller contract up front.** Subscription keys remain the starter default and
+  the native editor credential. For validated Entra users alongside existing key callers, opt in
+  to shared `coexistence`, customer-specific trust and durable ownership secrets. Configure the
+  native CLI with `-AuthMode jwt -RefreshToken`; legacy `authMode=jwt` alone replaces key admission.
 3. **Confirm region/tier reality.** APIM **v2 tiers are not in Azure Government** — Gov uses the
    classic **Developer/Premium** tiers. The AI-gateway GenAI policies work on classic tiers, so
    this is fine; just don't design around a v2-only feature.
@@ -61,10 +62,12 @@ instead.
 
 ## 3. Credential lifetime — pick the auth mode to match the fleet
 
-**Updated 2026-09-17:** distinguish token placement, renewal and gateway validation.
-CLI 1.0.85 documents a per-request credential command; the repo wrappers still mint on
-invocation, and actual expiry tests are pending. VS Code Custom Endpoint needs a renewal
-integration; its built-in Azure provider's Cognitive Services scope is not our gateway audience.
+**Updated 2026-09-27:** distinguish token placement, renewal and gateway validation.
+The paired CLI wrappers configure the per-request credential command with `-AuthMode jwt
+-RefreshToken`, pinning the existing Azure cloud, tenant, user and token cache. The helper can
+reuse or silently renew a cached credential; actual pilot/editor expiry and recovery acceptance
+remains separate. Native VS Code Custom Endpoint still uses a per-user key; its built-in Azure
+provider's Cognitive Services scope is not our gateway audience.
 
 - **`jwt` mode:** an expiring Entra access token must be renewed. Direct Okta tokens would
   have the same client lifecycle requirement; switching IdP does not solve renewal.
@@ -72,8 +75,9 @@ integration; its built-in Azure provider's Cognitive Services scope is not our g
   validated natively by APIM. No hourly 401. This is the pragmatic default for a
   150–200-machine rollout.
 - See [client capability evidence](feature-request-byok-credential-refresh.md) and the
-  [planned key OR Entra JWT OR Okta JWT design](authentication.md). Same-URL admission,
-  all operation policies, issuer-qualified metrics and quota isolation need tests before rollout.
+  [key OR Entra JWT OR Okta JWT contract](authentication.md). Both pilots completed approved
+  native-key plus Entra rollout and control-plane verification; actual client/package, security
+  and retained-object rollback acceptance remains open. Okta stays disabled pending customer tests.
   Backend identity is independent of the caller's identity; no Foundry auth change is needed.
 
 ---

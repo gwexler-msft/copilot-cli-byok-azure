@@ -7,6 +7,9 @@ It **reuses the same shared assets** as the Bicep route (no forked copies):
 |---|---|
 | `../policies/intellij-inference.xml`, `../policies/intellij-models.xml` | `azurerm_api_management_api_policy` / `..._api_operation_policy` (via `file()`) |
 | `../cloud-init.yaml`, `../cloud-init.prebaked.yaml` | the VM's `custom_data` (private IP + gateway host substituted with `replace()`) |
+| `../nginx-credentials.mjs` | raw credential selection before proxy header translation; requires nginx njs |
+| `../../../../infra/runner-image/install-nginx-njs.sh` | pinned, signing-key-verified nginx/njs bootstrap embedded in standard VM cloud-init |
+| `../caller-policies.bicepparam` | opt-in shared caller/ownership package rendered from canonical Bicep policy sources |
 | `../scripts/build-proxy-image.ps1` / `.sh` | Phase 6 pre-baked image (run once, pass the id via `proxy_image_id`) |
 
 So policy logic (subkey proxy, dynamic `/v1/models`, reasoning-strip, auto-route) and the nginx
@@ -49,6 +52,40 @@ terraform/
 - The same Azure access as the Bicep route (see the parent [`README.md`](../README.md) §Prerequisites): APIM contributor, subnet `join/action`, App Insights reader, Contributor to create the VM RG. **No Foundry permissions.**
 - Signed in for the target cloud (`az login`, or `ARM_*` env vars / a service principal for CI). For Gov set `arm_environment = "usgovernment"`.
 
+## Shared Callers
+
+Defaults remain `caller_auth_rollout="legacy"` and disabled `caller_auth_preparation`. For the
+explicit [shared caller stages](../README.md#shared-caller-authentication), first render the current
+nonsecret package from the repository root with Bicep 0.44.1 or later:
+
+```bash
+bicep build-params samples/intellij/standalone/caller-policies.bicepparam --outfile samples/intellij/standalone/caller-policies.json
+```
+
+The generated package is ignored by Git; regenerate after policy changes. Set complete trust
+configuration and a unique JWT product ID. Shared mode supports Commercial and Government only.
+Set `existing_backend_origin` to the exact HTTPS account origin and select `foundry_auth_mode`.
+Use the secret manager/environment for `TF_VAR_response_owner_key`,
+`TF_VAR_response_owner_previous_key` (explicit `__none__` initially), and `TF_VAR_foundry_api_key`
+when needed. Terraform state and saved plans contain sensitive values despite `sensitive=true`;
+protect/encrypt them and never commit them. Ownership keys must survive redeploys and rotations.
+
+`shared` adds four protected Responses operations; `coexistence` links the guarded JWT product
+last while keeping native key validation. JWT-only mode requires an enabled issuer and
+`keyEnabled=false`. Existing native subscriptions and JWT identities keep independent budgets.
+
+Before rollback, detach JWT product associations and verify absence before restoring legacy
+policies. Do not rely on one unordered apply to replace authentication and remove open admission.
+Retain the owner keys/utility policies for stored responses until their retention window ends.
+Review destruction of utility operations and named values explicitly.
+
+Ten isolated mock plans cover default/shared/coexistence and negative contracts. They use Terraform
+1.11.4 (mock-provider tests require at least 1.7) with the checked-in provider lockfile. Validation
+and all ten plans passed on 2026-09-23, including the shared installer reference. The test fixture
+must preserve the repository directory layout for that reference. This is not a live Azure apply;
+the separate [Linux image evidence](../README.md#shared-caller-authentication) does not establish
+Terraform deployment acceptance. Never run these tests against customer state or `.tfvars`.
+
 ## Deploy
 ```bash
 cd samples/intellij/standalone/terraform
@@ -90,10 +127,10 @@ setting, context window, and expected metrics. The proxy rejects every non-`/int
 ## Notes
 - **State:** use a remote backend (e.g. `azurerm` backend on a storage account) for anything beyond a
   local trial; `terraform.tfvars`, `*.tfstate*`, and `.terraform/` are gitignored.
-- **Foundry api-key (`foundry_api_key`):** the bolt-on reaches the customer's **existing** Foundry backend
-  and authenticates by **api-key** — it does **not** use managed identity (unlike the standard BYOK
-  deployment, which uses APIM MI + Cognitive Services User). Supply it **unless** that backend entity
-  already carries its own credential. If it's empty when required, Foundry returns
+- **Backend authentication:** `foundry_auth_mode="apiKey"` remains the default. Opt into
+  `"managedIdentity"` only after the existing APIM identity has Foundry data-plane RBAC; this package
+  creates no role grant. Shared ownership lookup requires explicit credentials and cannot rely on
+  opaque credentials on a backend entity. If a required backend key is empty, Foundry returns
   `401 "Access denied due to invalid subscription key or wrong API endpoint"` (Azure OpenAI's own message,
   not an APIM subscription error). Keep it out of `terraform.tfvars` in VCS — pass it via
   `TF_VAR_foundry_api_key` or a secrets manager. The App Insights instrumentation key is read from a

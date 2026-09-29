@@ -128,6 +128,14 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
           environment: ${{ startsWith(matrix.env, 'gov-') && 'AzureUSGovernment' || 'AzureCloud' }}
 
+      - name: Guard private client access
+        shell: pwsh
+        env:
+          TARGET_ENVIRONMENT: ${{ matrix.env }}
+          TARGET_SUBSCRIPTION: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          TARGET_CLOUD: ${{ startsWith(matrix.env, 'gov-') && 'AzureUSGovernment' || 'AzureCloud' }}
+        run: ./scripts/check-private-client-access-hold.ps1 -EnvironmentName $env:TARGET_ENVIRONMENT -SubscriptionId $env:TARGET_SUBSCRIPTION -Cloud $env:TARGET_CLOUD -IncludeCallerTransition
+
       # -------------------------------------------------------------------
       # Probes. The runner is VNet-injected so APIM Internal is directly reachable;
       # the operator's test VM / Bastion (if present in a pilot RG) is irrelevant.

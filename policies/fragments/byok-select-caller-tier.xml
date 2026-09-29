@@ -1,0 +1,87 @@
+<fragment>
+  <set-variable name="byokCallerTier" value="@{
+    try {
+      if (!context.Variables.ContainsKey(&quot;byokCallerAuthenticated&quot;) || !(bool)context.Variables[&quot;byokCallerAuthenticated&quot;]
+          || !context.Variables.ContainsKey(&quot;byokJwtValidated&quot;) || !(bool)context.Variables[&quot;byokJwtValidated&quot;]
+          || !context.Variables.ContainsKey(&quot;byokCallerAccountingMode&quot;) || (string)context.Variables[&quot;byokCallerAccountingMode&quot;] != &quot;jwt&quot;) { return &quot;__invalid__&quot;; }
+      var method = (string)context.Variables[&quot;callerAuthMethod&quot;];
+      if (method != &quot;entraJwt&quot; &amp;&amp; method != &quot;oktaJwt&quot;) { return &quot;__invalid__&quot;; }
+      var configuration = Newtonsoft.Json.Linq.JObject.Parse(System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(&quot;__BYOK_JWT_TIERING_CONFIG__&quot;)));
+      if (configuration.Properties().Count() != 4 || configuration[&quot;version&quot;] == null
+          || configuration[&quot;version&quot;].Type != Newtonsoft.Json.Linq.JTokenType.Integer || (int)configuration[&quot;version&quot;] != 1) { return &quot;__invalid__&quot;; }
+      var tiers = configuration[&quot;tiers&quot;] as Newtonsoft.Json.Linq.JArray;
+      if (tiers == null || tiers.Count == 0 || tiers.Count &gt; 8) { return &quot;__invalid__&quot;; }
+      var tierNames = new System.Collections.Generic.List&lt;string&gt;();
+      foreach (var tier in tiers) {
+        if (tier.Type != Newtonsoft.Json.Linq.JTokenType.String
+            || !System.Text.RegularExpressions.Regex.IsMatch((string)tier, @&quot;\A[a-z][a-z0-9-]{0,79}\z&quot;)
+            || tierNames.Contains((string)tier)) { return &quot;__invalid__&quot;; }
+        tierNames.Add((string)tier);
+      }
+      foreach (var providerName in new[] { &quot;entra&quot;, &quot;okta&quot; }) {
+        var provider = configuration[providerName] as Newtonsoft.Json.Linq.JObject;
+        if (provider == null || provider.Properties().Count() != 3 || provider[&quot;enabled&quot;] == null
+            || provider[&quot;enabled&quot;].Type != Newtonsoft.Json.Linq.JTokenType.Boolean
+            || provider[&quot;claimName&quot;] == null || provider[&quot;claimName&quot;].Type != Newtonsoft.Json.Linq.JTokenType.String) { return &quot;__invalid__&quot;; }
+        var configuredClaim = (string)provider[&quot;claimName&quot;];
+        if (!System.Text.RegularExpressions.Regex.IsMatch(configuredClaim, @&quot;\A[A-Za-z][A-Za-z0-9_.-]{0,63}\z&quot;)
+            || (providerName == &quot;entra&quot; &amp;&amp; configuredClaim != &quot;roles&quot;)
+            || new[] { &quot;iss&quot;, &quot;aud&quot;, &quot;sub&quot;, &quot;uid&quot;, &quot;cid&quot;, &quot;scp&quot;, &quot;exp&quot;, &quot;nbf&quot;, &quot;iat&quot;, &quot;jti&quot;, &quot;azp&quot;, &quot;tid&quot;, &quot;oid&quot;, &quot;idtyp&quot; }.Contains(configuredClaim)) { return &quot;__invalid__&quot;; }
+        var mappings = provider[&quot;mappings&quot;] as Newtonsoft.Json.Linq.JArray;
+        if (mappings == null || mappings.Count &gt; 16 || ((bool)provider[&quot;enabled&quot;] &amp;&amp; mappings.Count == 0)) { return &quot;__invalid__&quot;; }
+        var mappedClaims = new System.Collections.Generic.List&lt;string&gt;();
+        foreach (var mappingToken in mappings) {
+          var mapping = mappingToken as Newtonsoft.Json.Linq.JObject;
+          if (mapping == null || mapping.Properties().Count() != 2 || mapping[&quot;claimValue&quot;] == null
+              || mapping[&quot;claimValue&quot;].Type != Newtonsoft.Json.Linq.JTokenType.String
+              || mapping[&quot;tier&quot;] == null || mapping[&quot;tier&quot;].Type != Newtonsoft.Json.Linq.JTokenType.String
+              || !System.Text.RegularExpressions.Regex.IsMatch((string)mapping[&quot;claimValue&quot;], @&quot;\A[A-Za-z][A-Za-z0-9_.:-]{0,127}\z&quot;)
+              || !tierNames.Contains((string)mapping[&quot;tier&quot;]) || mappedClaims.Contains((string)mapping[&quot;claimValue&quot;])) { return &quot;__invalid__&quot;; }
+          mappedClaims.Add((string)mapping[&quot;claimValue&quot;]);
+        }
+      }
+      var selectedProvider = (Newtonsoft.Json.Linq.JObject)configuration[method == &quot;entraJwt&quot; ? &quot;entra&quot; : &quot;okta&quot;];
+      if (!(bool)selectedProvider[&quot;enabled&quot;]) { return &quot;__flat__&quot;; }
+      var token = (Jwt)context.Variables[&quot;parsedJwt&quot;];
+      if (token.Issuer != (string)context.Variables[&quot;callerIssuer&quot;]) { return &quot;__invalid__&quot;; }
+      var claimName = (string)selectedProvider[&quot;claimName&quot;];
+      if (!token.Claims.ContainsKey(claimName) || token.Claims[claimName] == null || token.Claims[claimName].Length == 0
+          || token.Claims[claimName].Length &gt; 64) { return &quot;__invalid__&quot;; }
+      var parts = ((string)context.Variables[&quot;byokJwtToken&quot;]).Split('.');
+      if (parts.Length != 3) { return &quot;__invalid__&quot;; }
+      var encodedPayload = parts[1].Replace('-', '+').Replace('_', '/');
+      encodedPayload = encodedPayload.PadRight(encodedPayload.Length + (4 - encodedPayload.Length % 4) % 4, '=');
+      var payload = Newtonsoft.Json.Linq.JObject.Parse(System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(encodedPayload)));
+      if ((string)payload[&quot;iss&quot;] != token.Issuer) { return &quot;__invalid__&quot;; }
+      var claim = payload[claimName];
+      if (claim == null || (claim.Type != Newtonsoft.Json.Linq.JTokenType.Array
+          &amp;&amp; !(method == &quot;oktaJwt&quot; &amp;&amp; claim.Type == Newtonsoft.Json.Linq.JTokenType.String))) { return &quot;__invalid__&quot;; }
+      var values = claim.Type == Newtonsoft.Json.Linq.JTokenType.Array ? (Newtonsoft.Json.Linq.JArray)claim : new Newtonsoft.Json.Linq.JArray(claim);
+      if (values.Count != token.Claims[claimName].Length) { return &quot;__invalid__&quot;; }
+      var seen = new System.Collections.Generic.List&lt;string&gt;();
+      var selectedTier = &quot;&quot;;
+      foreach (var value in values) {
+        if (value.Type != Newtonsoft.Json.Linq.JTokenType.String || string.IsNullOrWhiteSpace((string)value)
+            || ((string)value).Length &gt; 128 || seen.Contains((string)value)
+            || !token.Claims[claimName].Contains((string)value)) { return &quot;__invalid__&quot;; }
+        seen.Add((string)value);
+        foreach (var mapping in (Newtonsoft.Json.Linq.JArray)selectedProvider[&quot;mappings&quot;]) {
+          if ((string)mapping[&quot;claimValue&quot;] != (string)value) { continue; }
+          var mappedTier = (string)mapping[&quot;tier&quot;];
+          if (!string.IsNullOrEmpty(selectedTier) &amp;&amp; selectedTier != mappedTier) { return &quot;__invalid__&quot;; }
+          selectedTier = mappedTier;
+        }
+      }
+      return string.IsNullOrEmpty(selectedTier) ? &quot;__invalid__&quot; : selectedTier;
+    } catch { return &quot;__invalid__&quot;; }
+  }" />
+  <choose>
+    <when condition="@((string)context.Variables[&quot;byokCallerTier&quot;] == &quot;__invalid__&quot;)">
+      <return-response>
+        <set-status code="403" reason="Caller tier required" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":{"code":"CallerTierInvalid","message":"An unambiguous permitted caller tier is required."}}</set-body>
+      </return-response>
+    </when>
+  </choose>
+</fragment>

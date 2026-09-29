@@ -1,0 +1,15 @@
+{
+  "name": "copilot-byok-okta-credential",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test token.test.mjs" },
+  "dependencies": {
+    "@napi-rs/keyring": "2.1.0",
+    "jose": "6.2.12",
+    "open": "11.0.4",
+    "openid-client": "6.8.8",
+    "proper-lockfile": "4.1.2"
+  }
+}

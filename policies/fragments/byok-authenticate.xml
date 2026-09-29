@@ -1,0 +1,114 @@
+<fragment>
+  <set-variable name="byokJwtValidated" value="@(false)" />
+  <set-variable name="byokCallerAuthenticated" value="@(false)" />
+  <set-variable name="callerAuthMethod" value="" />
+  <set-variable name="callerIssuer" value="" />
+  <set-variable name="callerSubject" value="" />
+  <include-fragment fragment-id="byok-credential-source" />
+  <choose>
+    <when condition="@((string)context.Variables[&quot;byokCredentialSource&quot;] == &quot;key-header&quot; || (string)context.Variables[&quot;byokCredentialSource&quot;] == &quot;key-query&quot;)">
+      <set-variable name="callerAuthMethod" value="subscriptionKey" />
+      <set-variable name="callerIssuer" value="apim" />
+      <set-variable name="callerSubject" value="@(context.Subscription.Id)" />
+      <set-variable name="developerOid" value="@(context.Subscription.Id)" />
+      <set-variable name="developerUpn" value="@(context.Subscription.Name ?? context.Subscription.Id)" />
+    </when>
+    <otherwise>
+      <set-variable name="byokJwtToken" value="@{
+        var source = (string)context.Variables[&quot;byokCredentialSource&quot;];
+        if (source == &quot;jwt-bearer&quot;) { return context.Request.Headers[&quot;Authorization&quot;][0].Substring(7).Trim(); }
+        if (source == &quot;jwt-header&quot;) { return context.Request.Headers[(string)context.Variables[&quot;byokCredentialHeader&quot;]][0]; }
+        return &quot;&quot;;
+      }" />
+      <set-variable name="byokJwtShapeValid" value="@{
+        try {
+          var value = (string)context.Variables[&quot;byokJwtToken&quot;];
+          if (value.Length &gt; 32768 || !System.Text.RegularExpressions.Regex.IsMatch(value, @&quot;\A[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\z&quot;)) { return false; }
+          var parts = value.Split('.');
+          for (var partIndex = 0; partIndex &lt; 2; partIndex++) {
+            var encoded = parts[partIndex].Replace('-', '+').Replace('_', '/');
+            encoded = encoded.PadRight(encoded.Length + (4 - encoded.Length % 4) % 4, '=');
+            var bytes = Convert.FromBase64String(encoded);
+            var json = System.Text.Encoding.UTF8.GetString(bytes);
+            if (!bytes.SequenceEqual(System.Text.Encoding.UTF8.GetBytes(json))) { return false; }
+            var parsed = Newtonsoft.Json.Linq.JObject.Parse(json);
+            var stringPattern = @&quot;&quot;&quot;(?:\\(?:[&quot;&quot;\\/bfnrt]|u[0-9a-fA-F]{4})|[^&quot;&quot;\\\u0000-\u001F])*&quot;&quot;&quot;;
+            var withoutStrings = System.Text.RegularExpressions.Regex.Replace(json, stringPattern, &quot;&quot;);
+            if (System.Text.RegularExpressions.Regex.IsMatch(withoutStrings, @&quot;[^{}\[\]:,\x20\x09\x0A\x0D0-9.eE+\-truefalsn]&quot;)) { return false; }
+            var sourceProperties = 0;
+            foreach (System.Text.RegularExpressions.Match item in System.Text.RegularExpressions.Regex.Matches(json, stringPattern)) {
+              if (System.Text.RegularExpressions.Regex.IsMatch(json.Substring(item.Index + item.Length), @&quot;\A\s*:&quot;)) { sourceProperties++; }
+            }
+            if (sourceProperties != withoutStrings.Count(character =&gt; character == ':')
+                || sourceProperties != parsed.Descendants().OfType&lt;Newtonsoft.Json.Linq.JProperty&gt;().Count()) { return false; }
+            if (partIndex == 1) {
+              foreach (var name in new[] { &quot;iss&quot;, &quot;aud&quot; }) {
+                if (parsed[name] == null || parsed[name].Type != Newtonsoft.Json.Linq.JTokenType.String) { return false; }
+              }
+              foreach (var name in new[] { &quot;tid&quot;, &quot;oid&quot;, &quot;azp&quot;, &quot;sub&quot;, &quot;uid&quot;, &quot;cid&quot;, &quot;idtyp&quot; }) {
+                if (parsed[name] != null &amp;&amp; parsed[name].Type != Newtonsoft.Json.Linq.JTokenType.String) { return false; }
+              }
+              if (parsed[&quot;exp&quot;] == null || parsed[&quot;exp&quot;].Type != Newtonsoft.Json.Linq.JTokenType.Integer
+                  || (parsed[&quot;nbf&quot;] != null &amp;&amp; parsed[&quot;nbf&quot;].Type != Newtonsoft.Json.Linq.JTokenType.Integer)) { return false; }
+              var scope = parsed[&quot;scp&quot;];
+              if (scope == null || (scope.Type != Newtonsoft.Json.Linq.JTokenType.String &amp;&amp; scope.Type != Newtonsoft.Json.Linq.JTokenType.Array)
+                  || (scope.Type == Newtonsoft.Json.Linq.JTokenType.Array &amp;&amp; scope.Any(entry =&gt; entry.Type != Newtonsoft.Json.Linq.JTokenType.String))) { return false; }
+                if (((string)parsed[&quot;iss&quot;] == &quot;{{caller-entra-issuer}}&quot; &amp;&amp; scope.Type != Newtonsoft.Json.Linq.JTokenType.String)
+                  || ((string)parsed[&quot;iss&quot;] == &quot;{{caller-okta-issuer}}&quot; &amp;&amp; scope.Type != Newtonsoft.Json.Linq.JTokenType.Array)) { return false; }
+            }
+          }
+          return true;
+        } catch { return false; }
+      }" />
+      <set-variable name="byokJwtIssuerBranch" value="@{
+        try {
+          if (!(bool)context.Variables[&quot;byokJwtShapeValid&quot;]) { return &quot;invalid&quot;; }
+          var value = (string)context.Variables[&quot;byokJwtToken&quot;];
+          var token = value.AsJwt();
+          if (token == null || token.Algorithm != &quot;RS256&quot; || !token.Claims.ContainsKey(&quot;iss&quot;)
+              || token.Claims[&quot;iss&quot;] == null || token.Claims[&quot;iss&quot;].Length != 1
+              || token.Claims[&quot;iss&quot;][0] != token.Issuer) { return &quot;invalid&quot;; }
+          var entra = &quot;{{caller-entra-enabled}}&quot; == &quot;true&quot; &amp;&amp; token.Issuer == &quot;{{caller-entra-issuer}}&quot;;
+          var okta = &quot;{{caller-okta-enabled}}&quot; == &quot;true&quot; &amp;&amp; token.Issuer == &quot;{{caller-okta-issuer}}&quot;;
+          if (entra == okta) { return &quot;invalid&quot;; }
+          return entra ? &quot;entra&quot; : &quot;okta&quot;;
+        } catch { return &quot;invalid&quot;; }
+      }" />
+      <choose>
+        <when condition="@((string)context.Variables[&quot;byokJwtIssuerBranch&quot;] == &quot;entra&quot;)">
+          <include-fragment fragment-id="byok-validate-entra" />
+        </when>
+        <when condition="@((string)context.Variables[&quot;byokJwtIssuerBranch&quot;] == &quot;okta&quot;)">
+          <include-fragment fragment-id="byok-validate-okta" />
+        </when>
+        <otherwise>
+          <return-response>
+            <set-status code="401" reason="Invalid caller access token" />
+            <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+            <set-body>{"error":{"code":"InvalidCallerToken","message":"A supported user access token is required."}}</set-body>
+          </return-response>
+        </otherwise>
+      </choose>
+    </otherwise>
+  </choose>
+  <set-variable name="callerPrincipalKey" value="@{
+    var method = (string)context.Variables[&quot;callerAuthMethod&quot;];
+    var issuer = (string)context.Variables[&quot;callerIssuer&quot;];
+    var subject = (string)context.Variables[&quot;callerSubject&quot;];
+    if (string.IsNullOrWhiteSpace(issuer) || string.IsNullOrWhiteSpace(subject)) { return &quot;&quot;; }
+    if (method == &quot;subscriptionKey&quot;) {
+      if (context.Subscription == null || subject != context.Subscription.Id || issuer != &quot;apim&quot;) { return &quot;&quot;; }
+    } else if ((method != &quot;entraJwt&quot; &amp;&amp; method != &quot;oktaJwt&quot;) || !(bool)context.Variables[&quot;byokJwtValidated&quot;]) { return &quot;&quot;; }
+    return method + &quot;:&quot; + issuer.Length.ToString() + &quot;:&quot; + issuer + &quot;:&quot; + subject;
+  }" />
+  <choose>
+    <when condition="@(string.IsNullOrEmpty((string)context.Variables[&quot;callerPrincipalKey&quot;]))">
+      <return-response>
+        <set-status code="401" reason="Invalid caller identity" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":{"code":"InvalidCallerIdentity","message":"A validated stable caller identity is required."}}</set-body>
+      </return-response>
+    </when>
+  </choose>
+  <set-variable name="byokCallerAuthenticated" value="@(true)" />
+</fragment>

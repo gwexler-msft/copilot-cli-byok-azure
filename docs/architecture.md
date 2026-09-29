@@ -10,13 +10,14 @@
 Make the developer's Copilot dev surfaces — **`gh copilot` / `copilot` CLI** *and*
 **VS Code 1.122+ Copilot Chat** (via the stable Custom Endpoint provider) — hit a
 **customer-private** Azure OpenAI / Microsoft Foundry deployment instead of GHCP SaaS,
-without the laptop ever talking to a public model endpoint. Either client authenticates
-to the private APIM gateway with the credential selected by deployment `authMode`: a
-per-developer **APIM subscription key** (current CI default) or an **Entra access token**.
-CLI 1.0.85 documents a credential-command hook; integration and token-expiry tests remain
-pending. VS Code Custom Endpoint still needs a renewal solution. APIM holds backend access.
-**Same-endpoint key OR Entra JWT OR Okta JWT is planned, not implemented**; see the
-[authentication design](authentication.md) for the trust contract and rollout gates.
+without the laptop ever talking to a public model endpoint. Clients authenticate to the
+private APIM gateway with a per-developer **APIM subscription key** (the fresh-deployment
+default) or an **Entra access token** on an enabled route. The native CLI wrapper integrates
+the credential-command hook through `-AuthMode jwt -RefreshToken`; native VS Code Custom
+Endpoint still uses a per-user key. APIM holds separate backend access.
+**Same-endpoint key OR Entra JWT is implemented and enabled in both pilots** through explicit
+shared rollout; direct Okta support is opt-in and remains disabled pending customer acceptance.
+See the [authentication contract](authentication.md) for trust, client and release gates.
 
 ## Trust boundary
 
@@ -321,13 +322,14 @@ flowchart LR
 > only when the developer picks a non-BYOK model in the picker. See
 > [Client surfaces](#client-surfaces) and [deployment-guide → Option C](deployment-guide.md#option-c--vs-code-via-custom-endpoint-byok-provider).
 >
-> The CLI reaches the gateway with **one of two interchangeable credentials** (both ride the
-> `api-key` header). The solid edge is the default **`subscriptionKey`** mode; the dotted edge
-> is opt-in **`authMode=jwt`**, which sends a short-lived **Entra JWT (~1 h TTL)**. The CLI
-> now documents a per-request credential command in 1.0.85, but this repo's wrapper does not
-> yet configure it and gateway expiry tests are pending. `subscriptionKey` remains the fleet
-> default. **VS Code's Custom Endpoint provider still needs a renewal integration**, so it
-> uses `subscriptionKey` mode (`api-key` header) in practice. See the
+> The CLI reaches the gateway with **exactly one credential** in `api-key`: a per-developer key
+> or an Entra JWT. Legacy `authMode` selects one method; explicit `callerAuthRollout=coexistence`
+> admits both methods on the same Foundry/AOAI URL. The wrapper's `-AuthMode jwt -RefreshToken`
+> configures `COPILOT_PROVIDER_API_KEY_COMMAND` and clears static credentials. Azure CLI may
+> reuse its cached token or silently renew it. Current pilot/editor acceptance still needs
+> actual continued-session expiry evidence. Subscription keys remain the starter default.
+> **VS Code's Custom Endpoint provider does not inherit the CLI helper**, so it continues
+> using a per-user subscription key. See the
 > [capability record](feature-request-byok-credential-refresh.md) and
 > [Authentication modes](#authentication-modes).
 
@@ -527,18 +529,18 @@ The dev laptop has:
 
 ## Authentication modes
 
-The current gateway chooses its caller credential type at deploy time using `authMode`.
-Key mode attributes calls to APIM subscriptions and uses product tiers; JWT mode attributes
-calls to Entra `oid` and uses flat per-user limits. Foundry/AOAI JWT policies currently
-require `api-key`; Anthropic JWT accepts Bearer or `x-api-key`. CLI header capabilities have
-expanded, but that does not change the current policy contract.
+Legacy deployments select their caller credential using `authMode`. Explicit shared
+Foundry/AOAI rollout adds key OR validated Entra JWT on the same URLs; optional Okta trust
+remains disabled by default. Send exactly one supported credential, never a key and JWT together.
+The native API retains subscription validation and key callers keep their existing product tiers.
+JWT callers enter through the guarded product and use issuer/method-qualified immutable identity
+with independent per-user counters; they are not automatically assigned Standard/Power tiers.
 
-**Planned:** one credential per request, accepting key OR Entra JWT OR Okta JWT at the same
-client-facing URLs. This is not a requirement to supply both key and JWT. The
-[authentication design](authentication.md) covers admission before policy execution, separate
-issuer/audience validation, stable identity, discovery/Responses coverage and client renewal.
-Native subscription validation and product limits must be proven to survive the admission
-change; disabling subscription requirements alone is not the implementation.
+The [authentication contract](authentication.md) covers admission, exact issuer/audience/scope
+validation, credential stripping, stateful Responses ownership and renewable client credentials.
+Fresh deployments default to `callerAuthRollout=legacy`. Shared/coexistence requires explicit
+trust preparation and stable ownership secrets. Existing Anthropic authentication is unchanged;
+new shared Anthropic authentication remains deferred. The table below describes legacy selection.
 
 | `authMode` | Caller credential | How identity is established |
 |---|---|---|
@@ -550,15 +552,17 @@ change; disabling subscription requirements alone is not the implementation.
 `authMode=subscriptionKey` is the **recommended starter default** — a proposal, not a
 mandate. It standardizes on **one APIM subscription key per developer**, which most teams
 can adopt with zero changes on the developer side (a long-lived static key fits the CLI's
-static-credential model and any keys already in their tooling). It also sidesteps the
+static-credential interfaces and any keys already in their tooling). It also sidesteps the
 **~1-hour Entra token expiry**: a subscription key is long-lived, so there is no
 per-invocation token mint and no token-refresh wrapper to run. Teams that want
-cryptographic per-user identity should evaluate `authMode=jwt` below.
+validated per-user identity can enable shared Entra admission and the native CLI's renewable
+credential command without removing key access from existing editor clients.
 
 `authMode=jwt` is retained as an opt-in control for validated per-user identity and
 short-lived tokens. Local JWT validation does not guarantee instant revocation: an issued
-token may remain valid until expiry. Switching modes requires a coordinated redeploy;
-only the selected policy variant is deployed to each operation.
+token may remain valid until expiry. Switching legacy modes or enabling shared rollout requires
+a coordinated deployment. Rollback must detach JWT admission before changing consumer policies;
+changing the rollout parameter to `legacy` alone does not remove incremental ARM resources.
 
 ### Self-serve developer onboarding (planned — `#64`)
 

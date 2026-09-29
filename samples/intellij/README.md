@@ -1,10 +1,10 @@
-# IntelliJ / JetBrains BYOK samples (OpenAI-compatible, chat-completions)
+# IntelliJ / JetBrains BYOK samples
 
-> **TL;DR** — IntelliJ-family AI tools speak the **OpenAI Chat Completions API**, which the
-> BYOK APIM gateway exposes on every route (`/v1/chat/completions`). That is all IntelliJ
-> needs — the **Responses** API is optional and not required. Point any OpenAI-compatible
-> IntelliJ client at the gateway, deliver the APIM subscription key as the **`api-key`
-> header** (see the auth note below), and you are done.
+> **Client choice:** the configured native Copilot CLI custom ACP agent uses renewable JWTs
+> and **Responses** for GPT-5.6 tools plus reasoning. Actual IntelliJ agent acceptance remains
+> open. The native AI Assistant/OpenAI-compatible provider uses per-user APIM subscription keys
+> and its supported model/wire format, with the existing Bearer-to-`api-key` proxy where needed.
+> Chat Completions examples below describe that native-provider path, not the CLI agent.
 
 These samples are the IntelliJ counterpart to [`../vscode/`](../vscode/README.md). Unlike VS
 Code (which pastes a `chatLanguageModels.json`), IntelliJ tools are configured through the IDE
@@ -44,12 +44,11 @@ Three ways to satisfy APIM:
    the endpoint URL. Use this only when the client sends the request to the URL verbatim (it
    breaks if the client appends `/chat/completions` after the query string).
 
-If you deployed the gateway with `authMode=jwt`, there is no subscription key — put a fresh
-Entra access token for the gateway audience in the client's credential field. Today's
-Foundry JWT inference and discovery policies require it in `api-key`, not Bearer. A
-Bearer-only client needs a verified header adapter; the existing nginx proxy rewrites
-Bearer to `api-key` but does not validate or renew the token. Token renewal remains a
-client/helper responsibility.
+Legacy `authMode=jwt` replaces subscription-key authentication; it does not enable coexistence.
+Those Foundry policies expect a gateway-audience token in `api-key`. A proxy can rewrite the
+header but cannot validate or renew that token. Do not use pasted short-lived JWTs as the native
+AI Assistant support path. Use the configured CLI agent for renewal and retain per-user keys for
+the native provider, with shared admission activated only after deployment approval.
 
 ## What you need before configuring
 
@@ -70,16 +69,19 @@ The **base URL** is `https://<APIM_HOSTNAME>/openai/v1` for the Foundry route (o
 `/aoai/v1` for the legacy AOAI route). The chat-completions endpoint is
 `https://<APIM_HOSTNAME>/openai/v1/chat/completions`.
 
-## Option 1 — GitHub Copilot CLI as a custom ACP agent (BYOK) — ⚠️ BLOCKED UPSTREAM (waiting on a Copilot CLI fix)
+## Option 1 - Copilot CLI As A Custom ACP Agent
 
-> **Status (2026-07-03).** Adding the Copilot CLI as a custom ACP agent in IntelliJ AI Assistant is
-> **fully supported by JetBrains** via `acp.json`, and the agent launches correctly. It is currently
-> **blocked by an upstream Copilot CLI bug**: in BYOK + `--acp` mode the CLI still requires a GitHub
-> login, so `session/new` fails before any prompt runs. We filed the bug and are **waiting on a fix**:
-> [github/copilot-cli#4016](https://github.com/github/copilot-cli/issues/4016) — *BYOK
-> (`COPILOT_PROVIDER_*`) still rejected in `--acp` mode: `session/new` → `-32000 Authentication
-> required` (regressed on 1.0.61–1.0.68)*. Until it lands, **use Option 3 (terminal)** for login-free
-> BYOK. Repo tracking: #107.
+**Status (2026-09-23):** native CLI 1.0.85 passed login-free ACP sessions and actual JWT expiry
+renewal in the Government test environment. The earlier 1.0.61/1.0.68 GitHub-login gate is historical,
+not a blanket current blocker. Actual IntelliJ launch, tools and reauthentication recovery still
+need acceptance. See [the precise evidence](../../docs/feature-request-byok-credential-refresh.md#real-expiry-gate-passed).
+The new pinned launcher also passed a local strict-HTTPS test using the actual CLI in one ACP
+session, including credential renewal and zero provider requests after helper failure. That is
+launcher/protocol evidence, not an IntelliJ UI pass.
+
+The approved support boundary is renewable JWT through the configured CLI agent, with the native
+AI Assistant model-provider experience remaining on per-user APIM subscription keys. Selecting an
+agent named Copilot is not evidence that this CLI or credential helper is being used.
 
 > **The critical distinction.** JetBrains AI Assistant's built-in **"GitHub Copilot"** agent is
 > **not** the BYOK-capable `@github/copilot` CLI — it's the **`@github/copilot-language-server`**
@@ -92,7 +94,7 @@ subprocess it launches over stdio. JetBrains supports registering a **custom ACP
 `acp.json` file, so you can run the *real* BYOK-capable Copilot CLI. The steps (per
 [JetBrains' ACP docs → Add a custom agent](https://www.jetbrains.com/help/ai-assistant/acp.html#add-custom-agent)):
 
-1. **Install the standalone Copilot CLI.**
+1. **Install the standalone Copilot CLI and PowerShell 7.4+.**
    ```powershell
    npm install -g @github/copilot@latest    # or:  winget install GitHub.Copilot
    copilot --version
@@ -100,33 +102,47 @@ subprocess it launches over stdio. JetBrains supports registering a **custom ACP
    npm installs a native `copilot.exe` at
    `%APPDATA%\npm\node_modules\@github\copilot\node_modules\@github\copilot-win32-x64\copilot.exe`
    (a direct exe is the most reliable ACP `command` — a `.cmd`/`.ps1` shim is flaky under ACP).
-2. **Create the `acp.json`.** In the **AI Chat** tool window, click the **⋯** button (upper-right)
+2. **Prepare a local nonsecret agent profile.** Use [cli-agent.example.json](cli-agent.example.json)
+   as the shape for the ignored `cli-agent.local.json`. Specify the absolute native CLI executable,
+   gateway base ending in `/openai`, model, workspace and existing Azure CLI cache. Pin the expected
+   cloud, tenant and signed-in account. Complete delegated sign-in in that cache outside IntelliJ.
+   Do not put a token or subscription key in the profile. The launcher uses Responses and one
+   `COPILOT_PROVIDER_API_KEY_COMMAND`, and never signs in or silently switches users.
+
+   Validate without launching the CLI or making an Azure call:
+   ```powershell
+   ./scripts/start-copilot-agent.ps1 -ConfigFile ./samples/intellij/cli-agent.local.json -ValidateOnly
+   ```
+3. **Create the `acp.json`.** In the **AI Chat** tool window, click the **⋯** button (upper-right)
    and choose **Add Custom Agent**. IntelliJ creates `~/.jetbrains/acp.json` and opens it for editing.
-   Add a `agent_servers` entry that runs the CLI in ACP mode (`--acp`) with the BYOK env:
+   Add an `agent_servers` entry invoking the launcher. Keep absolute paths; only nonsecret
+   configuration belongs here:
    ```json
    {
      "default_mcp_settings": {},
      "agent_servers": {
        "BYOK Copilot (gateway)": {
-         "command": "C:\\Users\\<you>\\AppData\\Roaming\\npm\\node_modules\\@github\\copilot\\node_modules\\@github\\copilot-win32-x64\\copilot.exe",
-         "args": ["--acp"],
-         "env": {
-           "COPILOT_PROVIDER_BASE_URL": "https://<APIM_HOSTNAME>/openai",
-           "COPILOT_PROVIDER_TYPE": "azure",
-           "COPILOT_PROVIDER_API_KEY": "<APIM_SUBSCRIPTION_KEY>",
-           "COPILOT_MODEL": "gpt-5.1"
-         }
+             "command": "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+             "args": [
+                "-NoLogo", "-NoProfile", "-NonInteractive", "-File",
+                "C:\\<REPOSITORY>\\scripts\\start-copilot-agent.ps1",
+                "-ConfigFile", "C:\\<LOCAL_CONFIG>\\cli-agent.local.json", "-Mode", "acp"
+             ],
+             "env": {}
        }
      }
    }
    ```
-   The key inside `agent_servers` is the display name shown in AI Chat. Note the flag is **`--acp`**
-   (not an `acp` subcommand — that errors with *"Invalid command format"*). Base URL ends in `/openai`
-   (the CLI appends `/v1`).
-3. Save `acp.json`; the agent appears in the AI Chat agent picker. Select it and send a prompt.
+   The entry name is the display name shown in AI Chat. The launcher invokes the configured native
+   CLI with `--acp --stdio`; setup emits no banners on ACP stdout. Use the equivalent absolute
+   `pwsh` and file paths on Linux/macOS. The paired Bash launcher accepts the same parameters.
+4. Select the custom agent, after the target gateway's JWT configuration and test request budget
+   are approved. Verify its executable/version and helper invocation, then test expiry without
+   restarting the session and helper failure without backend traffic. Startup success alone does
+   not complete this gate. Native editor subscription/license policies remain separate.
 
-**⚠️ Current blocker (upstream) — why this doesn't work yet.** The Copilot CLI's `--acp` server
-**hard-gates every session on a GitHub login, independent of BYOK**. `initialize` succeeds and
+**Historical ACP failure (1.0.61/1.0.68).** Those CLI versions gated the `--acp` server on a
+GitHub login despite BYOK. `initialize` succeeded and
 advertises `authMethods:[copilot-login]`, but `session/new` returns
 `JSON-RPC error -32000: Authentication required` — even with `COPILOT_PROVIDER_*` set and
 `COPILOT_OFFLINE=true`. The *identical* env runs **login-free** under `copilot -p` / interactive, so
@@ -134,10 +150,10 @@ this is purely an ACP-path defect. Confirmed failing on **1.0.61 and 1.0.68** (t
 custom-provider-in-ACP fix, [#3048](https://github.com/github/copilot-cli/issues/3048), routed *model*
 traffic only — it did not remove the auth gate). Reproduce it IDE-independently with
 [`../../scripts/acp-byok-repro.mjs`](../../scripts/acp-byok-repro.mjs) (zero-dep Node stdio JSON-RPC
-client — drives `initialize` → `session/new` and prints the verdict). This means a **fully-private /
-egress-off** agent cannot proceed: the only ways to satisfy the gate today are a GitHub token
+client — drives `initialize` → `session/new` and prints the verdict). In those versions a
+**fully-private / egress-off** agent could not proceed: the available workarounds were a GitHub token
 (`COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`, fine-grained PAT with the "Copilot Requests"
-permission) or `copilot login` — **both need `github.com` reachable to validate**, defeating the
+permission) or `copilot login` — **both needed `github.com` reachable to validate**, defeating the
 air-gapped design.
 
 - **Tracking:** repo #107;
@@ -145,7 +161,8 @@ air-gapped design.
   [#3048](https://github.com/github/copilot-cli/issues/3048) /
   [#3161](https://github.com/github/copilot-cli/issues/3161) /
   [#3902](https://github.com/github/copilot-cli/issues/3902).
-- **Until the fix lands:** use **Option 3** (terminal) — the validated login-free BYOK path.
+- This older failure is retained for diagnosis; it does not override the newer 1.0.85 ACP/expiry
+   evidence. Do not install an older CLI or claim the editor integration passed from protocol tests alone.
 
 ## Option 2 — JetBrains AI Assistant (built-in)
 
@@ -186,23 +203,28 @@ in-VNet reachability as APIM). Opt-in (`deployFoundrySubkeyProxy=true`; enabled 
 [architecture.md](../../docs/architecture.md), and
 #108.
 
-### Planned alternative: Entra or Okta JWT on the same endpoint
+### Opt-in shared callers: acceptance pending
 
 The target is **subscription key OR Entra JWT OR Okta JWT**, one credential per request,
-with the same client-facing inference and discovery URLs. It is not implemented. The
+with the same client-facing inference and discovery URLs. The main and standalone policy packages
+are implemented locally, but this IDE/proxy workflow is not accepted for renewable JWT use. The
 previously documented `deployFoundryBearer` switch and `/openai-bearer` module are not
 present in the current infrastructure; do not use those old deployment instructions.
 
 Existing key clients keep their configuration. JWT clients would put the access token in
 the API-key field, but the proxy/admission path must first support the agreed header
 contract. The current proxy translates Bearer to `api-key` and removes Authorization;
-it does not obtain, validate or refresh an Entra/Okta token. Test both inference and
+it does not obtain, validate or refresh an Entra/Okta token. The new raw-header njs guard requires
+an approved compatible image and still needs Linux runtime acceptance. Test both inference and
 `GET /v1/models`, and provide a supported renewal mechanism before fleet rollout.
 
 Okta sign-in federated through Entra still produces an Entra API token. Direct Okta tokens
 require custom-authorization-server validation and issuer-qualified identity in the gateway.
-Neither option changes APIM-to-Foundry authentication. The standalone bolt-on requires
-its own inference/discovery policy updates in both Bicep and Terraform packaging.
+Neither option changes APIM-to-Foundry authentication. The standalone bolt-on's shared policies
+and ownership operations are packaged for Bicep and Terraform, with default-legacy settings.
+The [Okta CLI helper](../../scripts/okta/README.md) does not make AI Assistant invoke a credential
+command. Existing native-key settings remain the supported choice until an IDE renewal design
+and failure/recovery workflow are approved and tested.
 See [the full authentication design](../../docs/authentication.md).
 
 Because these clients use **chat-completions**, no Responses configuration is needed.

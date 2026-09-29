@@ -1,0 +1,36 @@
+<fragment>
+  <set-variable name="byokResponseOwnerAuthorized" value="@{
+    try {
+      if (!context.Variables.ContainsKey(&quot;byokCallerAuthenticated&quot;) || !(bool)context.Variables[&quot;byokCallerAuthenticated&quot;]
+          || !context.Variables.ContainsKey(&quot;byokResponseOwnerMarkers&quot;)
+          || !context.Variables.ContainsKey(&quot;byokResponseReference&quot;)
+          || !context.Variables.ContainsKey(&quot;byokResponseOwnershipDocument&quot;)) { return false; }
+      var reference = (string)context.Variables[&quot;byokResponseReference&quot;];
+      if (!System.Text.RegularExpressions.Regex.IsMatch(reference, @&quot;\Aresp_[A-Za-z0-9_-]{1,128}\z&quot;)) { return false; }
+      var document = Newtonsoft.Json.Linq.JObject.Parse((string)context.Variables[&quot;byokResponseOwnershipDocument&quot;]);
+      if (document[&quot;id&quot;]?.Type != Newtonsoft.Json.Linq.JTokenType.String || (string)document[&quot;id&quot;] != reference
+          || document[&quot;object&quot;]?.Type != Newtonsoft.Json.Linq.JTokenType.String || (string)document[&quot;object&quot;] != &quot;response&quot;) { return false; }
+      var metadata = document[&quot;metadata&quot;] as Newtonsoft.Json.Linq.JObject;
+      var marker = metadata?[&quot;byok_owner_v1&quot;];
+      if (marker?.Type != Newtonsoft.Json.Linq.JTokenType.String
+          || !System.Text.RegularExpressions.Regex.IsMatch((string)marker, @&quot;\Av1\.[0-9a-f]{64}\z&quot;)) { return false; }
+      foreach (var expected in ((string)context.Variables[&quot;byokResponseOwnerMarkers&quot;]).Split(',')) {
+        if (!System.Text.RegularExpressions.Regex.IsMatch(expected, @&quot;\Av1\.[0-9a-f]{64}\z&quot;)) { return false; }
+        var difference = 0;
+        for (var characterIndex = 0; characterIndex &lt; expected.Length; characterIndex++) { difference |= expected[characterIndex] ^ ((string)marker)[characterIndex]; }
+        if (difference == 0) { return true; }
+      }
+      return false;
+    } catch { return false; }
+  }" />
+  <set-variable name="byokResponseOwnershipDocument" value="" />
+  <choose>
+    <when condition="@(!(bool)context.Variables[&quot;byokResponseOwnerAuthorized&quot;])">
+      <return-response>
+        <set-status code="404" reason="Response unavailable" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":{"code":"ResponseUnavailable","message":"The requested response is unavailable for this caller."}}</set-body>
+      </return-response>
+    </when>
+  </choose>
+</fragment>

@@ -3,6 +3,8 @@
 // API surface + operations + policy. Callers reach AOAI by pointing
 // COPILOT_PROVIDER_BASE_URL at https://<apim-gateway>/aoai.
 
+import { sharedModelsAuthentication, sharedResponsesPreparation, sharedResponseAffinity, sharedCallerThrottleTelemetry, responsesItemTemplate, guardNativePolicy } from './apim-foundry-api.bicep'
+
 param apimName string
 param aoaiPrivateBaseUrl string
 
@@ -15,6 +17,12 @@ param authMode string = 'subscriptionKey'
 
 @description('Resource IDs of the shared named values; used to order the policy after they exist.')
 param namedValueIds array = []
+
+@description('Opt-in shared caller authentication, JWT accounting and owned Responses operations. Main must pass prepared auth/ownership outputs; legacy behavior remains the default.')
+param sharedInferenceAuth bool = false
+
+param callerAuthFragmentIds array = []
+param responseOwnershipFragmentIds array = []
 
 resource apim 'Microsoft.ApiManagement/service@2024-05-01' existing = {
   name: apimName
@@ -139,6 +147,49 @@ resource opEmbedDep 'Microsoft.ApiManagement/service/apis/operations@2024-05-01'
   }
 }
 
+var responseOperations = [
+  { name: 'responses-get', method: 'GET', path: '/v1/responses/{response_id}' }
+  { name: 'responses-delete', method: 'DELETE', path: '/v1/responses/{response_id}' }
+  { name: 'responses-cancel', method: 'POST', path: '/v1/responses/{response_id}/cancel' }
+  { name: 'responses-input-items', method: 'GET', path: '/v1/responses/{response_id}/input_items' }
+]
+var sharedEntry = replace(sharedModelsAuthentication, '__NATIVE_SUBSCRIPTION_REQUIRED__', toLower(string(authMode == 'subscriptionKey')))
+var ownedResponsePolicy = replace(responsesItemTemplate, '__SHARED_AUTHENTICATION__', sharedEntry)
+
+@batchSize(1)
+resource responseItems 'Microsoft.ApiManagement/service/apis/operations@2024-05-01' = [for operation in responseOperations: if (sharedInferenceAuth) {
+  parent: api
+  name: operation.name
+  properties: {
+    displayName: operation.name
+    method: operation.method
+    urlTemplate: operation.path
+    templateParameters: [{ name: 'response_id', type: 'string', required: true }]
+  }
+}]
+
+@batchSize(1)
+resource responseItemPolicies 'Microsoft.ApiManagement/service/apis/operations/policies@2024-05-01' = [for (operation, operationIndex) in responseOperations: if (sharedInferenceAuth) {
+  parent: responseItems[operationIndex]
+  name: 'policy'
+  properties: { format: 'xml', value: ownedResponsePolicy }
+}]
+
+var inferencePolicySources = {
+  subscriptionKey: loadTextContent('../../policies/byok-aoai-policy-subkey.xml')
+  jwt: loadTextContent('../../policies/byok-aoai-policy.xml')
+}
+var sharedInferenceAuthentication = replace(sharedModelsAuthentication, '<include-fragment fragment-id="byok-strip-caller-credentials" />', '')
+var inferenceInboundEnd = indexOf(inferencePolicySources.subscriptionKey, '<inbound>') + length('<inbound>')
+var sharedInferenceWithAuthentication = '${substring(inferencePolicySources.subscriptionKey, 0, inferenceInboundEnd)}${sharedInferenceAuthentication}${substring(inferencePolicySources.subscriptionKey, inferenceInboundEnd)}'
+var sharedInferenceWithAccounting = replace(sharedInferenceWithAuthentication, '<set-variable name="developerOid" value="@(context.Subscription?.Id ?? "unknown")" />', '<include-fragment fragment-id="byok-apply-caller-limits" /><include-fragment fragment-id="byok-strip-caller-credentials" />${sharedResponsesPreparation}')
+var sharedInferenceWithoutLegacyIdentity = replace(sharedInferenceWithAccounting, '<set-variable name="developerUpn" value="@(context.Subscription?.Name ?? context.Subscription?.Id ?? "unknown")" />', '')
+var aoaiResponseAffinity = replace(sharedResponseAffinity, '((bool)context.Variables[&quot;isCommercialModel&quot;] ? &quot;commercial&quot; : ((bool)context.Variables[&quot;routeToAoai&quot;] ? &quot;aoai&quot; : &quot;foundry&quot;))', '&quot;aoai&quot;')
+var sharedInferenceWithAffinity = replace(sharedInferenceWithoutLegacyIdentity, '<set-backend-service backend-id="{{aoai-backend-id}}" />', '<set-backend-service backend-id="{{aoai-backend-id}}" />${aoaiResponseAffinity}')
+@export()
+var sharedInferenceTemplate string = replace(sharedInferenceWithAffinity, '</on-error>', '${sharedCallerThrottleTelemetry}</on-error>')
+var sharedInferencePolicy = replace(sharedInferenceTemplate, '__NATIVE_SUBSCRIPTION_REQUIRED__', toLower(string(authMode == 'subscriptionKey')))
+
 resource apiPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = {
   parent: api
   name: 'policy'
@@ -146,7 +197,7 @@ resource apiPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = 
     format: 'rawxml'
     // Both policy files are embedded at compile time; the ternary selects which one is
     // applied at deploy time based on authMode.
-    value: authMode == 'jwt' ? loadTextContent('../../policies/byok-aoai-policy.xml') : loadTextContent('../../policies/byok-aoai-policy-subkey.xml')
+    value: sharedInferenceAuth ? sharedInferencePolicy : (authMode == 'jwt' ? inferencePolicySources.jwt : guardNativePolicy(inferencePolicySources.subscriptionKey))
   }
   dependsOn: [
     opChat
@@ -162,3 +213,6 @@ resource apiPolicy 'Microsoft.ApiManagement/service/apis/policies@2024-05-01' = 
 output apiId string = api.id
 output apiName string = api.name
 output namedValueDependency array = namedValueIds
+output callerAuthFragmentDependency array = callerAuthFragmentIds
+output responseOwnershipDependency array = responseOwnershipFragmentIds
+output callerPolicyIds array = [apiPolicy.id]

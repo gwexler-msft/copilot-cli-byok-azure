@@ -28,6 +28,39 @@ sample retains an empty legacy Chat Completions provider and puts GPT-5.6 models
 
 ## What you need before pasting
 
+### CLI Agent Versus Native Chat
+
+The supported client split is **renewable JWT for the configured Copilot CLI agent**, and
+**per-user APIM subscription keys for the native Custom Endpoint experience described here**.
+Ordinary VS Code Agent mode using Custom Endpoint is still the native provider path; its name
+does not make it a CLI session or add JWT renewal.
+
+For an explicit CLI process in VS Code's integrated terminal, use the shared
+[agent profile](../intellij/cli-agent.example.json) and
+[launcher](../../scripts/start-copilot-agent.ps1):
+
+```powershell
+./scripts/start-copilot-agent.ps1 -ConfigFile '<ABSOLUTE_LOCAL_PROFILE>' -ValidateOnly
+./scripts/start-copilot-agent.ps1 -ConfigFile '<ABSOLUTE_LOCAL_PROFILE>' -Mode terminal
+```
+
+The profile contains only nonsecret settings and pins the native executable, model, gateway,
+workspace, cloud, tenant, account and existing Azure CLI cache. The launcher configures one
+per-request credential command and Responses; it does not open a sign-in prompt, weaken TLS,
+grant permissions or persist tokens. Complete sign-in outside the agent first.
+
+The installed Copilot extension exposes **New Copilot CLI Session**, which opens a CLI terminal.
+Its separate background/Agent Host sessions can use an editor provider bridge. Do not assume
+either inherits environment changes made in another terminal, or silently call terminal acceptance
+background-session acceptance. The required editor test must prove the intended executable and
+helper are used and the same session survives JWT expiry and failed-renewal recovery. That UI
+acceptance is still pending; this runbook does not claim it has passed.
+The pinned launcher passed a local strict-HTTPS test with the actual CLI in one ACP session,
+including renewed credentials and no provider requests after helper failure. It is not evidence
+that the editor's native background session selected the same executable or provider.
+
+### Native Custom Endpoint
+
 1. **The APIM hostname.** From the deployment outputs:
    ```pwsh
    azd env get-values | Select-String 'apim'                # if you used azd
@@ -109,18 +142,18 @@ See issue #96 for
 the root cause (VS Code's `url.includes('openai.azure')` heuristic in the Custom Endpoint
 provider). Without the parameter, APIM returns `Access denied due to missing subscription key`.
 
-If you deployed the gateway with `authMode=jwt`, set the provider's stored `apiKey` to a
-fresh Entra access token for the gateway audience. **Keep the URL marker** with today's
-Foundry/AOAI policies: they require the token in `api-key`, including model discovery and
-Responses follow-ups. Bearer-only requests are not accepted on those routes today.
+Legacy `authMode=jwt` policies accept gateway-audience JWTs in `api-key`, including discovery and
+Responses follow-ups, but pasting one into this provider is not renewable authentication. The
+supported native Custom Endpoint configuration remains a per-user subscription key. Use the
+configured CLI path above for renewable JWTs and do not treat a UI Agent label as proof of CLI use.
 
 ### Planned Entra and Okta JWT migration
 
 The target is the same URLs accepting **one credential: subscription key OR Entra JWT OR
 Okta JWT**, not both. This is not deployed; pasting an Okta token into today's key-only
 configuration will fail. Existing key users keep their settings. Migrated users replace
-the stored credential and use the gateway's validated header contract; model IDs and
-request bodies do not change. APIM-to-Foundry authentication is unchanged.
+the credential path with the configured native CLI/helper and use the gateway's validated header
+contract. Native Custom Endpoint users keep keys. APIM-to-Foundry authentication is unchanged.
 
 Current [VS Code documentation](https://code.visualstudio.com/docs/agent-customization/language-models)
 supports a custom auth header using `requestHeaders: { "api-key": "${apiKey}" }`, drawing
@@ -128,8 +161,8 @@ from the provider's secret-backed credential without copying it into plaintext. 
 support in the target VS Code version before replacing the existing URL marker. A Bearer
 header can similarly use `"Authorization": "Bearer ${apiKey}"` once the gateway supports it.
 
-Neither secret interpolation nor manually replacing a token implements renewal. Custom
-Endpoint still needs a supported refreshing provider/helper integration for long sessions.
+Neither secret interpolation nor manually replacing a token implements renewal. A new refreshing
+Custom Endpoint provider/helper is outside the approved scope; it is not a remaining delivery task.
 The built-in Azure provider's Cognitive Services scope does not match our gateway audience.
 See [authentication design and acceptance gates](../../docs/authentication.md) and the
 [client capability record](../../docs/feature-request-byok-credential-refresh.md).

@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "disableBypassPermissionsMode": "disable",
+    "deny": ["Read(~/.ssh/**)"],
+    "ask": ["Shell(git push *)"]
+  },
+  "allowedMcpServers": [],
+  "strictKnownMarketplaces": [],
+  "remoteControl": {
+    "mode": "disabled"
+  },
+  "telemetry": {
+    "enabled": false,
+    "captureContent": false,
+    "lockCaptureContent": true
+  }
+}

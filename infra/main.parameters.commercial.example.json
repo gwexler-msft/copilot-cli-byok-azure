@@ -34,6 +34,21 @@
       { "name": "gpt-5.6-terra", "version": "2026-07-09", "sku": "DataZoneStandard", "capacity": 250, "exposedName": "gpt-5.6-terra" }
     ] },
     "authMode":           { "value": "subscriptionKey" },
+    "callerAuthPreparation": { "value": {
+      "enabled": false,
+      "keyEnabled": true,
+      "entraEnabled": false,
+      "entraClientIds": [],
+      "oktaTrust": {
+        "enabled": false,
+        "issuer": "",
+        "openIdConfigUrl": "",
+        "audience": "",
+        "requiredScope": "",
+        "clientIds": []
+      },
+      "jwtProductId": "byok-jwt"
+    } },
     "deployTestSubscriptions": { "value": true },
     "testSubscriptions":  { "value": [ { "name": "dev1", "product": "byok-standard" }, { "name": "dev2", "product": "byok-power" } ] },
     "productTiers":       { "value": [

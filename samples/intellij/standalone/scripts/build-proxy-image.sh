@@ -56,7 +56,10 @@ info "== 3/6 Install nginx + prep =="
 # Single-line script (parity with the pwsh path, and avoids any CRLF/heredoc pitfalls that make the
 # remote bash silently no-op). cloud-init clean (NOT waagent deprovision) preps for generalize;
 # cloud-init regenerates SSH host keys + hostname on first boot.
-PREP='set -e; export DEBIAN_FRONTEND=noninteractive; sudo apt-get update -qq >/dev/null 2>&1; sudo apt-get install -y -qq nginx >/dev/null 2>&1; sudo rm -f /etc/nginx/sites-enabled/default; sudo rm -f /etc/nginx/conf.d/byok-proxy.conf; sudo systemctl enable nginx >/dev/null 2>&1; sudo cloud-init clean --logs >/dev/null 2>&1 || true; sudo rm -f /home/builder/.ssh/authorized_keys || true; echo INSTALLED=$(command -v nginx)'
+INSTALLER_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd -P)/infra/runner-image/install-nginx-njs.sh"
+INSTALLER_ENCODED="$(tr -d '\r' < "$INSTALLER_PATH" | base64 | tr -d '\n')"
+PREP="set -e; printf '%s' '$INSTALLER_ENCODED' | base64 --decode | sudo bash; "
+PREP+='sudo rm -f /etc/nginx/sites-enabled/default; sudo rm -f /etc/nginx/conf.d/byok-proxy.conf; sudo systemctl enable nginx >/dev/null 2>&1; sudo cloud-init clean --logs >/dev/null 2>&1 || true; sudo rm -f /home/builder/.ssh/authorized_keys || true; echo INSTALLED=$(command -v nginx)'
 MSG="$(az vm run-command invoke -g "$BUILD_RG" -n "$BUILD_VM" --command-id RunShellScript --scripts "$PREP" --query "value[0].message" -o tsv)"
 echo "$MSG" | grep -q 'INSTALLED=/usr/sbin/nginx' || { echo "$MSG"; fail "nginx install failed (not present in image)."; }
 ok "nginx installed"

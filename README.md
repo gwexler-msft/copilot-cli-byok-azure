@@ -2,12 +2,12 @@
 
 Routes the developer's Copilot dev surfaces — **GitHub Copilot CLI** and **VS Code 1.122+
 Copilot Chat** (Custom Endpoint provider) — to a **customer-owned, private Azure OpenAI /
-Microsoft Foundry** account through an internal-VNet APIM gateway. Inference traffic
-never leaves your tenant.
+Microsoft Foundry** account through an internal-VNet APIM gateway. Review the selected
+backend cloud, region, client telemetry and tool integrations against your data-boundary
+requirements; a private inference route does not make every client or tool connection private.
 
-Based on the customer architecture whitepaper *"Architecture Reference - GitHub Copilot
-BYOK with Azure"* (Parsons), reality-checked against shipping `gh copilot-cli` v1.0.x
-and the VS Code 1.122 Custom Endpoint provider.
+**Customer engineering preview (2026-09-29).** See the [validation and acceptance limits](docs/RELEASES.md#customer-preview--2026-09-29)
+before deployment. This snapshot is not a production-readiness or compliance certification.
 
 ## What you get
 
@@ -75,7 +75,6 @@ matrix and the Commercial-only `services.ai` private-DNS-zone caveat.
 ## Repo layout
 
 ```
-.azure/infrastructure-plan.json   Reviewable plan (subscription-scope topology)
 docs/                             Architecture, deployment guide, CI/CD, GitHub egress allowlist
 docs/RELEASES.md                  Versioned changelog (what shipped in each release)
 docs/ROADMAP.md                   Forward-looking plan (Now / Next / Later)
@@ -90,14 +89,19 @@ monitoring/kql/*.kql              Workbook queries
 
 ## Status
 
-**Pre-deployment.** Files are scaffolded for review. No `azd up`, no `az deployment`.
-See [docs/deployment-guide.md](docs/deployment-guide.md) for the run order once approved.
-For the automated / OIDC-federated path (both clouds) + planned self-hosted runner + post-deploy
-smoke tests, see [docs/cicd.md](docs/cicd.md).
+**Deployed and smoke-tested in controlled development environments in both Azure clouds.**
+The initial deployment and a scheduled redeployment each passed 33 checks with zero failures;
+three checks for unconfigured optional routes were skipped. Customer deployment still requires
+environment-specific configuration, access approval and acceptance testing. See
+[docs/deployment-guide.md](docs/deployment-guide.md) for deployment and
+[docs/cicd.md](docs/cicd.md) for the OIDC-federated automation. Workflows are supplied as examples;
+the public repository does not provide internal runners, environment secrets or automatic deployment.
 
 **`azd` is the primary deploy path** — `azure.yaml` wires `azd` to the
-subscription-scope `infra/main` template (`azd provision`; no `services:` block, so
-`azd up` == `azd provision`). Requires `azd` >= 1.25.4, Azure CLI >= 2.60, Bicep >= 0.30,
+subscription-scope `infra/main` template. Use `azd provision` for infrastructure and the
+targeted `azd deploy register` only when the opt-in registration service is enabled.
+Do not use a blanket `azd up` for a deployment without that service. Requires `azd` >= 1.25.4,
+Azure CLI >= 2.60, Bicep >= 0.30,
 PowerShell 7+ (see *Required tools* in the deployment guide). **Commercial** is `azd`'s
 default cloud; **Gov** tenants must first run `azd config set cloud.name AzureUSGovernment`
 (global — it selects the AAD login authority) **then** `azd auth login`, otherwise
@@ -108,15 +112,16 @@ provisioning fails with `AADSTS90051: Invalid national Cloud ID (2)`. Raw
 
 Clients must support the endpoint's wire format and credential header. Two are first-class:
 
-> **Authentication status (2026-09-17):** CI deployments select subscription keys. Entra JWT
-> is a separate implemented deployment mode, not an alternative accepted by today's key-only
-> API. Same-endpoint **key OR Entra JWT OR Okta JWT** is planned, with unchanged backend
-> authentication. See [docs/authentication.md](docs/authentication.md) for policy coverage,
-> client renewal requirements and rollout gates.
+> **Authentication status (2026-09-29):** Native subscription-key defaults remain available.
+> Same-endpoint key/Entra JWT coexistence is implemented and requires an explicitly configured,
+> reviewed rollout; it is not enabled merely by cloning this snapshot. Okta remains disabled
+> unless separately configured, and customer Okta acceptance is pending. Group-selected JWT
+> tiers, retained-state rollback and client renewal have separate live acceptance requirements.
+> See [docs/authentication.md](docs/authentication.md) for the exact contracts and remaining gates.
 
 | Client | Path it hits | Credential it sends | Notes |
 |---|---|---|---|
-| **GitHub Copilot CLI** (BYOK `azure` provider) | `/openai/v1/responses` or `/openai/v1/chat/completions` | `api-key`: APIM subscription key by default, or Entra JWT only when deployed in JWT mode | The wrapper mints JWTs on invocation. CLI 1.0.85 documents a per-request credential command; gateway renewal validation is pending. See [docs/deployment-guide.md](docs/deployment-guide.md). |
+| **GitHub Copilot CLI** (BYOK `azure` provider) | `/openai/v1/responses` or `/openai/v1/chat/completions` | `api-key`: APIM subscription key, or a delegated JWT when the gateway is configured to accept it | The launcher and paired token helper support `-RefreshToken` credential commands and explicit `-Login` recovery. Long-running real-client renewal acceptance remains separate from offline helper tests. See [docs/authentication.md](docs/authentication.md). |
 | **VS Code 1.122+** "Custom Endpoint" provider | `POST /openai/v1/chat/completions` and/or `POST /openai/v1/responses` on either API | APIM subscription key via the provider `apiKey` + a `?_vscodeauth=openai.azure` url param (makes VS Code send it as `api-key`; see issue #96); BYOK doesn't require GitHub sign-in | Set `apiType: chat-completions` or `apiType: responses` per model; `reasoningEffortFormat` follows the apiType. Ready-made model registration JSON in [`samples/vscode/`](samples/vscode/). See [docs/deployment-guide.md → Option C: VS Code Custom Endpoint](docs/deployment-guide.md#option-c--vs-code-via-custom-endpoint-byok-provider). |
 
 Both APIs expose both routes (the policy rewrites `/openai/v1/responses` to the
@@ -133,10 +138,10 @@ well as non-streamed responses.
 > away. See
 > [docs/architecture.md → Model discovery](docs/architecture.md#model-discovery--the-v1models-operation-on-the-foundry-api-61).
 
-> **Self-serve onboarding at fleet scale is planned** (`#64`). A developer signs in once with
-> Entra ID and gets their own APIM subscription **plus** a ready-to-use VS Code config written
-> to disk — no admin ticket, no JSON hand-editing. See
-> [docs/architecture.md → Self-serve developer onboarding](docs/architecture.md#self-serve-developer-onboarding-planned--64).
+> **Self-serve key onboarding is an opt-in service** (`deployRegisterApp=true`). The registration
+> app uses Entra sign-in to provision a per-developer APIM subscription and configuration artifacts.
+> It needs separately configured identity, group, network and RBAC settings. See
+> [docs/register-app-runbook.md](docs/register-app-runbook.md).
 
 > **Auto model-selection comes in two flavors** (`#73`). Send **`model: auto`** to use the
 > **free, in-policy APIM router** (coding-signal + length heuristic, optional classifier — already
@@ -157,4 +162,4 @@ well as non-streamed responses.
 
 - `COPILOT_PROVIDER_TYPE=azure` may hardcode an `api-version` ([copilot-cli#3208](https://github.com/github/copilot-cli/issues/3208)). The APIM policy *injects* `api-version` if missing and tolerates whatever the CLI sends.
 - CLI now documents `COPILOT_PROVIDER_HEADERS` and, in 1.0.85, `COPILOT_PROVIDER_API_KEY_COMMAND`; open issue states alone do not establish shipping capability.
-- The wrapper still mints Entra JWTs only on invocation. The new command hook needs integration and expiry tests; VS Code Custom Endpoint still needs a renewal solution. See [the capability record](docs/feature-request-byok-credential-refresh.md).
+- The launcher implements per-request credential commands with `-RefreshToken`; actual client behavior across expiry and group changes still requires customer acceptance. VS Code Custom Endpoint does not inherit the CLI's renewal mechanism. See [the capability record](docs/feature-request-byok-credential-refresh.md).

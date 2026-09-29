@@ -5,25 +5,43 @@
 # (what JetBrains AI Assistant sends) into the `api-key` header the Internal APIM validates, then
 # forwards to the APIM by PRIVATE IP with the gateway hostname as the Host header + TLS SNI — so the
 # VM needs no DNS. __APIM_PRIVATE_IP__ and __APIM_GATEWAY_HOST__ are substituted by Bicep at deploy.
-package_update: true
-packages:
-  - nginx
 write_files:
-  - path: /etc/nginx/conf.d/byok-proxy.conf
+  - path: /var/lib/byok/install-nginx-njs.sh
+    permissions: '0700'
+    encoding: b64
+    content: '__BYOK_NGINX_INSTALLER_BASE64__'
+  - path: /etc/nginx/conf.d/nginx-credentials.mjs
+    permissions: '0644'
+    encoding: b64
+    content: '__BYOK_CREDENTIAL_GUARD_BASE64__'
+  - path: /var/lib/byok/byok-proxy.conf
     permissions: '0644'
     content: |
-      map $http_authorization $byok_key {
+      js_import credentials from /etc/nginx/conf.d/nginx-credentials.mjs;
+      js_set $byok_credential credentials.credential;
+      map $byok_credential $byok_key {
           default "";
-          "~*^Bearer (.+)$" $1;
+          "~^header:(?<byok_header>.+)$" $byok_header;
       }
+      map $byok_credential $byok_source_invalid {
+          default 1;
+          "query" 0;
+          "~^header:.+$" 0;
+      }
+        log_format byok '$request_method $uri $status $request_time';
       server {
           listen 8080;
           server_name _;
+          access_log /var/log/nginx/byok-access.log byok;
+          error_log /var/log/nginx/byok-error.log crit;
           location ^~ /__INTELLIJ_API_PATH__/ {
+            if ($byok_source_invalid) { return 401; }
               proxy_pass https://__APIM_PRIVATE_IP__;
               proxy_set_header Host __APIM_GATEWAY_HOST__;
               proxy_ssl_name __APIM_GATEWAY_HOST__;
               proxy_ssl_server_name on;
+              proxy_ssl_verify on;
+              proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
               proxy_set_header api-key $byok_key;
               proxy_set_header Authorization "";
               proxy_http_version 1.1;
@@ -37,7 +55,12 @@ write_files:
               }
       }
 runcmd:
-  - rm -f /etc/nginx/sites-enabled/default
-  - nginx -t
-  - systemctl enable nginx
-  - systemctl restart nginx
+  - |
+      set -eu
+      bash /var/lib/byok/install-nginx-njs.sh
+      rm -f /var/lib/byok/install-nginx-njs.sh
+      install -m 644 /var/lib/byok/byok-proxy.conf /etc/nginx/conf.d/byok-proxy.conf
+      rm -f /var/lib/byok/byok-proxy.conf /etc/nginx/sites-enabled/default
+      nginx -t
+      systemctl enable nginx
+      systemctl restart nginx

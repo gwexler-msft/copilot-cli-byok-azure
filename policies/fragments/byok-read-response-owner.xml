@@ -1,0 +1,57 @@
+<fragment>
+  <set-variable name="byokResponseBackendOrigins" value="{{caller-response-backend-origins}}" />
+  <set-variable name="byokResponseLookupUrl" value="@{
+    try {
+      if (!context.Variables.ContainsKey(&quot;byokCallerAuthenticated&quot;) || !(bool)context.Variables[&quot;byokCallerAuthenticated&quot;]
+          || !context.Variables.ContainsKey(&quot;byokResponseReference&quot;)
+          || !context.Variables.ContainsKey(&quot;byokResponseBackendUrl&quot;)) { return &quot;&quot;; }
+      var reference = (string)context.Variables[&quot;byokResponseReference&quot;];
+      if (!System.Text.RegularExpressions.Regex.IsMatch(reference, @&quot;\Aresp_[A-Za-z0-9_-]{1,128}\z&quot;)) { return &quot;&quot;; }
+      var configured = Newtonsoft.Json.Linq.JArray.Parse((string)context.Variables[&quot;byokResponseBackendOrigins&quot;]);
+      var backendText = (string)context.Variables[&quot;byokResponseBackendUrl&quot;];
+        var backend = new Uri(backendText);
+        if (backend.Scheme != &quot;https&quot; || backend.Port != 443
+          || !string.IsNullOrEmpty(backend.UserInfo) || !string.IsNullOrEmpty(backend.Query) || !string.IsNullOrEmpty(backend.Fragment)) { return &quot;&quot;; }
+        var origin = backend.Scheme + &quot;://&quot; + backend.Authority;
+      if (!configured.Any(entry =&gt; entry.Type == Newtonsoft.Json.Linq.JTokenType.String &amp;&amp; string.Equals((string)entry, origin, StringComparison.OrdinalIgnoreCase))) { return &quot;&quot;; }
+      return origin + &quot;/openai/v1/responses/&quot; + Uri.EscapeDataString(reference);
+    } catch { return &quot;&quot;; }
+  }" />
+  <choose>
+    <when condition="@(string.IsNullOrEmpty((string)context.Variables[&quot;byokResponseLookupUrl&quot;])
+        || !context.Variables.ContainsKey(&quot;byokResponseBackendCredentialHeader&quot;)
+        || !context.Variables.ContainsKey(&quot;byokResponseBackendCredential&quot;)
+        || ((string)context.Variables[&quot;byokResponseBackendCredentialHeader&quot;] != &quot;Authorization&quot; &amp;&amp; (string)context.Variables[&quot;byokResponseBackendCredentialHeader&quot;] != &quot;api-key&quot;)
+        || string.IsNullOrWhiteSpace((string)context.Variables[&quot;byokResponseBackendCredential&quot;]))">
+      <return-response>
+        <set-status code="503" reason="Response ownership lookup unavailable" />
+        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-body>{"error":{"code":"ResponseOwnershipUnavailable","message":"Stored response ownership validation is unavailable."}}</set-body>
+      </return-response>
+    </when>
+  </choose>
+  <send-request mode="new" response-variable-name="byokResponseOwnerLookup" timeout="15" ignore-error="true">
+    <set-url>@((string)context.Variables["byokResponseLookupUrl"])</set-url>
+    <set-method>GET</set-method>
+    <set-header name="Accept" exists-action="override"><value>application/json</value></set-header>
+    <set-header name="@((string)context.Variables[&quot;byokResponseBackendCredentialHeader&quot;])" exists-action="override"><value>@((string)context.Variables["byokResponseBackendCredential"])</value></set-header>
+  </send-request>
+  <set-variable name="byokResponseLookupFailed" value="@{
+    var previousFailure = context.Variables.ContainsKey(&quot;byokResponseLookupFailed&quot;) &amp;&amp; (bool)context.Variables[&quot;byokResponseLookupFailed&quot;];
+    var response = context.Variables.ContainsKey(&quot;byokResponseOwnerLookup&quot;) ? (IResponse)context.Variables[&quot;byokResponseOwnerLookup&quot;] : null;
+    return previousFailure || response == null || (response.StatusCode != 200 &amp;&amp; response.StatusCode != 404);
+  }" />
+  <set-variable name="byokResponseOwnershipDocument" value="@{
+    try {
+      var response = context.Variables.ContainsKey(&quot;byokResponseOwnerLookup&quot;) ? (IResponse)context.Variables[&quot;byokResponseOwnerLookup&quot;] : null;
+      if (response == null || response.StatusCode != 200) { return &quot;&quot;; }
+      var document = response.Body.As&lt;Newtonsoft.Json.Linq.JObject&gt;(preserveContent: false);
+      return new Newtonsoft.Json.Linq.JObject(
+        new Newtonsoft.Json.Linq.JProperty(&quot;id&quot;, document[&quot;id&quot;]),
+        new Newtonsoft.Json.Linq.JProperty(&quot;object&quot;, document[&quot;object&quot;]),
+        new Newtonsoft.Json.Linq.JProperty(&quot;metadata&quot;, document[&quot;metadata&quot;])
+      ).ToString(Newtonsoft.Json.Formatting.None);
+    } catch { return &quot;&quot;; }
+  }" />
+  <set-variable name="byokResponseOwnerLookup" value="" />
+</fragment>

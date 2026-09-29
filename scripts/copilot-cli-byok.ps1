@@ -7,15 +7,16 @@
   Exports the COPILOT_PROVIDER_* environment variables with the per-developer credential,
   and (optionally) runs a curl smoke test against the selected wire API route.
 
-  Two auth modes, matching the gateway's `authMode` Bicep parameter:
+  Credential choices, each requiring matching gateway admission:
     - subscriptionKey (DEFAULT): you present a long-lived per-developer APIM subscription key.
       No token mint, no expiry, no Entra round-trip. This matches the default deployment.
     - jwt: the script mints a short-lived (~1h) Entra JWT for the BYOK API app. Opt in with
-      `-AuthMode jwt`. Re-run to refresh the token.
+      `-AuthMode jwt`. Add `-RefreshToken` for per-request acquisition through the CLI's
+      credential command; otherwise re-run to refresh the static token.
 
   Notes:
-    - The credential rides in COPILOT_PROVIDER_API_KEY (the `api-key` header) because the CLI
-      cannot send custom headers (github/copilot-cli#3399). APIM strips it before the backend.
+    - The credential rides in the Azure provider's `api-key` header. APIM strips it before
+      the backend. Custom credential headers are rejected to keep one credential source.
     - jwt mode: with v2 access tokens the JWT 'aud' is the app (client) ID GUID, NOT the api://
       URI. We mint with `--scope "<AppId>/.default"`, which also dodges az's per-resource token
       cache handing back a stale-audience token. Works in AzureCloud and AzureUSGovernment.
@@ -29,7 +30,8 @@
   Copilot CLI wire API: 'responses' (default) or 'completions'. Responses is required for
   GPT-5.6 agent tool calls and avoids newer CLI payload fields rejected by Chat Completions.
 .PARAMETER AuthMode
-  'subscriptionKey' (default) or 'jwt'. Selects which credential is sent to the gateway.
+  'subscriptionKey' (default), 'jwt' (Entra), or 'okta'. Okta always uses the renewable
+  credential command and requires the opt-in shared gateway configuration.
 .PARAMETER SubscriptionKey
   (subscriptionKey mode) The per-developer APIM subscription key. If omitted, falls back to
   the APIM_SUBSCRIPTION_KEY environment variable. Avoid passing secrets on the command line;
@@ -37,6 +39,28 @@
 .PARAMETER AppId
   (jwt mode) The app (client) ID GUID of the BYOK gateway app (output of setup-entra). Used as
   the token scope and equals the JWT audience validated by APIM. Required only for -AuthMode jwt.
+.PARAMETER Cloud
+  (jwt mode) AzureCloud or AzureUSGovernment. Inferred from an exact .azure-api.net or
+  .azure-api.us HTTPS hostname. Custom gateway domains require this value or an interactive
+  choice. A conflicting override is rejected.
+.PARAMETER TenantId
+  (jwt mode) Gateway directory tenant GUID, not AppId. Prompted for first sign-in when missing;
+  a matching existing delegated account can supply it on later runs.
+.PARAMETER Login
+  (jwt mode) Explicitly start Entra sign-in, including when an account is already cached.
+  Without this switch, a missing account prompts for approval only in an interactive terminal.
+.PARAMETER UseDeviceCode
+  (jwt mode) Use device-code sign-in instead of the Azure CLI browser/broker default when
+  login is needed. Complete the sign-in directly in a browser; do not share the code in chat.
+.PARAMETER OktaConfigFile
+  Nonsecret pinned Okta client settings. Complete explicit PKCE sign-in using get-okta-token.ps1
+  -Login before selecting -AuthMode okta. Never put tokens or a client secret in this file.
+.PARAMETER RefreshToken
+  (jwt mode) Configure COPILOT_PROVIDER_API_KEY_COMMAND to acquire a usable token before each
+  provider request. Requires CLI credential-command support. The launcher can guide first-run
+  sign-in; the per-request helper pins cloud, tenant, account and cache and never logs in or
+  switches clouds.
+  Does not apply to -Test or provide automatic renewal for VS Code Custom Endpoint.
 .PARAMETER ApimPrivateIp
   Optional. APIM Internal-VNet private IP. When set, curl uses --resolve so you do not need a
   hosts entry or private DNS zone. Only used by -Test.
@@ -53,10 +77,11 @@
 .PARAMETER PrintOnly
   Export the env vars but do not print the "run copilot now" hint.
 .PARAMETER InstallDeps
-  If the Copilot CLI (or its prerequisites) are missing, attempt to install them with WinGet
-  (PowerShell 7+, Node.js 22+ and the Copilot CLI). Without this switch the script only PRINTS
-  the install commands and stops. Requires WinGet (App Installer); if WinGet itself is missing
-  the script prints how to get it (https://aka.ms/getwinget).
+  Install missing prerequisites (PowerShell 7+, Node.js 22+ and Copilot CLI). JWT mode also
+  installs Azure CLI from Microsoft's version-pinned x64 ZIP (preview) under LOCALAPPDATA,
+  without administrator privileges or persistent PATH changes. Interactive users can approve
+  installation when prompted; noninteractive runs require this switch. Installation does not
+  authorize sign-in; use the first-run prompt or -Login. Downloads require approved outbound HTTPS.
 .EXAMPLE
   # DEFAULT (subscription key) - configure the shell for the real Copilot CLI:
   $env:APIM_SUBSCRIPTION_KEY = '<your per-developer key>'
@@ -88,9 +113,15 @@ param(
   [string] $ApimBaseUrl = '',
   [string] $Model = '',
   [ValidateSet('responses', 'completions')] [string] $WireApi = 'responses',
-  [ValidateSet('subscriptionKey', 'jwt')] [string] $AuthMode = 'subscriptionKey',
+  [ValidateSet('subscriptionKey', 'jwt', 'okta')] [string] $AuthMode = 'subscriptionKey',
   [string] $SubscriptionKey = '',
   [string] $AppId,
+  [ValidateSet('AzureCloud', 'AzureUSGovernment')] [string] $Cloud,
+  [string] $TenantId,
+  [switch] $Login,
+  [switch] $UseDeviceCode,
+  [string] $OktaConfigFile,
+  [switch] $RefreshToken,
   [string] $ApimPrivateIp,
   [int] $MaxPromptTokens,
   [int] $MaxOutputTokens,
@@ -100,8 +131,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($AuthMode -ne 'jwt' -and ($Cloud -or $TenantId -or $Login -or $UseDeviceCode)) { throw '-Cloud, -TenantId, -Login and -UseDeviceCode require -AuthMode jwt.' }
+if ($AuthMode -eq 'okta') { $RefreshToken = $true }
+if ($RefreshToken -and ($AuthMode -notin @('jwt','okta') -or $Test)) { throw '-RefreshToken requires -AuthMode jwt or okta and cannot be combined with -Test.' }
+if (@(($env:COPILOT_PROVIDER_HEADERS -split '\\n|\r?\n') | Where-Object { $_ -match '^\s*(Authorization|api-key|x-api-key|Ocp-Apim-Subscription-Key)\s*:' }).Count) {
+  throw 'Remove credential headers from COPILOT_PROVIDER_HEADERS before configuring BYOK; use one credential source.'
+}
 
-$script:IsInteractive = $Host.Name -ne 'Default Host' -and -not [Console]::IsInputRedirected
+$script:IsInteractive = $Host.Name -ne 'Default Host' -and -not [Console]::IsInputRedirected -and
+  -not ([Environment]::GetCommandLineArgs() -match '^-(noni|noninteractive)$')
+$script:AzureCliPortableVersion = '2.90.0'
 
 function Install-PowerShell7 {
   # Prefer WinGet; otherwise fall back to Microsoft's official installer script, which downloads
@@ -168,6 +207,217 @@ function Update-SessionPath {
     $env:PATH = (($merged -split ';') | Where-Object { $_ -and $seen.Add($_) }) -join ';'
   }
   catch { Write-Verbose "Could not refresh PATH from registry: $($_.Exception.Message)" }
+}
+
+function Resolve-AzureCliCommand {
+  $command = Get-Command az -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($command) { return $command }
+  if ($env:OS -ne 'Windows_NT') { return $null }
+  $candidates = @()
+  foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+    if ($root) { $candidates += Join-Path $root 'Microsoft SDKs/Azure/CLI2/wbin' }
+  }
+  if ($env:LOCALAPPDATA) {
+    $candidates += Join-Path $env:LOCALAPPDATA "Microsoft/AzureCLI-BYOK/$script:AzureCliPortableVersion/bin"
+  }
+  foreach ($directory in $candidates) {
+    if (Test-Path -LiteralPath (Join-Path $directory 'az.cmd') -PathType Leaf) {
+      $env:PATH = $directory + [IO.Path]::PathSeparator + $env:PATH
+      $command = Get-Command az -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($command) { return $command }
+    }
+  }
+  return $null
+}
+
+function Install-AzureCli {
+  if ($env:OS -ne 'Windows_NT' -or -not [Environment]::Is64BitOperatingSystem -or -not $env:LOCALAPPDATA) {
+    throw 'Automatic Azure CLI installation requires 64-bit Windows and LOCALAPPDATA. Install Azure CLI for your platform: https://learn.microsoft.com/cli/azure/install-azure-cli'
+  }
+  $root = Join-Path $env:LOCALAPPDATA 'Microsoft/AzureCLI-BYOK'
+  $destination = Join-Path $root $script:AzureCliPortableVersion
+  if (Test-Path -LiteralPath $destination) {
+    throw 'The per-user Azure CLI installation directory already exists but is not usable. Repair it explicitly; this launcher will not overwrite it.'
+  }
+  $staging = Join-Path $root ('.install-' + [guid]::NewGuid().ToString('N'))
+  $null = New-Item -ItemType Directory -Path $staging -ErrorAction Stop
+  try {
+    $archive = Join-Path $staging 'azure-cli.zip'
+    $package = Join-Path $staging 'package'
+    $uri = "https://azcliprod.blob.core.windows.net/zip/azure-cli-$script:AzureCliPortableVersion-x64.zip"
+    Write-Host "Installing Azure CLI $script:AzureCliPortableVersion for the current user (Microsoft ZIP preview)..."
+    Invoke-WebRequest -Uri $uri -OutFile $archive -UseBasicParsing -TimeoutSec 300
+    Expand-Archive -LiteralPath $archive -DestinationPath $package
+    if (-not (Test-Path -LiteralPath (Join-Path $package 'bin/az.cmd') -PathType Leaf)) {
+      throw 'The Azure CLI archive does not contain the expected bin/az.cmd entry point.'
+    }
+    [IO.Directory]::Move($package, $destination)
+  } finally {
+    Remove-Item -LiteralPath $staging -Recurse -Force
+  }
+}
+
+function Initialize-AzureCli {
+  param([switch] $AllowInstall, [switch] $Interactive)
+  if (-not (Resolve-AzureCliCommand)) {
+    $approved = [bool]$AllowInstall
+    if (-not $approved -and $Interactive) {
+      $answer = Read-Host 'Azure CLI is missing. Install the Microsoft per-user x64 ZIP (preview) now? [y/N]'
+      $approved = $answer -match '^(y|yes)$'
+    }
+    if (-not $approved) {
+      throw 'JWT mode requires Azure CLI (az). Rerun with -InstallDeps to install the Microsoft per-user Windows ZIP (preview), or install Azure CLI separately. No sign-in or cloud change was performed.'
+    }
+    Install-AzureCli
+    if (-not (Resolve-AzureCliCommand)) { throw 'Azure CLI installation completed but az is not discoverable in this shell. No sign-in was attempted.' }
+  }
+  $version = $null
+  try {
+    $versionJson = az version --output json --only-show-errors 2>$null
+    if ($LASTEXITCODE -eq 0) { $version = [version](($versionJson | ConvertFrom-Json).'azure-cli') }
+  } catch { $version = $null }
+  if (-not $version -or $version -lt [version]'2.54.0') {
+    throw 'Azure CLI could not be verified as version 2.54.0 or newer. Repair or upgrade the existing installation explicitly, then rerun this launcher.'
+  }
+}
+
+function Resolve-ByokAzureCloud {
+  param([string] $GatewayUrl, [string] $Cloud, [switch] $Interactive)
+  $gatewayUri = $null
+  if (-not [uri]::TryCreate($GatewayUrl, [UriKind]::Absolute, [ref]$gatewayUri) -or
+      $gatewayUri.Scheme -ne 'https' -or $gatewayUri.UserInfo -or $gatewayUri.Query -or $gatewayUri.Fragment) {
+    throw 'JWT mode requires an absolute HTTPS gateway URL without user information, query parameters or fragments.'
+  }
+  $hostname = $gatewayUri.DnsSafeHost.TrimEnd('.').ToLowerInvariant()
+  $inferredCloud = if ($hostname.EndsWith('.azure-api.us')) { 'AzureUSGovernment' }
+    elseif ($hostname.EndsWith('.azure-api.net')) { 'AzureCloud' } else { '' }
+  if ($Cloud -and $inferredCloud -and $Cloud -cne $inferredCloud) {
+    throw 'The requested cloud conflicts with the APIM hostname. Use the matching cloud in a dedicated terminal.'
+  }
+  if (-not $Cloud) { $Cloud = $inferredCloud }
+  if (-not $Cloud -and $Interactive) {
+    $Cloud = Read-Host 'Custom gateway domain: enter AzureCloud or AzureUSGovernment'
+  }
+  if ($Cloud -cnotin @('AzureCloud', 'AzureUSGovernment')) {
+    throw 'Cannot infer the cloud from this gateway hostname. Supply -Cloud AzureCloud or -Cloud AzureUSGovernment.'
+  }
+  return $Cloud
+}
+
+function Read-ByokAzureAccount {
+  try {
+    $accountJson = az account show --output json --only-show-errors 2>$null
+    if ($LASTEXITCODE -eq 0 -and $accountJson) { return ($accountJson | ConvertFrom-Json) }
+  } catch { }
+  return $null
+}
+
+function Write-ByokJwtAccessGuidance {
+  param([string] $Token)
+  $missingRoles = $false
+  try {
+    if ($Token.Length -le 65536 -and $Token -cmatch '\A[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\z') {
+      $payload = $Token.Split('.')[1].Replace('-', '+').Replace('_', '/')
+      $payload = $payload.PadRight($payload.Length + (4 - $payload.Length % 4) % 4, '=')
+      $claims = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json
+      if ($claims -is [pscustomobject]) {
+        $missingRoles = $null -eq $claims.roles -or ($claims.roles -is [array] -and $claims.roles.Count -eq 0)
+      }
+    }
+  } catch { } finally { $claims = $null; $payload = $null; $Token = $null }
+  if ($missingRoles) {
+    Write-Warning 'The acquired gateway token has no app roles. If group-based JWT tiers are enabled, APIM will deny inference with 403. After a group change, allow propagation and rerun this launcher with -Login (add -UseDeviceCode on a VM). If access is still denied, ask your administrator to verify exactly one mapped gateway tier. This is a local metadata hint, not an authorization check.' -WarningAction Continue
+  }
+}
+
+function Initialize-ByokAzureAccount {
+  param(
+    [string] $Cloud, [string] $TenantId, [string] $AppId,
+    [switch] $Login, [switch] $UseDeviceCode, [switch] $Interactive,
+    [switch] $AllowInstall, [ref] $Account
+  )
+  $tenantPattern = '\A[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\z'
+  if ($TenantId -and $TenantId -notmatch $tenantPattern) { throw '-TenantId must be the gateway directory tenant GUID, not AppId or a login authority URL.' }
+  $previousConfig = $env:AZURE_CONFIG_DIR
+  $cache = if ($previousConfig) { [IO.Path]::GetFullPath($previousConfig) } else {
+    $cacheName = if ($Cloud -eq 'AzureUSGovernment') { '.azure-byok-government' } else { '.azure-byok-commercial' }
+    Join-Path $env:USERPROFILE $cacheName
+  }
+  $newCache = -not (Test-Path -LiteralPath $cache)
+  if (-not $newCache -and -not (Test-Path -LiteralPath $cache -PathType Container)) { throw 'AZURE_CONFIG_DIR must identify a directory.' }
+  $completed = $false
+  $readCloud = {
+    try {
+      $current = az cloud show --query name --output tsv --only-show-errors 2>$null
+      if ($LASTEXITCODE -eq 0) { return ([string]$current).Trim() }
+    } catch { }
+    return ''
+  }
+  $context = $null
+  try {
+    if (-not $newCache) {
+      $env:AZURE_CONFIG_DIR = $cache
+      Initialize-AzureCli -AllowInstall:$AllowInstall -Interactive:$Interactive
+      if ((& $readCloud) -cne $Cloud) { throw 'The selected Azure CLI cache is not pinned to the gateway cloud. Use a different dedicated terminal/cache; this cache will not be switched.' }
+      $context = Read-ByokAzureAccount
+    }
+    if ($context) {
+      if (@($context).Count -ne 1 -or $context.environmentName -cne $Cloud -or
+          $context.user.type -cne 'user' -or [string]::IsNullOrWhiteSpace($context.user.name) -or
+          $context.tenantId -notmatch $tenantPattern) { throw 'The cached account must be one delegated user in the gateway cloud. Use a dedicated user cache.' }
+      if ($TenantId -and $context.tenantId -ine $TenantId) { throw 'The cached account belongs to a different tenant. Select the intended dedicated cache; the launcher will not replace this account.' }
+      if (-not $TenantId) { $TenantId = $context.tenantId }
+    }
+    if (-not $context -or $Login) {
+      $approved = [bool]$Login
+      Write-Host "Gateway authentication cloud: $Cloud."
+      if (-not $approved -and $Interactive) {
+        $answer = Read-Host "Sign in to $Cloud for this gateway now? [y/N]"
+        $approved = $answer -match '^(y|yes)$'
+      }
+      if (-not $approved) { throw 'No usable Azure CLI account in the selected cache. Rerun interactively or use -Login -TenantId <TENANT_ID>; use -UseDeviceCode for a remote VM. AZURE_CONFIG_DIR must be dedicated to the gateway cloud.' }
+      if (-not $TenantId -and $Interactive) { $TenantId = Read-Host 'Gateway directory Tenant ID (GUID, not the application AppId)' }
+      if (-not $TenantId -or $TenantId -notmatch $tenantPattern -or $TenantId -ieq $AppId) { throw 'Sign-in requires the gateway directory Tenant ID. Supply -TenantId <TENANT_ID>; it cannot be inferred from the APIM URL or AppId.' }
+      if ($newCache) {
+        $stagingCache = Join-Path (Split-Path -Path $cache -Parent) ('.byok-cache-setup-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $stagingCache -ErrorAction Stop
+        try {
+          $env:AZURE_CONFIG_DIR = $stagingCache
+          Initialize-AzureCli -AllowInstall:$AllowInstall -Interactive:$Interactive
+          $cloudExit = -1
+          try { $null = az cloud set --name $Cloud --output none --only-show-errors 2>$null; $cloudExit = $LASTEXITCODE } catch { }
+          if ($cloudExit -ne 0 -or (& $readCloud) -cne $Cloud) { throw 'Could not initialize the new cloud-specific Azure CLI cache. No login was attempted.' }
+          [IO.Directory]::Move($stagingCache, $cache)
+          $env:AZURE_CONFIG_DIR = $cache
+        } finally {
+          if (Test-Path -LiteralPath $stagingCache) { Remove-Item -LiteralPath $stagingCache -Recurse -Force }
+        }
+      }
+      $loginArguments = @('login', '--tenant', $TenantId, '--scope', "$AppId/.default", '--allow-no-subscriptions', '--output', 'none')
+      if ($UseDeviceCode) { $loginArguments += '--use-device-code' }
+      $loginExit = -1
+      $previousErrorPreference = $ErrorActionPreference
+      try {
+        $ErrorActionPreference = 'Continue'
+        $PSNativeCommandUseErrorActionPreference = $false
+        az @loginArguments
+        $loginExit = $LASTEXITCODE
+      } finally { $ErrorActionPreference = $previousErrorPreference }
+      if ($loginExit -ne 0) { throw 'Azure sign-in did not complete. Provider credentials were not changed. Check identity connectivity and retry explicitly; use -UseDeviceCode when a local browser is unavailable.' }
+      $signedIn = Read-ByokAzureAccount
+      if ((& $readCloud) -cne $Cloud -or @($signedIn).Count -ne 1 -or -not $signedIn -or
+          $signedIn.environmentName -cne $Cloud -or $signedIn.tenantId -ine $TenantId -or
+          $signedIn.user.type -cne 'user' -or [string]::IsNullOrWhiteSpace($signedIn.user.name) -or
+          ($context -and $signedIn.user.name -ine $context.user.name)) {
+        throw 'The resulting sign-in does not match the expected cloud, tenant and delegated user. Provider credentials were not changed.'
+      }
+      $context = $signedIn
+    }
+    $Account.Value = $context
+    $completed = $true
+  } finally {
+    if (-not $completed) { $env:AZURE_CONFIG_DIR = $previousConfig }
+  }
 }
 
 function Resolve-CopilotCommand {
@@ -278,6 +528,7 @@ $Model       = Resolve-Setting -Value $Model       -Saved $savedConfig.Model    
 
 if (-not $ApimBaseUrl) { throw '-ApimBaseUrl is required (the APIM gateway base URL, e.g. https://<apim>.azure-api.us).' }
 if (-not $Model)       { throw '-Model is required (the deployed model/deployment name, e.g. gpt-5.6-sol, or "auto" to let the gateway route).' }
+if ($AuthMode -eq 'okta' -and ([uri]$ApimBaseUrl).Scheme -ne 'https') { throw 'Okta credentials require an HTTPS gateway URL.' }
 
 # Normalize: the inference routes live under /openai (the default route, and the only path the CLI's
 # azure provider actually keeps), so append /openai only if the dev passed a bare host (and tolerate
@@ -312,18 +563,57 @@ if ($AuthMode -eq 'subscriptionKey') {
   $credential = $SubscriptionKey
   $credKind   = 'APIM subscription key'
 }
+elseif ($AuthMode -eq 'okta') {
+  if (-not $OktaConfigFile) { throw 'okta mode: -OktaConfigFile is required; sign in explicitly with get-okta-token first.' }
+  $tokenHelper = Join-Path $PSScriptRoot 'get-okta-token.ps1'
+  $oktaPath = [IO.Path]::GetFullPath($OktaConfigFile)
+  & $tokenHelper -ConfigFile $oktaPath | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'The pinned Okta credential helper failed preflight.' }
+  $invocation = "& '" + $tokenHelper.Replace("'", "''") + "' -ConfigFile '" + $oktaPath.Replace("'", "''") + "'"
+  $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($invocation))
+  $tokenShell = Get-PwshPath
+  if (-not $tokenShell) { $tokenShell = Join-Path $PSHOME 'powershell.exe' }
+  $credentialCommand = '"' + $tokenShell + '" -NoLogo -NoProfile -NonInteractive -EncodedCommand ' + $encodedCommand
+  $credKind = 'Okta JWT (OS-protected renewable user grant)'
+}
 else {
   if (-not $AppId) { throw 'jwt mode: -AppId (the BYOK gateway app/client ID GUID) is required.' }
-  $ctx = az account show 2>$null | ConvertFrom-Json
-  if (-not $ctx) { throw 'Run `az login` first (use the cloud matching the deployment).' }
-  Write-Verbose "Cloud=$($ctx.environmentName) Tenant=$($ctx.tenantId) Account=$($ctx.user.name)"
+  $targetCloud = Resolve-ByokAzureCloud -GatewayUrl $ApimBaseUrl -Cloud $Cloud -Interactive:$script:IsInteractive
+  $ctx = $null
+  Initialize-ByokAzureAccount -Cloud $targetCloud -TenantId $TenantId -AppId $AppId -Login:$Login -UseDeviceCode:$UseDeviceCode -Interactive:$script:IsInteractive -AllowInstall:$InstallDeps -Account ([ref]$ctx)
 
-  # v2 token: scope "<AppId>/.default" => aud == AppId GUID (what APIM validate-jwt expects).
-  $credential = az account get-access-token --scope "$AppId/.default" --query accessToken -o tsv 2>$null
-  if (-not $credential) {
-    throw "Could not get token for $AppId. Did you run setup-entra and is this user able to consent to the 'cli.invoke' scope?"
+  if ($RefreshToken) {
+    $tokenHelper = Join-Path $PSScriptRoot 'get-byok-token.ps1'
+    $azureConfigDirectory = if ($env:AZURE_CONFIG_DIR) { [IO.Path]::GetFullPath($env:AZURE_CONFIG_DIR) } else { Join-Path $env:USERPROFILE '.azure' }
+    $tokenParameters = [ordered]@{
+      AppId = $AppId
+      Cloud = $ctx.environmentName
+      TenantId = $ctx.tenantId
+      AccountName = $ctx.user.name
+      AzureConfigDirectory = $azureConfigDirectory
+    }
+    $preflightToken = $null
+    try {
+      $preflightToken = & $tokenHelper @tokenParameters
+      if ($LASTEXITCODE -ne 0) { throw 'Gateway token acquisition failed. Rerun this launcher with -Login (add -UseDeviceCode on a VM), using the intended cloud, account and cache.' }
+      Write-ByokJwtAccessGuidance -Token $preflightToken
+    } finally { $preflightToken = $null }
+    $invokeParts = @("& '" + $tokenHelper.Replace("'", "''") + "'")
+    foreach ($name in $tokenParameters.Keys) { $invokeParts += '-' + $name + " '" + ([string]$tokenParameters[$name]).Replace("'", "''") + "'" }
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(($invokeParts -join ' ')))
+    $tokenShell = Get-PwshPath
+    if (-not $tokenShell) { $tokenShell = Join-Path $PSHOME 'powershell.exe' }
+    $credentialCommand = '"' + $tokenShell + '" -NoLogo -NoProfile -NonInteractive -EncodedCommand ' + $encodedCommand
+    $credKind = 'Entra JWT (per-request Azure CLI cache)'
   }
-  $credKind = 'Entra JWT (~1h)'
+  else {
+    $credential = az account get-access-token --scope "$AppId/.default" --query accessToken -o tsv 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $credential) {
+      throw 'Could not acquire the gateway token. Sign in in the pinned cloud and verify the delegated gateway permission.'
+    }
+    Write-ByokJwtAccessGuidance -Token $credential
+    $credKind = 'Entra JWT (~1h)'
+  }
 }
 
 $baseUrl = $ApimBaseUrl.TrimEnd('/')
@@ -432,10 +722,25 @@ Verify with: copilot --version
   }
 }
 
+if ($RefreshToken) {
+  $providerHelp = (& copilot help providers 2>$null) -join "`n"
+  if ($LASTEXITCODE -ne 0 -or $providerHelp -notmatch '\bCOPILOT_PROVIDER_API_KEY_COMMAND\b') {
+    throw 'This Copilot CLI does not advertise credential-command support. Update it before enabling -RefreshToken.'
+  }
+}
+
 $env:COPILOT_PROVIDER_BASE_URL = $baseUrl
 $env:COPILOT_PROVIDER_TYPE     = 'azure'
 $env:COPILOT_PROVIDER_WIRE_API = $WireApi
-$env:COPILOT_PROVIDER_API_KEY  = $credential
+$env:COPILOT_PROVIDER_BEARER_TOKEN = $null
+if ($RefreshToken) {
+  $env:COPILOT_PROVIDER_API_KEY = $null
+  $env:COPILOT_PROVIDER_API_KEY_COMMAND = $credentialCommand
+  $credential = $null
+} else {
+  $env:COPILOT_PROVIDER_API_KEY_COMMAND = $null
+  $env:COPILOT_PROVIDER_API_KEY = $credential
+}
 $env:COPILOT_MODEL             = $Model
 
 # The CLI looks up token limits from a built-in model catalog. A gateway-routed name like 'auto'
@@ -463,7 +768,11 @@ Write-Host "Configured Copilot CLI for BYOK ($AuthMode):"
 Write-Host "  COPILOT_PROVIDER_BASE_URL = $env:COPILOT_PROVIDER_BASE_URL"
 Write-Host "  COPILOT_PROVIDER_TYPE     = $env:COPILOT_PROVIDER_TYPE"
 Write-Host "  COPILOT_PROVIDER_WIRE_API = $env:COPILOT_PROVIDER_WIRE_API"
-Write-Host "  COPILOT_PROVIDER_API_KEY  = <hidden $credKind, length=$($credential.Length)>"
+if ($RefreshToken) {
+  Write-Host '  COPILOT_PROVIDER_API_KEY_COMMAND = <pinned token helper>'
+} else {
+  Write-Host "  COPILOT_PROVIDER_API_KEY  = <hidden $credKind, length=$($credential.Length)>"
+}
 Write-Host "  COPILOT_MODEL             = $env:COPILOT_MODEL"
 if ($env:COPILOT_PROVIDER_MAX_PROMPT_TOKENS) {
   Write-Host "  COPILOT_PROVIDER_MAX_PROMPT_TOKENS = $env:COPILOT_PROVIDER_MAX_PROMPT_TOKENS"
@@ -471,9 +780,16 @@ if ($env:COPILOT_PROVIDER_MAX_PROMPT_TOKENS) {
 if ($env:COPILOT_PROVIDER_MAX_OUTPUT_TOKENS) {
   Write-Host "  COPILOT_PROVIDER_MAX_OUTPUT_TOKENS = $env:COPILOT_PROVIDER_MAX_OUTPUT_TOKENS"
 }
+if ($AuthMode -eq 'jwt') {
+  Write-Host '  Entra token acquired; APIM authorization has not been checked by this launcher.'
+  Write-Host '  A cached token can retain old tier roles. After group changes, use -Login (and -UseDeviceCode on a VM); -RefreshToken alone may reuse the cache.'
+}
 Write-Host ""
 if ($PrintOnly) { return }
-if ($AuthMode -eq 'jwt') {
+if ($RefreshToken) {
+  Write-Host "Copilot will acquire the gateway token per request using the pinned credential helper. Run 'copilot' now."
+}
+elseif ($AuthMode -eq 'jwt') {
   Write-Host "Token expires in ~1 hour. Re-run to refresh, then run 'copilot'."
 }
 else {

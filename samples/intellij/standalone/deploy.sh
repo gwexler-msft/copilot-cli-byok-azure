@@ -14,7 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARAMS="$SCRIPT_DIR/main.parameters.json"
 LOCATION=""
-FOUNDRY_API_KEY=""
+FOUNDRY_API_KEY="${FOUNDRY_API_KEY:-}"
 WHATIF=0
 
 while [ $# -gt 0 ]; do
@@ -47,15 +47,28 @@ ACCT="$(az account show -o json 2>/dev/null || true)"
 [ -n "$ACCT" ] || fail "Not signed in. Run: az login"
 SUB="$(echo "$ACCT" | jq -r '.id')"
 ARM_BASE="$(az cloud show --query endpoints.resourceManager -o tsv | sed 's:/*$::')"
+CALLER_ROLLOUT="$(val callerAuthRollout)"; CALLER_ROLLOUT="${CALLER_ROLLOUT:-legacy}"
+[[ "$CALLER_ROLLOUT" == legacy || "$CALLER_ROLLOUT" == shared || "$CALLER_ROLLOUT" == coexistence ]] || fail 'callerAuthRollout must be legacy, shared or coexistence.'
+SHARED_CALLER=false; [[ "$CALLER_ROLLOUT" == legacy ]] || SHARED_CALLER=true
+if [[ "$SHARED_CALLER" == true ]] || jq -e '.parameters | has("callerAuthPreparation") or has("callerJwtTiering")' "$PARAMS" >/dev/null; then
+  FOUNDRY_API_KEY="$FOUNDRY_API_KEY" bash "$SCRIPT_DIR/../../../scripts/check-provision-params.sh" --standalone-cloud "$(az cloud show --query name -o tsv --only-show-errors)" "$PARAMS" || fail 'Standalone caller-auth preflight failed; no deployment started.'
+fi
 ok "Signed in: $(echo "$ACCT" | jq -r '.name')  (sub $SUB)"
 
 APIM_RG="$(val apimResourceGroup)"; APIM="$(val apimName)"
 az apim show -g "$APIM_RG" -n "$APIM" -o none 2>/dev/null || fail "APIM '$APIM' not found in resource group '$APIM_RG'."
+if jq -e '.parameters.callerJwtTiering.value | .entra.enabled == true or .okta.enabled == true' "$PARAMS" >/dev/null; then
+  tier_sku="$(az apim show -g "$APIM_RG" -n "$APIM" --query sku.name -o tsv --only-show-errors)" || fail 'Unable to verify the APIM tier SKU.'
+  [[ "$tier_sku" == Developer || "$tier_sku" == Premium ]] || fail 'JWT tiers currently require classic Developer or Premium APIM.'
+fi
 ok "APIM found: $APIM"
 
 BE="$(val existingBackendName)"
 BE_URL="$ARM_BASE/subscriptions/$SUB/resourceGroups/$APIM_RG/providers/Microsoft.ApiManagement/service/$APIM/backends/$BE?api-version=2024-05-01"
-if az rest --method get --url "$BE_URL" -o none 2>/dev/null; then ok "Foundry backend found: $BE"; else warn "Backend '$BE' not found on APIM — double-check existingBackendName."; fi
+if BACKEND="$(az rest --method get --url "$BE_URL" -o json 2>/dev/null)"; then ok "Foundry backend found: $BE"; elif [[ "$SHARED_CALLER" == true ]]; then fail 'Shared caller mode requires a readable existing backend.'; else warn "Backend '$BE' not found on APIM — double-check existingBackendName."; fi
+if [[ "$SHARED_CALLER" == true ]]; then
+  jq -e --arg origin "$(val existingBackendOrigin)" '(.properties.url | capture("^(?<origin>https://[^/]+)").origin | ascii_downcase) == ($origin | ascii_downcase)' <<< "$BACKEND" >/dev/null || fail 'existingBackendOrigin must match the selected backend HTTPS origin.'
+fi
 
 PRODUCTS=()
 while IFS= read -r product; do
@@ -133,6 +146,10 @@ info $'\n== Deploy =='
 TEMPLATE="$SCRIPT_DIR/main.bicep"
 EXTRA=()
 [ -n "$FOUNDRY_API_KEY" ] && EXTRA+=(--parameters "foundryApiKey=$FOUNDRY_API_KEY")
+if [[ "$SHARED_CALLER" == true ]]; then
+  PREVIOUS="$BYOK_RESPONSE_OWNER_PREVIOUS_KEY"; [[ "$PREVIOUS" != __none__ ]] || PREVIOUS=''
+  EXTRA+=(--parameters "responseOwnerKey=$BYOK_RESPONSE_OWNER_KEY" "responseOwnerPreviousKey=$PREVIOUS")
+fi
 
 if [ "$WHATIF" = "1" ]; then
   az deployment sub what-if --location "$LOC" --template-file "$TEMPLATE" --parameters "@$PARAMS" ${EXTRA[@]+"${EXTRA[@]}"}

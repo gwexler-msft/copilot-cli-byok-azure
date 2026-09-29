@@ -19,6 +19,14 @@ This is not final production acceptance: actual IDE use, long-running/idle strea
 concurrency, cancellation, and revision draining still need testing. Keep the VM available while
 evaluating Container Apps. Concrete endpoint values belong in local deployment outputs, not Git.
 
+The opt-in [shared caller implementation](README.md#shared-caller-authentication) and raw-header
+njs guard added afterward are **not covered by that historical pilot result**. They remain local
+engineering changes. No-push tests on 2026-09-23 passed the actual main and standalone nginx
+images, including 33 selector cases and 88 real forwarding/TLS/conflict checks per runtime across
+four configurations. APIM accepted all sixteen main/standalone/wizard policy consumers in both
+clouds behind mandatory diagnostic denials. Full feature execution, a package deployment and
+end-to-end acceptance remain open; no image was published and no pilot was upgraded.
+
 ## What This Deploys
 
 - One Container App in an **existing private, VNet-integrated environment** and existing RG.
@@ -85,8 +93,10 @@ option must not be used here. Relocation requires a separately named app for ove
 an existing app cannot move between environments. Keep the prior proxy until retirement is approved.
 
 Set `proxyImage` to an approved, anonymously pullable nginx image, preferably pinned by digest.
-It must include the standard `/etc/nginx/conf.d` layout and
-`/etc/ssl/certs/ca-certificates.crt`. Do not assume MCR mirrors every upstream nginx release:
+It must include the standard `/etc/nginx/conf.d` layout,
+`/usr/lib/nginx/modules/ngx_http_js_module.so` and `/etc/ssl/certs/ca-certificates.crt`. The template
+loads njs explicitly and mounts the shared raw-header guard beside the configuration. Slim images
+without njs fail startup. Do not assume MCR mirrors every upstream nginx release:
 the proposed `1.28` mirror tag returned 404 during preparation. This package installs no packages
 at container startup and does not build or publish an image.
 
@@ -152,11 +162,18 @@ From this directory, run the dependency-free guard suite with PowerShell 7+:
 pwsh -NoProfile -File ./tests/deployment-guards.Tests.ps1
 ```
 
-The 40 cases mock every Azure CLI call and parameter-file read. They cover both private topologies,
+The 49 cases mock every Azure CLI call and parameter-file read. They cover both private topologies,
 APIM subscription authentication, unsafe inputs, failed reads, what-if as the default, explicit
-deployment acknowledgement, and the active-cloud backend lookup. No Azure resources are accessed
+deployment acknowledgement, active-cloud backend lookup, shared caller settings, owner-key inputs
+and reused-API admission. No Azure resources are accessed
 or changed. This suite exercises the PowerShell helper; Bash runtime parity, nginx, image pulls,
 and the live acceptance checks below remain separate validation requirements.
+
+The shared parameter guard separately has 13 matching PowerShell/Bash standalone cases. On a
+Linux host with nginx, njs, Node.js and OpenSSL, run
+`node --test samples/intellij/standalone/tests/proxy-credentials.test.mjs` from the repository root
+for real forwarding/TLS and credential-conflict tests. A Node-only selector test does not replace
+this runtime gate.
 
 ## Runtime Acceptance
 
