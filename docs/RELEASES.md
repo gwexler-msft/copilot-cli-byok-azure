@@ -13,6 +13,21 @@ Version history for the Copilot BYOK → private Azure OpenAI/Foundry gateway. F
 > the foundational work (285 commits from 2026-05-30). Per-commit detail lives in `git log`.
 > From `1.1.0` onward, each change is recorded under its version as it lands.
 
+## Documentation Update (2026-09-29)
+
+Adds the publicly cleared leadership briefs:
+
+- [Top 5 security values](top5-security-values-leadership-summary.docx)
+- [Top 10 starting values](top10-starting-values-leadership-summary.docx)
+
+The document owner confirmed public clearance and authorized removal of author and tenant-linked
+label metadata from the publication copies. All content and formatting parts were verified
+byte-for-byte against the updated committed documents; the originals remain unchanged.
+
+This update changes only these documents and their README/release-note links. Application code,
+infrastructure, policies and workflows are unchanged from the preceding customer preview. Its
+verification results and acceptance limits below continue to apply. Public Actions remain disabled.
+
 ## Customer Preview — 2026-09-29
 
 This is an engineering evaluation snapshot, not a production-readiness, compliance or support
@@ -49,9 +64,9 @@ entries are historical references, not links to a public issue tracker.
 - Full-stack ARM what-if was incomplete: nested deployments were short-circuited and two diagnostics
   remained unclassified. A documented, specifically approved CI-only recovery used unchanged
   infrastructure inputs plus live health/RBAC checks; this is not a general preview bypass.
-- Internal plans, release tooling, unfinished JWT-tier runner work and both new leadership Word
-  documents are excluded. The Word documents require sharing/metadata review; no sensitivity label
-  was removed to create this package.
+- Internal plans, release tooling and unfinished JWT-tier runner work remain excluded. The initial
+  September 29 snapshot also excluded the leadership Word documents. The documentation update
+  above includes metadata-clean copies after explicit owner clearance and approval.
 - Example client settings are reviewable starting values, not a guaranteed fleet-enforcement
   policy. Preserve existing organizational controls and verify effective settings on supported
   client versions. This snapshot does not introduce a new software license.
