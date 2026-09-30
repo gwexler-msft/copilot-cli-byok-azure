@@ -9,6 +9,9 @@ requirements; a private inference route does not make every client or tool conne
 **Customer engineering preview (2026-09-29).** See the [validation and acceptance limits](docs/RELEASES.md#customer-preview--2026-09-29)
 before deployment. This snapshot is not a production-readiness or compliance certification.
 
+Leadership briefs: [Top 5 security values](docs/top5-security-values-leadership-summary.docx)
+and [Top 10 starting values](docs/top10-starting-values-leadership-summary.docx).
+
 ## What you get
 
 | Layer | Component |
